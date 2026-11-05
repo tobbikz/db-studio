@@ -498,13 +498,21 @@ impl App {
         self.ui.sidebar = Sidebar::Database;
         self.ui.bottom = BottomPanel::Results;
         self.ui.show_sidebar = true;
-        // Start on Explorer so sources/tables are navigable immediately.
-        self.ui.focus = Focus::Database;
-        self.ui.mode = Mode::Normal;
         self.refresh_queries_dir();
         self.db.rebuild_flat();
+        self.db.prepare_studio_entry();
+        // Console first after connect — Explorer is one Tab away.
+        self.ui.focus = Focus::Editor;
+        self.ui.mode = Mode::Normal;
+        let conn = self
+            .db
+            .active_source
+            .as_ref()
+            .and_then(|id| self.db.sources.iter().find(|s| &s.id == id))
+            .map(|s| s.name.as_str())
+            .unwrap_or("—");
         self.set_status(
-            "Studio · Tab panes · 1 Explorer · 2 Console · 3 Results · Enter expand",
+            format!("Studio · {conn} · F5 run · Tab panes · 1 Explorer"),
             false,
         );
     }
@@ -712,6 +720,10 @@ impl App {
 
     /// Home Enter: connect selected/active source, then open Studio.
     async fn home_enter_studio(&mut self) {
+        if self.ui.home_pane == ide_ui::HomePane::Recents {
+            self.home_open_recent().await;
+            return;
+        }
         if self.db.sources.is_empty() {
             self.start_add_connection();
             return;
@@ -722,6 +734,53 @@ impl App {
             .min(self.db.sources.len().saturating_sub(1));
         let slot = (idx + 1) as u8;
         self.open_db_source_slot(slot).await;
+    }
+
+    /// Home Recents: connect last source, load history SQL into console, open Studio.
+    async fn home_open_recent(&mut self) {
+        if self.db.history.is_empty() {
+            self.set_status("no recent queries", true);
+            return;
+        }
+        let newest_first_idx = self.ui.home_recent_selected.min(5);
+        let Some(hist_idx) = self
+            .db
+            .history
+            .len()
+            .checked_sub(1)
+            .map(|last| last.saturating_sub(newest_first_idx))
+        else {
+            self.set_status("no recent queries", true);
+            return;
+        };
+        let Some(id) = self
+            .db
+            .active_source
+            .clone()
+            .or_else(|| self.db.sources.first().map(|s| s.id.clone()))
+        else {
+            self.start_add_connection();
+            return;
+        };
+        self.set_status("connecting…", false);
+        match self.db.ensure_connected(&id, None).await {
+            Ok(()) => {
+                self.db.active_source = Some(id.clone());
+                let _ = self.db.save_sources();
+                self.db
+                    .connection_health
+                    .insert(id, ide_db::ConnHealth::ok_now());
+                if let Err(e) = self.db.open_history_entry(hist_idx) {
+                    self.set_status(format!("history: {e:#}"), true);
+                    return;
+                }
+                self.enter_db_studio();
+                self.set_status(self.db.status.clone(), false);
+            }
+            Err(e) => {
+                self.set_status(format!("connect failed: {e:#}"), true);
+            }
+        }
     }
 
     fn toggle_product_mode(&mut self) {
@@ -6331,22 +6390,58 @@ async fn event_loop(
                             }
                         }
 
-                        // Database Home: j/k select · Enter/e connect→studio · 1-9 · a · r health · p pin
+                        // Database Home: Tab pane · j/k · Enter · 1-9 · a · r · p
                         if app.ui.product == ProductMode::Database
                             && app.ui.db_surface == DbSurface::Home
                             && app.ui.mode == Mode::Normal
                             && !key.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             match key.code {
+                                KeyCode::Tab | KeyCode::BackTab => {
+                                    app.ui.home_pane = match app.ui.home_pane {
+                                        ide_ui::HomePane::Sources => ide_ui::HomePane::Recents,
+                                        ide_ui::HomePane::Recents => ide_ui::HomePane::Sources,
+                                    };
+                                    let label = match app.ui.home_pane {
+                                        ide_ui::HomePane::Sources => "sources",
+                                        ide_ui::HomePane::Recents => "recents",
+                                    };
+                                    app.set_status(format!("Home · {label}"), false);
+                                    continue;
+                                }
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    app.ui.home_selected =
-                                        app.ui.home_selected.saturating_sub(1);
+                                    match app.ui.home_pane {
+                                        ide_ui::HomePane::Sources => {
+                                            app.ui.home_selected =
+                                                app.ui.home_selected.saturating_sub(1);
+                                        }
+                                        ide_ui::HomePane::Recents => {
+                                            app.ui.home_recent_selected =
+                                                app.ui.home_recent_selected.saturating_sub(1);
+                                        }
+                                    }
                                     continue;
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    let max = app.db.sources.len().saturating_sub(1).min(8);
-                                    if app.ui.home_selected < max {
-                                        app.ui.home_selected += 1;
+                                    match app.ui.home_pane {
+                                        ide_ui::HomePane::Sources => {
+                                            let max =
+                                                app.db.sources.len().saturating_sub(1).min(8);
+                                            if app.ui.home_selected < max {
+                                                app.ui.home_selected += 1;
+                                            }
+                                        }
+                                        ide_ui::HomePane::Recents => {
+                                            let max = app
+                                                .db
+                                                .history
+                                                .len()
+                                                .saturating_sub(1)
+                                                .min(5);
+                                            if app.ui.home_recent_selected < max {
+                                                app.ui.home_recent_selected += 1;
+                                            }
+                                        }
                                     }
                                     continue;
                                 }
@@ -6389,6 +6484,7 @@ async fn event_loop(
                                 }
                                 KeyCode::Char(d) if d.is_ascii_digit() && d != '0' => {
                                     let n = d as u8 - b'0';
+                                    app.ui.home_pane = ide_ui::HomePane::Sources;
                                     app.open_db_source_slot(n).await;
                                     continue;
                                 }

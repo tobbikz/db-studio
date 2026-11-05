@@ -116,8 +116,20 @@ pub struct UiState {
     pub session_form_field: usize,
     /// AgentForm field index: 0 name … 4 seed.
     pub agent_form_field: usize,
-    /// Home hub selection: 0 Code · 1 Database · 2 Sessions.
+    /// Home hub selection: Code products (0..2) or DB source index (0..8).
     pub home_selected: usize,
+    /// DB Home: Sources list vs Recent queries.
+    pub home_pane: HomePane,
+    /// Selected index within recent history (newest-first, 0..5).
+    pub home_recent_selected: usize,
+}
+
+/// Which column is active on DB Home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HomePane {
+    #[default]
+    Sources,
+    Recents,
 }
 
 impl Default for UiState {
@@ -180,6 +192,8 @@ impl Default for UiState {
             session_form_field: 0,
             agent_form_field: 0,
             home_selected: 0,
+            home_pane: HomePane::Sources,
+            home_recent_selected: 0,
         }
     }
 }
@@ -998,10 +1012,16 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 ]))
             })
             .collect(),
-        Some(ws) => vec![ListItem::new(Span::styled(
-            format!(" {} ", ws.status),
-            theme::style_faint(),
-        ))],
+        Some(ws) => vec![
+            ListItem::new(Span::styled(
+                format!(" {} ", ws.status),
+                theme::style_muted(),
+            )),
+            ListItem::new(Span::styled(
+                " expand a source · Enter on a table ",
+                theme::style_faint(),
+            )),
+        ],
         None => vec![ListItem::new(Span::styled(
             " no sources — press a to connect ",
             theme::style_faint(),
@@ -2020,16 +2040,28 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         } else {
             " Results "
         };
-        // Keep the pane calm — key chords live in the Zellij-style footer.
+        let conn = db
+            .active_source
+            .as_ref()
+            .and_then(|id| db.sources.iter().find(|s| &s.id == id))
+            .map(|s| s.name.as_str())
+            .unwrap_or("—");
         let hint = Paragraph::new(vec![
             Line::from(""),
-            Line::from(Span::styled("  empty", theme::style_muted())),
             Line::from(Span::styled(
-                "  F5 / Ctrl+↵  run SQL in Console",
+                format!("  connected · {conn}"),
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "  F5 / Ctrl+↵  run Console SQL",
                 theme::style_faint(),
             )),
             Line::from(Span::styled(
-                "  y copy cell  ·  i edit  ·  / filter",
+                "  1 Explorer · Enter on a table",
+                theme::style_faint(),
+            )),
+            Line::from(Span::styled(
+                "  y copy  ·  i edit  ·  / filter",
                 theme::style_faint(),
             )),
         ])
@@ -2719,9 +2751,15 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(inner[1]);
 
+    let sources_active = ctx.ui.home_pane == HomePane::Sources;
+    let sources_title = if sources_active {
+        "▸ SOURCES"
+    } else {
+        "SOURCES"
+    };
     let mut left: Vec<Line> = vec![
         Line::from(Span::styled(
-            "SOURCES",
+            sources_title,
             theme::style_muted().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -2740,7 +2778,7 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         } else {
             for (i, src) in db.sources.iter().take(9).enumerate() {
                 let n = (i + 1) as u8;
-                let selected = i == sel;
+                let selected = sources_active && i == sel;
                 let is_active = db.active_source.as_deref() == Some(src.id.as_str());
                 let health = db
                     .connection_health
@@ -2807,9 +2845,15 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
     frame.render_widget(Paragraph::new(left), body[0]);
 
+    let recents_active = ctx.ui.home_pane == HomePane::Recents;
+    let recent_title = if recents_active {
+        "▸ RECENT"
+    } else {
+        "RECENT"
+    };
     let mut right: Vec<Line> = vec![
         Line::from(Span::styled(
-            "RECENT",
+            recent_title,
             theme::style_muted().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -2825,10 +2869,27 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 theme::style_faint(),
             )));
         } else {
-            for entry in db.history.iter().take(6) {
+            let rsel = ctx.ui.home_recent_selected;
+            for (i, entry) in db.history.iter().rev().take(6).enumerate() {
+                let selected = recents_active && i == rsel;
+                let cursor = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(theme::text())
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    theme::style_muted()
+                };
+                right.push(Line::from(vec![
+                    Span::styled(cursor, theme::style_selected()),
+                    Span::styled(entry.label(40), style),
+                ]));
+            }
+            if recents_active {
+                right.push(Line::from(""));
                 right.push(Line::from(Span::styled(
-                    entry.label(42),
-                    theme::style_muted(),
+                    "Enter → Studio with SQL",
+                    theme::style_faint(),
                 )));
             }
         }
@@ -2876,6 +2937,8 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     frame.render_widget(Paragraph::new(right), body[1]);
 
     let foot = vec![Line::from(vec![
+        Span::styled("Tab", theme::style_text()),
+        Span::styled(" pane  ·  ", theme::style_faint()),
         Span::styled("j/k", theme::style_text()),
         Span::styled("  ·  ", theme::style_faint()),
         Span::styled("Enter", theme::style_text()),
@@ -2888,8 +2951,6 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         Span::styled(" pin  ·  ", theme::style_faint()),
         Span::styled("r", theme::style_text()),
         Span::styled(" health  ·  ", theme::style_faint()),
-        Span::styled("c", theme::style_text()),
-        Span::styled(" config  ·  ", theme::style_faint()),
         Span::styled("q", theme::style_text()),
         Span::styled(" quit", theme::style_faint()),
     ])];
@@ -2906,7 +2967,7 @@ fn render_db_home_status(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "  j/k  ·  Enter open  ·  a add  ·  p pin  ·  r health  ·  q quit ",
+            "  Tab pane  ·  j/k  ·  Enter open  ·  a add  ·  p pin  ·  r health  ·  q quit ",
             theme::style_faint(),
         ),
     ]);

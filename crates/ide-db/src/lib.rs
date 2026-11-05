@@ -1858,6 +1858,39 @@ impl DbWorkspace {
         self.status = format!("new tab · {}", self.tabs[self.active_tab].title);
     }
 
+    /// After Home→Studio: ensure a console tab and a calm starter buffer when still default.
+    pub fn prepare_studio_entry(&mut self) {
+        if self.tabs.is_empty() {
+            self.tabs.push(SqlTab::query(1));
+            self.active_tab = 0;
+            self.load_active_tab();
+        }
+        let trimmed = self.sql.trim();
+        let is_default = trimmed.is_empty() || trimmed == "SELECT 1;" || trimmed == "SELECT 1";
+        if !is_default || self.last_result.is_some() {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                if tab.source_id.is_none() {
+                    tab.source_id = self.active_source.clone();
+                }
+            }
+            return;
+        }
+        let (name, driver) = self
+            .active_source
+            .as_ref()
+            .and_then(|id| self.sources.iter().find(|s| &s.id == id))
+            .map(|s| (s.name.as_str(), s.driver.label()))
+            .unwrap_or(("database", "SQL"));
+        self.sql = format!(
+            "-- {name} ({driver}) · connected\n-- Explorer: Enter on a table · F5 / Ctrl-↵ run\nSELECT 1 AS ok;\n"
+        );
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.sql = self.sql.clone();
+            tab.source_id = self.active_source.clone();
+            tab.database = self.active_database.clone();
+        }
+    }
+
     /// Close the active SQL tab (keeps at least one). Returns true if closed.
     pub fn close_active_tab(&mut self) -> bool {
         if self.tabs.len() <= 1 {
