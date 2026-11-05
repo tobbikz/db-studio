@@ -118,10 +118,16 @@ pub struct UiState {
     pub agent_form_field: usize,
     /// Home hub selection: Code products (0..2) or DB source index (0..8).
     pub home_selected: usize,
-    /// DB Home: Sources list vs Recent queries.
+    /// DB Home: Sources · Recents · Favorites.
     pub home_pane: HomePane,
     /// Selected index within recent history (newest-first, 0..5).
     pub home_recent_selected: usize,
+    /// Selected index within pinned favorites.
+    pub home_favorite_selected: usize,
+    /// `?` keymap cheat overlay.
+    pub show_help: bool,
+    /// Transient chrome busy label (`connecting…` / `RUNNING…`).
+    pub busy_label: Option<String>,
 }
 
 /// Which column is active on DB Home.
@@ -130,6 +136,7 @@ pub enum HomePane {
     #[default]
     Sources,
     Recents,
+    Favorites,
 }
 
 impl Default for UiState {
@@ -194,6 +201,9 @@ impl Default for UiState {
             home_selected: 0,
             home_pane: HomePane::Sources,
             home_recent_selected: 0,
+            home_favorite_selected: 0,
+            show_help: false,
+            busy_label: None,
         }
     }
 }
@@ -636,6 +646,9 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
                 "save & leave",
             );
         }
+        if ctx.ui.show_help {
+            render_db_help_overlay(frame, size, ctx.ui.db_surface);
+        }
         return;
     }
 
@@ -1012,16 +1025,31 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 ]))
             })
             .collect(),
-        Some(ws) => vec![
-            ListItem::new(Span::styled(
+        Some(ws) => {
+            let loading = ws.status.to_lowercase().contains("load")
+                || ws.status.to_lowercase().contains("fetch")
+                || ws.status.to_lowercase().contains("expand");
+            let mut items = vec![ListItem::new(Span::styled(
                 format!(" {} ", ws.status),
                 theme::style_muted(),
-            )),
-            ListItem::new(Span::styled(
-                " expand a source · Enter on a table ",
-                theme::style_faint(),
-            )),
-        ],
+            ))];
+            if loading {
+                items.push(ListItem::new(Span::styled(
+                    " loading schemas… ",
+                    theme::style_accent(),
+                )));
+            } else {
+                items.push(ListItem::new(Span::styled(
+                    " expand a source · Enter on a table ",
+                    theme::style_faint(),
+                )));
+                items.push(ListItem::new(Span::styled(
+                    " empty schema? check grants / database field ",
+                    theme::style_faint(),
+                )));
+            }
+            items
+        }
         None => vec![ListItem::new(Span::styled(
             " no sources — press a to connect ",
             theme::style_faint(),
@@ -1197,23 +1225,21 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 
     // Toolbar strip inside console
     if h >= 2 {
-        let run_hint = if ctx.db.map(|d| d.query_running).unwrap_or(false) {
+        let run_hint = if ctx.db.map(|d| d.query_running).unwrap_or(false)
+            || ctx.ui.busy_label.as_deref() == Some("RUNNING…")
+        {
             Span::styled(" RUNNING… Esc ", theme::style_selected())
         } else {
-            Span::styled(" F5 / Ctrl-↵ run ", theme::style_text())
+            Span::styled(" F5 run ", theme::style_text())
         };
         let hist_n = ctx.db.map(|d| d.history.len()).unwrap_or(0);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" ▸ ", theme::style_muted()),
+                Span::styled(" ", theme::style_faint()),
                 run_hint,
-                Span::styled(" · ", theme::style_faint()),
-                Span::styled("Ctrl-E explain", theme::style_faint()),
-                Span::styled(" · ", theme::style_faint()),
-                Span::styled(
-                    format!("hist {hist_n}"),
-                    theme::style_faint(),
-                ),
+                Span::styled(" · hist ", theme::style_faint()),
+                Span::styled(format!("{hist_n}"), theme::style_muted()),
+                Span::styled(" · Ctrl-] source ", theme::style_faint()),
             ]))
             .style(Style::default().bg(theme::surface_2())),
             Rect {
@@ -2061,7 +2087,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 theme::style_faint(),
             )),
             Line::from(Span::styled(
-                "  y copy  ·  i edit  ·  / filter",
+                "  Ctrl-⇧E CSV · Ctrl-⇧L SQL · D density",
                 theme::style_faint(),
             )),
         ])
@@ -2533,7 +2559,23 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
         DbSurface::Home => "home",
         DbSurface::Studio => "studio",
     };
-    let spans = vec![
+    let busy = ctx
+        .ui
+        .busy_label
+        .as_deref()
+        .or_else(|| {
+            if ctx.db.map(|d| d.query_running).unwrap_or(false) {
+                Some("RUNNING…")
+            } else {
+                None
+            }
+        });
+    let density = if ctx.ui.results_compact {
+        "compact"
+    } else {
+        "comfort"
+    };
+    let mut spans = vec![
         Span::styled(
             " DB Studio ",
             Style::default()
@@ -2546,9 +2588,96 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
         Span::styled(conn.to_string(), theme::style_faint()),
         Span::styled("  ", theme::style_faint()),
         Span::styled(health, theme::style_muted()),
+        Span::styled(format!("  ·  {density}"), theme::style_faint()),
     ];
+    if let Some(b) = busy {
+        spans.push(Span::styled("  ·  ", theme::style_faint()));
+        spans.push(Span::styled(
+            b.to_string(),
+            theme::style_accent().add_modifier(Modifier::BOLD),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
+        area,
+    );
+}
+
+fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
+    let width = screen.width.min(64).max(40);
+    let height = screen.height.min(18).max(12);
+    let x = screen.x + (screen.width.saturating_sub(width)) / 2;
+    let y = screen.y + (screen.height.saturating_sub(height)) / 4;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let title = match surface {
+        DbSurface::Home => " help · Home ",
+        DbSurface::Studio => " help · Studio ",
+    };
+    let lines: Vec<Line> = match surface {
+        DbSurface::Home => vec![
+            Line::from(Span::styled("Tab", theme::style_text())),
+            Line::from(Span::styled(
+                "  sources · recents · favorites",
+                theme::style_faint(),
+            )),
+            Line::from(Span::styled(
+                "Enter open · 1-9 source · a add · p pin · r health",
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "Drivers: Postgres · MySQL · SQLite · DuckDB · …",
+                theme::style_faint(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "? / Esc close",
+                theme::style_faint(),
+            )),
+        ],
+        DbSurface::Studio => vec![
+            Line::from(Span::styled(
+                "1–4 panes · Tab cycle · f fullscreen",
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "Esc explorer → Esc Home · Ctrl-] / Ctrl-[ switch source",
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "F5 / Ctrl-↵ run · D density · y yank cell",
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "Ctrl-⇧E CSV · Ctrl-⇧L SQL export · a edit connection",
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "SSH jump: set SSH host on connection form",
+                theme::style_faint(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "? / Esc close",
+                theme::style_faint(),
+            )),
+        ],
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::default().fg(theme::border_idle()))
+                    .style(Style::default().bg(theme::surface())),
+            )
+            .alignment(ratatui::layout::Alignment::Left),
         area,
     );
 }
@@ -2718,11 +2847,11 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                "No connections yet. Press  a  to add one.",
+                "1  a  add connection   ·   2  Enter open   ·   3  explore",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Postgres · MySQL · SQLite · DuckDB",
+                "Postgres · MySQL · SQLite · DuckDB · SSH jump optional",
                 theme::style_faint(),
             )),
         ]
@@ -2739,7 +2868,7 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Enter connects · then Studio",
+                "Tab panes · Enter open · ? help",
                 theme::style_faint(),
             )),
         ]
@@ -2772,7 +2901,15 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     if let Some(db) = ctx.db {
         if db.sources.is_empty() {
             left.push(Line::from(Span::styled(
-                "(none — press a)",
+                "  1 · press a — add a source",
+                theme::style_muted(),
+            )));
+            left.push(Line::from(Span::styled(
+                "  2 · Enter — open Studio",
+                theme::style_faint(),
+            )));
+            left.push(Line::from(Span::styled(
+                "  3 · Explorer — tables & SQL",
                 theme::style_faint(),
             )));
         } else {
@@ -2895,8 +3032,14 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         }
 
         right.push(Line::from(""));
+        let fav_active = ctx.ui.home_pane == HomePane::Favorites;
+        let fav_title = if fav_active {
+            "▸ FAVORITES"
+        } else {
+            "FAVORITES"
+        };
         right.push(Line::from(Span::styled(
-            "FAVORITES",
+            fav_title,
             theme::style_muted().add_modifier(Modifier::BOLD),
         )));
         right.push(Line::from(Span::styled(
@@ -2910,27 +3053,44 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             .iter()
             .filter(|s| s.pinned)
             .map(|s| s.name.as_str())
-            .take(4)
+            .take(6)
             .collect();
         if pinned.is_empty() && db.bookmarks.is_empty() {
             right.push(Line::from(Span::styled(
-                "(p pin source · bookmarks later)",
+                "(p pin source · Tab here · Enter open)",
                 theme::style_faint(),
             )));
         } else {
-            for name in pinned {
+            let fsel = ctx.ui.home_favorite_selected;
+            for (i, name) in pinned.iter().enumerate() {
+                let selected = fav_active && i == fsel;
+                let cursor = if selected { "› " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(theme::text())
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    theme::style_text()
+                };
                 right.push(Line::from(vec![
+                    Span::styled(cursor, theme::style_selected()),
                     Span::styled("★ ", theme::style_muted()),
-                    Span::styled(name.to_string(), theme::style_text()),
+                    Span::styled((*name).to_string(), style),
                 ]));
             }
-            for bm in db.bookmarks.iter().take(4) {
+            for bm in db.bookmarks.iter().take(3) {
                 let label = if bm.chars().count() > 40 {
                     format!("{}…", bm.chars().take(39).collect::<String>())
                 } else {
                     bm.clone()
                 };
                 right.push(Line::from(Span::styled(label, theme::style_faint())));
+            }
+            if fav_active && !pinned.is_empty() {
+                right.push(Line::from(Span::styled(
+                    "Enter → connect favorite",
+                    theme::style_faint(),
+                )));
             }
         }
     }
@@ -2967,7 +3127,7 @@ fn render_db_home_status(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "  Tab pane  ·  j/k  ·  Enter open  ·  a add  ·  p pin  ·  r health  ·  q quit ",
+            "  Tab  ·  j/k  ·  Enter  ·  a  ·  p  ·  r  ·  ?  ·  q ",
             theme::style_faint(),
         ),
     ]);

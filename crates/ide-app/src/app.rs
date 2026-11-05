@@ -474,10 +474,42 @@ impl App {
     }
 
     fn set_status(&mut self, text: impl Into<String>, error: bool) {
-        self.ui.status = Some(StatusMessage {
-            text: text.into(),
-            error,
-        });
+        let raw = text.into();
+        let text = if error {
+            Self::human_err(&raw)
+        } else {
+            Self::human_ok(&raw)
+        };
+        self.ui.status = Some(StatusMessage { text, error });
+    }
+
+    fn human_ok(raw: &str) -> String {
+        let line = raw.lines().next().unwrap_or(raw).trim();
+        if line.chars().count() <= 88 {
+            line.to_string()
+        } else {
+            format!("{}…", line.chars().take(87).collect::<String>())
+        }
+    }
+
+    fn human_err(raw: &str) -> String {
+        let line = raw
+            .lines()
+            .next()
+            .unwrap_or(raw)
+            .split("Caused by:")
+            .next()
+            .unwrap_or(raw)
+            .trim();
+        let cleaned = line
+            .trim_start_matches("Error:")
+            .trim_start_matches("error:")
+            .trim();
+        if cleaned.chars().count() <= 72 {
+            cleaned.to_string()
+        } else {
+            format!("{}…", cleaned.chars().take(71).collect::<String>())
+        }
     }
 
     fn enter_database_mode(&mut self) {
@@ -695,6 +727,7 @@ impl App {
             return;
         };
         self.ui.home_selected = idx;
+        self.ui.busy_label = Some(format!("connecting · {}", src.name));
         self.set_status(format!("connecting · {}…", src.name), false);
         match self.db.ensure_connected(&src.id, None).await {
             Ok(()) => {
@@ -705,10 +738,12 @@ impl App {
                     .insert(src.id.clone(), ide_db::ConnHealth::ok_now());
                 self.db.rebuild_flat();
                 self.db.status = format!("connected · {}", src.name);
+                self.ui.busy_label = None;
                 self.enter_db_studio();
                 self.set_status(format!("connected · {}", src.name), false);
             }
             Err(e) => {
+                self.ui.busy_label = None;
                 self.db.connection_health.insert(
                     src.id.clone(),
                     ide_db::ConnHealth::Dead(format!("{e:#}")),
@@ -720,9 +755,16 @@ impl App {
 
     /// Home Enter: connect selected/active source, then open Studio.
     async fn home_enter_studio(&mut self) {
-        if self.ui.home_pane == ide_ui::HomePane::Recents {
-            self.home_open_recent().await;
-            return;
+        match self.ui.home_pane {
+            ide_ui::HomePane::Recents => {
+                self.home_open_recent().await;
+                return;
+            }
+            ide_ui::HomePane::Favorites => {
+                self.home_open_favorite().await;
+                return;
+            }
+            ide_ui::HomePane::Sources => {}
         }
         if self.db.sources.is_empty() {
             self.start_add_connection();
@@ -733,6 +775,70 @@ impl App {
             .home_selected
             .min(self.db.sources.len().saturating_sub(1));
         let slot = (idx + 1) as u8;
+        self.open_db_source_slot(slot).await;
+    }
+
+    /// Studio: cycle active source by delta (±1), reconnect, stay in Studio.
+    async fn cycle_db_source(&mut self, delta: i32) {
+        if self.db.sources.is_empty() {
+            self.set_status("no sources — a to add", true);
+            return;
+        }
+        let cur = self
+            .db
+            .active_source
+            .as_ref()
+            .and_then(|id| self.db.sources.iter().position(|s| &s.id == id))
+            .unwrap_or(0);
+        let n = self.db.sources.len() as i32;
+        let next = ((cur as i32 + delta).rem_euclid(n)) as usize;
+        let src = self.db.sources[next].clone();
+        self.ui.busy_label = Some(format!("connecting · {}", src.name));
+        self.set_status(format!("switching · {}…", src.name), false);
+        match self.db.ensure_connected(&src.id, None).await {
+            Ok(()) => {
+                self.db.active_source = Some(src.id.clone());
+                let _ = self.db.save_sources();
+                self.db
+                    .connection_health
+                    .insert(src.id.clone(), ide_db::ConnHealth::ok_now());
+                self.db.rebuild_flat();
+                if let Some(tab) = self.db.tabs.get_mut(self.db.active_tab) {
+                    tab.source_id = Some(src.id.clone());
+                }
+                self.ui.busy_label = None;
+                self.set_status(format!("active · {}", src.name), false);
+            }
+            Err(e) => {
+                self.ui.busy_label = None;
+                self.db.connection_health.insert(
+                    src.id.clone(),
+                    ide_db::ConnHealth::Dead(format!("{e:#}")),
+                );
+                self.set_status(format!("switch failed · {}: {e:#}", src.name), true);
+            }
+        }
+    }
+
+    /// Home Favorites: open pinned source by selection.
+    async fn home_open_favorite(&mut self) {
+        let pinned: Vec<(usize, String)> = self
+            .db
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.pinned)
+            .map(|(i, s)| (i, s.id.clone()))
+            .collect();
+        if pinned.is_empty() {
+            self.set_status("no favorites — p to pin a source", true);
+            return;
+        }
+        let idx = self
+            .ui
+            .home_favorite_selected
+            .min(pinned.len().saturating_sub(1));
+        let slot = (pinned[idx].0 + 1) as u8;
         self.open_db_source_slot(slot).await;
     }
 
@@ -1292,6 +1398,7 @@ impl App {
         self.db.result_page = 0;
         self.db.query_running = true;
         self.pending_db_query = true;
+        self.ui.busy_label = Some("RUNNING…".into());
         self.set_status("RUNNING… Esc cancels", false);
     }
 
@@ -1312,6 +1419,7 @@ impl App {
             Ok(()) => {
                 self.ui.focus = Focus::Results;
                 self.ui.mode = Mode::Normal;
+                self.ui.busy_label = None;
                 self.set_status(self.db.status.clone(), false);
             }
             Err(e) => {
@@ -1335,6 +1443,7 @@ impl App {
                 });
                 self.ui.focus = Focus::Results;
                 self.ui.mode = Mode::Normal;
+                self.ui.busy_label = None;
                 self.set_status(format!("query: {msg}"), true);
             }
         }
@@ -4132,7 +4241,29 @@ impl App {
                 }
             }
             Action::EnterDbStudio => self.enter_db_studio(),
-            Action::GoHome => self.go_home(),
+            Action::GoHome => {
+                if self.ui.product == ProductMode::Database {
+                    self.ui.show_help = false;
+                    self.ui.busy_label = None;
+                    self.go_db_home();
+                } else {
+                    self.go_home();
+                }
+            }
+            Action::ToggleHelp => {
+                self.ui.show_help = !self.ui.show_help;
+            }
+            Action::ToggleResultsDensity => {
+                self.ui.results_compact = !self.ui.results_compact;
+                let label = if self.ui.results_compact {
+                    "compact"
+                } else {
+                    "comfort"
+                };
+                self.set_status(format!("results density · {label}"), false);
+            }
+            Action::CycleDbSourceNext => self.cycle_db_source(1).await,
+            Action::CycleDbSourcePrev => self.cycle_db_source(-1).await,
             Action::OpenFolder => self.start_open_folder(),
             Action::OpenProjects => self.open_projects_palette(),
             Action::OpenHomeSlot(n) => {
@@ -6400,13 +6531,23 @@ async fn event_loop(
                                 KeyCode::Tab | KeyCode::BackTab => {
                                     app.ui.home_pane = match app.ui.home_pane {
                                         ide_ui::HomePane::Sources => ide_ui::HomePane::Recents,
-                                        ide_ui::HomePane::Recents => ide_ui::HomePane::Sources,
+                                        ide_ui::HomePane::Recents => ide_ui::HomePane::Favorites,
+                                        ide_ui::HomePane::Favorites => ide_ui::HomePane::Sources,
                                     };
                                     let label = match app.ui.home_pane {
                                         ide_ui::HomePane::Sources => "sources",
                                         ide_ui::HomePane::Recents => "recents",
+                                        ide_ui::HomePane::Favorites => "favorites",
                                     };
                                     app.set_status(format!("Home · {label}"), false);
+                                    continue;
+                                }
+                                KeyCode::Char('?') => {
+                                    app.ui.show_help = !app.ui.show_help;
+                                    continue;
+                                }
+                                KeyCode::Esc if app.ui.show_help => {
+                                    app.ui.show_help = false;
                                     continue;
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
@@ -6418,6 +6559,10 @@ async fn event_loop(
                                         ide_ui::HomePane::Recents => {
                                             app.ui.home_recent_selected =
                                                 app.ui.home_recent_selected.saturating_sub(1);
+                                        }
+                                        ide_ui::HomePane::Favorites => {
+                                            app.ui.home_favorite_selected =
+                                                app.ui.home_favorite_selected.saturating_sub(1);
                                         }
                                     }
                                     continue;
@@ -6440,6 +6585,18 @@ async fn event_loop(
                                                 .min(5);
                                             if app.ui.home_recent_selected < max {
                                                 app.ui.home_recent_selected += 1;
+                                            }
+                                        }
+                                        ide_ui::HomePane::Favorites => {
+                                            let max = app
+                                                .db
+                                                .sources
+                                                .iter()
+                                                .filter(|s| s.pinned)
+                                                .count()
+                                                .saturating_sub(1);
+                                            if app.ui.home_favorite_selected < max {
+                                                app.ui.home_favorite_selected += 1;
                                             }
                                         }
                                     }
@@ -6652,19 +6809,63 @@ async fn event_loop(
                                 KeyCode::Esc
                                     if !ctrl && app.ui.mode == Mode::Normal =>
                                 {
+                                    if app.ui.show_help {
+                                        app.ui.show_help = false;
+                                        continue;
+                                    }
                                     if app.ui.db_fullscreen.is_some() {
                                         app.ui.db_fullscreen = None;
                                         app.set_status("fullscreen off", false);
                                         continue;
                                     }
+                                    if app.db.query_running {
+                                        app.db.request_query_cancel();
+                                        app.set_status("cancelling query…", false);
+                                        continue;
+                                    }
                                     if app.ui.focus != Focus::Database {
                                         app.focus_db_explorer();
                                         app.set_status(
-                                            "1 Explorer · Tab panes · f fullscreen",
+                                            "1 Explorer · Esc Home · Tab panes",
                                             false,
                                         );
                                         continue;
                                     }
+                                    // Explorer focused → Home
+                                    app.ui.busy_label = None;
+                                    app.go_db_home();
+                                    continue;
+                                }
+                                KeyCode::Char('?')
+                                    if !ctrl && app.ui.mode == Mode::Normal =>
+                                {
+                                    app.ui.show_help = !app.ui.show_help;
+                                    continue;
+                                }
+                                KeyCode::Char(']')
+                                    if ctrl && app.ui.mode == Mode::Normal =>
+                                {
+                                    app.cycle_db_source(1).await;
+                                    continue;
+                                }
+                                KeyCode::Char('[')
+                                    if ctrl && app.ui.mode == Mode::Normal =>
+                                {
+                                    app.cycle_db_source(-1).await;
+                                    continue;
+                                }
+                                KeyCode::Char('D')
+                                    if !ctrl && app.ui.mode == Mode::Normal
+                                        && app.ui.focus == Focus::Results =>
+                                {
+                                    app.ui.results_compact = !app.ui.results_compact;
+                                    let label = if app.ui.results_compact {
+                                        "compact"
+                                    } else {
+                                        "comfort"
+                                    };
+                                    app.set_status(format!("results density · {label}"), false);
+                                    continue;
                                 }
                                 KeyCode::Char('f') | KeyCode::Char('F')
                                     if !ctrl && app.ui.mode == Mode::Normal =>

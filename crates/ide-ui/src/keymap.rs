@@ -187,6 +187,14 @@ pub enum Action {
     SaveResultTemp,
     SaveResultView,
     CancelQuery,
+    /// Studio: cycle to next data source and reconnect.
+    CycleDbSourceNext,
+    /// Studio: cycle to previous data source and reconnect.
+    CycleDbSourcePrev,
+    /// Toggle `?` keymap help overlay.
+    ToggleHelp,
+    /// Toggle results compact/comfort density.
+    ToggleResultsDensity,
 }
 
 pub struct Keymap;
@@ -261,6 +269,9 @@ impl Keymap {
                 (true, false, KeyCode::Char('1')) => Some(Action::ProductTab(0)),
                 (true, false, KeyCode::Char('2')) => Some(Action::ProductTab(1)),
                 (true, false, KeyCode::Char('3')) => Some(Action::ProductTab(2)),
+                (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
+                (true, false, KeyCode::Char(']')) => Some(Action::CycleDbSourceNext),
+                (true, false, KeyCode::Char('[')) => Some(Action::CycleDbSourcePrev),
                 (false, false, KeyCode::Char('e')) => Some(Action::EnterCodeEditor),
                 (false, false, KeyCode::Char('o')) => Some(Action::OpenFolder),
                 (false, false, KeyCode::Char('p')) => Some(Action::OpenProjects),
@@ -412,29 +423,40 @@ impl Keymap {
                 (false, KeyCode::Esc) => Some(Action::FocusEditor),
                 _ => None,
             },
-            KeyContext::Database => match (ctrl, key.code) {
-                (false, KeyCode::Char('q')) => Some(Action::Quit),
-                (false, KeyCode::Char('j')) | (false, KeyCode::Down) => Some(Action::MoveDown),
-                (false, KeyCode::Char('k')) | (false, KeyCode::Up) => Some(Action::MoveUp),
-                (false, KeyCode::Enter) | (false, KeyCode::Char('l')) => Some(Action::ToggleOrOpen),
-                (false, KeyCode::Char('2')) => Some(Action::FocusEditor),
-                (false, KeyCode::Char('3')) => Some(Action::FocusResults),
-                (false, KeyCode::Char('r')) => Some(Action::RefreshTree),
-                (false, KeyCode::Char('e')) => Some(Action::EditDataSource),
-                (false, KeyCode::Tab) => Some(Action::CycleDbPane),
-                (false, KeyCode::Esc) => Some(Action::FocusEditor),
-                (true, KeyCode::Char('p')) => Some(Action::OpenDbObjectPalette),
-                (true, KeyCode::Char('e')) => Some(Action::ExplainQuery),
-                (true, KeyCode::Enter)
-                | (true, KeyCode::Char('\n'))
-                | (true, KeyCode::Char('j'))
-                | (true, KeyCode::Char('r'))
-                | (false, KeyCode::F(5)) => Some(Action::RunQuery),
+            KeyContext::Database => match (ctrl, shift, key.code) {
+                (false, false, KeyCode::Char('q')) => Some(Action::Quit),
+                (false, false, KeyCode::Char('j')) | (false, false, KeyCode::Down) => {
+                    Some(Action::MoveDown)
+                }
+                (false, false, KeyCode::Char('k')) | (false, false, KeyCode::Up) => {
+                    Some(Action::MoveUp)
+                }
+                (false, false, KeyCode::Enter) | (false, false, KeyCode::Char('l')) => {
+                    Some(Action::ToggleOrOpen)
+                }
+                (false, false, KeyCode::Char('2')) => Some(Action::FocusEditor),
+                (false, false, KeyCode::Char('3')) => Some(Action::FocusResults),
+                (false, false, KeyCode::Char('r')) => Some(Action::RefreshTree),
+                (false, false, KeyCode::Char('e')) => Some(Action::EditDataSource),
+                (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
+                (false, false, KeyCode::Tab) => Some(Action::CycleDbPane),
+                (false, false, KeyCode::Esc) => Some(Action::GoHome),
+                (true, false, KeyCode::Char('p')) => Some(Action::OpenDbObjectPalette),
+                (true, false, KeyCode::Char('e')) => Some(Action::ExplainQuery),
+                (true, false, KeyCode::Char(']')) => Some(Action::CycleDbSourceNext),
+                (true, false, KeyCode::Char('[')) => Some(Action::CycleDbSourcePrev),
+                (true, false, KeyCode::Enter)
+                | (true, false, KeyCode::Char('\n'))
+                | (true, false, KeyCode::Char('j'))
+                | (true, false, KeyCode::Char('r'))
+                | (false, false, KeyCode::F(5)) => Some(Action::RunQuery),
                 _ => None,
             },
             KeyContext::Results => match (ctrl, shift, key.code) {
                 (false, false, KeyCode::Char(']')) => Some(Action::ResultPageNext),
                 (false, false, KeyCode::Char('[')) => Some(Action::ResultPagePrev),
+                (true, false, KeyCode::Char(']')) => Some(Action::CycleDbSourceNext),
+                (true, false, KeyCode::Char('[')) => Some(Action::CycleDbSourcePrev),
                 (true, false, KeyCode::Enter)
                 | (true, false, KeyCode::Char('\n'))
                 | (true, false, KeyCode::Char('j'))
@@ -442,11 +464,15 @@ impl Keymap {
                 | (false, false, KeyCode::F(5)) => Some(Action::RunQuery),
                 (true, false, KeyCode::Char('s')) => Some(Action::ApplyRowUpdates),
                 (true, true, KeyCode::Char('E')) => Some(Action::ExportCsv),
-                (true, true, KeyCode::Char('S')) => Some(Action::ExportSql),
+                (true, true, KeyCode::Char('S') | KeyCode::Char('l') | KeyCode::Char('L')) => {
+                    Some(Action::ExportSql)
+                }
                 (true, true, KeyCode::Char('I')) => Some(Action::ImportCsv),
                 (false, false, KeyCode::Char('K')) => Some(Action::KillSession),
                 (false, false, KeyCode::Char('a')) => Some(Action::ApplyRowUpdates),
                 (false, false, KeyCode::Char('u')) => Some(Action::Undo),
+                (false, false, KeyCode::Char('D')) => Some(Action::ToggleResultsDensity),
+                (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Char('i')) | (false, false, KeyCode::Enter) => {
                     Some(Action::EditCell)
                 }

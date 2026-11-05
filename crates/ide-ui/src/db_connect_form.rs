@@ -530,7 +530,7 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
 
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "  Data source  ·  TLS + read-only  ·  SSH jump optional",
+            "  Source · TLS · read-only · SSH jump (host empty = direct)",
             theme::style_muted(),
         )),
         inner[0],
@@ -544,9 +544,17 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
     );
 
     let mut lines: Vec<Line> = Vec::new();
+    let mut saw_ssh = false;
     for field in ConnField::ALL {
         if !form.field_enabled(field) {
             continue;
+        }
+        if matches!(field, ConnField::SshHost) && !saw_ssh {
+            saw_ssh = true;
+            lines.push(Line::from(Span::styled(
+                "   — SSH jump (optional) —",
+                theme::style_faint(),
+            )));
         }
         let focused = form.focus == field;
         let marker = if focused { "▸" } else { " " };
@@ -605,13 +613,13 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
         Paragraph::new(Line::from(vec![
             Span::styled("  ", theme::style_faint()),
             Span::styled("Tab", theme::style_pill_off()),
-            Span::styled(" field  ", theme::style_faint()),
-            Span::styled("←→", theme::style_pill_off()),
-            Span::styled(" cycle  ", theme::style_faint()),
+            Span::styled(" field · ", theme::style_faint()),
+            Span::styled("password", theme::style_muted()),
+            Span::styled(" env:VAR / vault · ", theme::style_faint()),
+            Span::styled("SSH", theme::style_muted()),
+            Span::styled(" jump optional · ", theme::style_faint()),
             Span::styled("Enter", theme::style_pill_off()),
-            Span::styled(" save  ", theme::style_faint()),
-            Span::styled("Ctrl-T", theme::style_pill_off()),
-            Span::styled("/F6 test  ", theme::style_faint()),
+            Span::styled(" save · ", theme::style_faint()),
             Span::styled("Esc", theme::style_pill_off()),
             Span::styled(" cancel", theme::style_faint()),
         ])),
