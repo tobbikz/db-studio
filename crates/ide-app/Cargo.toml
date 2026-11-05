@@ -1,0 +1,39 @@
+[package]
+name = "ide-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "db-studio"
+path = "src/main.rs"
+
+[dependencies]
+ide-core.workspace = true
+ide-config.workspace = true
+ide-buffer.workspace = true
+ide-fs.workspace = true
+ide-syntax.workspace = true
+ide-lsp.workspace = true
+ide-git.workspace = true
+ide-search.workspace = true
+ide-db.workspace = true
+ide-term.workspace = true
+ide-sessions.workspace = true
+ide-agents.workspace = true
+ide-dap.workspace = true
+ide-plugins.workspace = true
+ide-nvim.workspace = true
+ide-ui.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+lsp-types.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+arboard.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "ide-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ide-core.workspace = true
+ide-buffer.workspace = true
+ide-fs.workspace = true
+ide-syntax.workspace = true
+ide-lsp.workspace = true
+ide-git.workspace = true
+ide-search.workspace = true
+ide-sessions.workspace = true
+ide-agents.workspace = true
+ide-db.workspace = true
+ide-config.workspace = true
+ide-dap.workspace = true
+ide-nvim.workspace = true
+ide-plugins = { workspace = true, optional = true }
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true
+nucleo-matcher.workspace = true
+lsp-types.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "ide-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ide-core.workspace = true
+ignore.workspace = true
+walkdir.workspace = true
+anyhow.workspace = true

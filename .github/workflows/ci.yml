@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      duckdb:
+        description: "Also run DuckDB smoke (compiles libduckdb — slow/heavy)"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: ide-db sqlite smoke + Wave6 unit helpers
+        run: cargo test -p ide-db --test sqlite_smoke -- --nocapture
+      - name: ide-term PTY smoke
+        run: cargo test -p ide-term -- --nocapture
+      - name: workspace check (Code + DB crates)
+        run: cargo check --release -p ide-db -p ide-ui -p ide-core -p ide-app -p ide-term -p ide-search -p ide-git -p ide-dap -p ide-nvim
+      - name: install Neovim for embed smoke
+        run: sudo apt-get update && sudo apt-get install -y neovim
+      - name: ide-nvim embed_smoke
+        run: cargo test -p ide-nvim --test embed_smoke -- --nocapture
+      - name: ide-db duckdb smoke (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.duckdb }}
+        run: cargo test -p ide-db --test duckdb_smoke -- --nocapture
+      - name: Release checklist note
+        run: |
+          echo "Release gate: cargo check + ide-term + ide-nvim embed_smoke + ide-db sqlite_smoke"
+          echo "Optional: workflow_dispatch duckdb=true for duckdb_smoke"
+

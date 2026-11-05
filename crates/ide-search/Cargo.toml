@@ -1,0 +1,12 @@
+[package]
+name = "ide-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+regex.workspace = true
+ignore.workspace = true
+serde.workspace = true

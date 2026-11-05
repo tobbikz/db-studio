@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tui-ide · layouts mono (AMOLED / white)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --page-bg: #050505;
+    --page-fg: #f2f2f2;
+    --muted: #888;
+    --card: #0c0c0c;
+    --line: #222;
+    --ok: #cfcfcf;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page-bg);
+    color: var(--page-fg);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    min-height: 100vh;
+  }
+  header {
+    padding: 24px 28px 14px;
+    border-bottom: 1px solid var(--line);
+    position: sticky;
+    top: 0;
+    background: rgba(5,5,5,.94);
+    z-index: 5;
+  }
+  header h1 { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
+  header p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; max-width: 78ch; }
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-top: 12px;
+  }
+  .mode-btn, .copy-btn {
+    border: 1px solid #333;
+    background: #111;
+    color: #eee;
+    font: inherit;
+    font-size: 11px;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .mode-btn.on { background: #f2f2f2; color: #050505; border-color: #f2f2f2; }
+  .pick { font-size: 12px; color: var(--ok); min-height: 1.2em; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+    gap: 20px;
+    padding: 22px 28px 48px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: border-color 140ms ease, transform 140ms ease;
+  }
+  .card:hover { border-color: #555; transform: translateY(-1px); }
+  .card.selected { border-color: #ddd; box-shadow: inset 0 0 0 1px #ddd; }
+  .meta { padding: 12px 14px 10px; border-bottom: 1px solid var(--line); }
+  .meta .id { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  .meta h2 { margin: 4px 0; font-size: 14px; }
+  .meta .blurb { margin: 0; font-size: 11px; color: var(--muted); line-height: 1.45; }
+  .stage { padding: 12px; background: #000; }
+  body.white-page { --page-bg:#f4f4f4; --page-fg:#111; --muted:#666; --card:#fff; --line:#ddd; --ok:#222; }
+  body.white-page header { background: rgba(244,244,244,.95); }
+  body.white-page .mode-btn, body.white-page .copy-btn { background:#fff; color:#111; border-color:#ccc; }
+  body.white-page .mode-btn.on { background:#111; color:#fff; border-color:#111; }
+  body.white-page .stage { background: #e8e8e8; }
+
+  /* Theme tokens applied to mock */
+  .tui {
+    --bg: #000;
+    --fg: #eaeaea;
+    --dim: #777;
+    --line: #2a2a2a;
+    --panel: #0a0a0a;
+    --hi: #fff;
+    --lo: #111;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--line);
+    overflow: hidden;
+    font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+    font-size: 11px;
+    line-height: 1.35;
+    min-height: 300px;
+  }
+  body.white-mode .tui {
+    --bg: #fff;
+    --fg: #111;
+    --dim: #777;
+    --line: #d0d0d0;
+    --panel: #f3f3f3;
+    --hi: #000;
+    --lo: #eee;
+  }
+
+  .tui * { box-sizing: border-box; }
+  .brand { font-weight: 600; letter-spacing: .03em; }
+  .dim { color: var(--dim); }
+  .on { color: var(--hi); font-weight: 600; }
+  .box { border: 1px solid var(--line); }
+  .fill { background: var(--panel); }
+
+  /* ========== L1 Ribbon top ========== */
+  .L1 { display: grid; grid-template-rows: auto auto 1fr auto; }
+  .L1 .top {
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 14px 8px;
+  }
+  .L1 .tabs {
+    display: flex; gap: 2px; flex: 1; flex-wrap: wrap;
+  }
+  .L1 .tab {
+    padding: 5px 12px; border: 1px solid transparent; border-radius: 3px;
+    color: var(--dim);
+  }
+  .L1 .tab.active {
+    color: var(--hi); border-color: var(--line); background: var(--lo);
+  }
+  .L1 .body { display: grid; grid-template-columns: 148px 1fr; border-top: 1px solid var(--line); min-height: 210px; }
+  .L1 .side { padding: 12px 10px; border-right: 1px solid var(--line); background: var(--panel); }
+  .L1 .side .h { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin-bottom: 10px; }
+  .L1 .side .row { padding: 4px 8px; margin-bottom: 3px; border-radius: 3px; color: var(--dim); }
+  .L1 .side .row.active { color: var(--hi); background: var(--lo); }
+  .L1 .main { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .L1 .bufs { display: flex; gap: 6px; }
+  .L1 .chip { padding: 4px 10px; border: 1px solid var(--line); border-radius: 3px; color: var(--dim); }
+  .L1 .chip.on { color: var(--hi); background: var(--lo); }
+  .L1 .ed { flex: 1; border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px; white-space: pre; color: var(--dim); }
+  .L1 .status {
+    display: flex; gap: 8px; align-items: center;
+    padding: 8px 14px; border-top: 1px solid var(--line); font-size: 10px;
+  }
+  .L1 .pill { padding: 3px 8px; border: 1px solid var(--line); background: var(--lo); color: var(--hi); font-weight: 600; }
+
+  /* ========== L2 Icon rail ========== */
+  .L2 { display: grid; grid-template-columns: 44px 1fr; grid-template-rows: auto 1fr auto; }
+  .L2 .rail {
+    grid-row: 1 / 4;
+    border-right: 1px solid var(--line);
+    background: var(--panel);
+    display: flex; flex-direction: column; align-items: center;
+    padding: 10px 0; gap: 6px;
+  }
+  .L2 .rail .ic {
+    width: 28px; height: 28px; display: grid; place-items: center;
+    border: 1px solid transparent; border-radius: 4px; color: var(--dim); font-size: 10px;
+  }
+  .L2 .rail .ic.active { color: var(--hi); border-color: var(--line); background: var(--lo); }
+  .L2 .head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+  }
+  .L2 .head .path { color: var(--dim); font-size: 10px; }
+  .L2 .work {
+    display: grid; grid-template-columns: 150px 1fr; min-height: 220px;
+  }
+  .L2 .side { padding: 12px 10px; border-right: 1px solid var(--line); }
+  .L2 .side .h { color: var(--dim); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 10px; }
+  .L2 .side .row { padding: 4px 8px; color: var(--dim); margin-bottom: 2px; }
+  .L2 .side .row.active { color: var(--hi); }
+  .L2 .main { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .L2 .bufs { display: flex; gap: 8px; }
+  .L2 .chip { padding: 4px 10px; color: var(--dim); border-bottom: 2px solid transparent; }
+  .L2 .chip.on { color: var(--hi); border-bottom-color: var(--hi); }
+  .L2 .ed { flex: 1; border: 1px solid var(--line); padding: 12px 14px; white-space: pre; color: var(--dim); }
+  .L2 .status {
+    display: flex; gap: 10px; padding: 8px 14px; border-top: 1px solid var(--line); font-size: 10px; color: var(--dim);
+  }
+  .L2 .status b { color: var(--hi); font-weight: 600; }
+
+  /* ========== L3 Airy stacked ========== */
+  .L3 { display: grid; grid-template-rows: auto 1fr auto; padding: 0; }
+  .L3 .hero {
+    padding: 14px 16px 12px;
+    border-bottom: 1px solid var(--line);
+    display: grid; gap: 12px;
+  }
+  .L3 .hero-top { display: flex; justify-content: space-between; align-items: baseline; }
+  .L3 .tabs { display: flex; gap: 18px; }
+  .L3 .tab { color: var(--dim); padding-bottom: 6px; border-bottom: 2px solid transparent; }
+  .L3 .tab.active { color: var(--hi); border-bottom-color: var(--hi); }
+  .L3 .body {
+    display: grid; grid-template-columns: 160px 1fr; gap: 0; min-height: 210px;
+  }
+  .L3 .side { padding: 16px 14px; border-right: 1px solid var(--line); }
+  .L3 .side .h { color: var(--dim); margin-bottom: 12px; font-size: 10px; letter-spacing: .14em; text-transform: uppercase; }
+  .L3 .side .row { padding: 6px 8px; margin-bottom: 4px; color: var(--dim); }
+  .L3 .side .row.active { color: var(--hi); outline: 1px solid var(--line); }
+  .L3 .main { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
+  .L3 .bufs { display: flex; gap: 8px; }
+  .L3 .chip { padding: 5px 12px; border: 1px solid var(--line); color: var(--dim); }
+  .L3 .chip.on { color: var(--hi); }
+  .L3 .ed { flex: 1; border: 1px solid var(--line); padding: 14px 16px; white-space: pre; color: var(--dim); }
+  .L3 .status {
+    padding: 10px 16px; border-top: 1px solid var(--line);
+    display: flex; gap: 14px; font-size: 10px; color: var(--dim);
+  }
+  .L3 .status .hi { color: var(--hi); }
+
+  /* ========== L4 Dual column command ========== */
+  .L4 { display: grid; grid-template-rows: auto 1fr auto; }
+  .L4 .bar {
+    display: grid; grid-template-columns: 1fr auto;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); gap: 12px; align-items: center;
+  }
+  .L4 .tabs { display: flex; gap: 0; border: 1px solid var(--line); }
+  .L4 .tab { padding: 5px 11px; color: var(--dim); border-right: 1px solid var(--line); }
+  .L4 .tab:last-child { border-right: 0; }
+  .L4 .tab.active { color: var(--hi); background: var(--lo); }
+  .L4 .body { display: grid; grid-template-columns: 1.05fr 1.4fr; min-height: 220px; }
+  .L4 .left { border-right: 1px solid var(--line); display: grid; grid-template-rows: auto 1fr; }
+  .L4 .seg {
+    display: flex; gap: 0; border-bottom: 1px solid var(--line);
+  }
+  .L4 .seg span {
+    flex: 1; text-align: center; padding: 7px 4px; color: var(--dim); border-right: 1px solid var(--line); font-size: 10px;
+  }
+  .L4 .seg span:last-child { border-right: 0; }
+  .L4 .seg span.active { color: var(--hi); background: var(--lo); }
+  .L4 .tree { padding: 12px; }
+  .L4 .tree .row { padding: 4px 6px; color: var(--dim); }
+  .L4 .tree .row.active { color: var(--hi); background: var(--lo); }
+  .L4 .main { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .L4 .ed { flex: 1; border: 1px solid var(--line); padding: 12px; white-space: pre; color: var(--dim); }
+  .L4 .status {
+    display: flex; justify-content: space-between; padding: 8px 14px;
+    border-top: 1px solid var(--line); font-size: 10px; color: var(--dim);
+  }
+
+  /* ========== L5 Bottom activity ========== */
+  .L5 { display: grid; grid-template-rows: auto 1fr auto auto; }
+  .L5 .top {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+  }
+  .L5 .tabs { display: flex; gap: 10px; margin-left: auto; }
+  .L5 .tab { color: var(--dim); padding: 4px 2px; }
+  .L5 .tab.active { color: var(--hi); text-decoration: underline; text-underline-offset: 6px; }
+  .L5 .body { display: grid; grid-template-columns: 140px 1fr; min-height: 170px; }
+  .L5 .side { padding: 12px 10px; border-right: 1px solid var(--line); background: var(--panel); }
+  .L5 .side .h { color: var(--dim); font-size: 10px; margin-bottom: 8px; letter-spacing: .1em; text-transform: uppercase; }
+  .L5 .side .row { padding: 4px 6px; color: var(--dim); }
+  .L5 .side .row.active { color: var(--hi); }
+  .L5 .main { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .L5 .bufs { display: flex; gap: 6px; }
+  .L5 .chip { padding: 3px 8px; border: 1px solid var(--line); color: var(--dim); }
+  .L5 .chip.on { color: var(--hi); }
+  .L5 .ed { flex: 1; border: 1px solid var(--line); padding: 12px; white-space: pre; color: var(--dim); }
+  .L5 .activity {
+    border-top: 1px solid var(--line);
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    background: var(--panel);
+  }
+  .L5 .activity button {
+    appearance: none; background: transparent; border: 0; border-right: 1px solid var(--line);
+    color: var(--dim); padding: 9px 4px; font: inherit; font-size: 10px; cursor: default;
+  }
+  .L5 .activity button:last-child { border-right: 0; }
+  .L5 .activity button.active { color: var(--hi); background: var(--lo); }
+  .L5 .status {
+    display: flex; gap: 10px; padding: 7px 14px; border-top: 1px solid var(--line); font-size: 10px; color: var(--dim);
+  }
+
+  /* ========== L6 Zen center ========== */
+  .L6 { display: grid; grid-template-rows: auto 1fr auto; }
+  .L6 .top {
+    display: flex; flex-direction: column; gap: 10px;
+    padding: 12px 18px 10px; border-bottom: 1px solid var(--line);
+  }
+  .L6 .brandline { display: flex; justify-content: space-between; align-items: baseline; }
+  .L6 .tabs { display: flex; justify-content: center; gap: 22px; }
+  .L6 .tab { color: var(--dim); letter-spacing: .04em; }
+  .L6 .tab.active { color: var(--hi); }
+  .L6 .body {
+    display: grid; grid-template-columns: 120px minmax(0, 1fr) 120px;
+    min-height: 220px;
+  }
+  .L6 .gutter {
+    padding: 14px 10px; color: var(--dim); font-size: 10px; border-right: 1px solid var(--line);
+  }
+  .L6 .gutter.right { border-right: 0; border-left: 1px solid var(--line); text-align: right; }
+  .L6 .gutter .row { margin-bottom: 6px; }
+  .L6 .gutter .row.active { color: var(--hi); }
+  .L6 .main { padding: 18px 22px; display: flex; flex-direction: column; gap: 12px; max-width: 720px; margin: 0 auto; width: 100%; }
+  .L6 .bufs { display: flex; gap: 10px; justify-content: center; }
+  .L6 .chip { color: var(--dim); }
+  .L6 .chip.on { color: var(--hi); border-bottom: 1px solid var(--hi); padding-bottom: 2px; }
+  .L6 .ed { flex: 1; border: 1px solid var(--line); padding: 16px 18px; white-space: pre; color: var(--dim); }
+  .L6 .status {
+    display: flex; justify-content: center; gap: 16px;
+    padding: 9px 14px; border-top: 1px solid var(--line); font-size: 10px; color: var(--dim);
+  }
+  .L6 .status .hi { color: var(--hi); }
+
+  footer {
+    padding: 0 28px 36px;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  footer code { color: inherit; opacity: .85; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>tui-ide · layouts (AMOLED black / white mono)</h1>
+    <p>
+      El color aquí es solo <strong>negro puro ↔ blanco</strong> monocromo.
+      Lo que estás eligiendo es el <strong>layout</strong>: dónde viven Code / Database / Sessions / Agents / Git,
+      cuánto aire hay, y cómo se lee la jerarquía. Click en una tarjeta.
+    </p>
+    <div class="toolbar">
+      <button class="mode-btn on" id="btnBlack" type="button">AMOLED black</button>
+      <button class="mode-btn" id="btnWhite" type="button">White mono</button>
+      <div class="pick" id="pick">Ningún layout seleccionado.</div>
+    </div>
+  </header>
+
+  <div class="grid" id="grid"></div>
+
+  <footer>
+    Serve: <code>http://127.0.0.1:8765/tui-style-canvas.html</code>
+    · responde con id (<code>L1</code>…<code>L6</code>) + modo (black/white).
+  </footer>
+
+<script>
+const TABS = ["Code", "Database", "Sessions", "Agents", "Git"];
+const CODE = `fn main() {
+    boot_ide(); // host chrome
+}`;
+
+const LAYOUTS = [
+  {
+    id: "L1",
+    name: "Ribbon top",
+    blurb: "Tabs de producto en la barra superior (estilo IDE clásico). Sidebar Files + editor. Clarísimo y fácil en ratatui.",
+    render() {
+      const tabs = TABS.map((t,i)=>`<span class="tab${i===0?" active":""}">${t}</span>`).join("");
+      return `<div class="tui L1">
+        <div class="top">
+          <div class="brand">tui-ide</div>
+          <div class="tabs">${tabs}</div>
+          <div class="dim">~/Projects/tui-ide</div>
+        </div>
+        <div class="body">
+          <aside class="side">
+            <div class="h">Files</div>
+            <div class="row">▾ crates</div>
+            <div class="row active">  ide-app</div>
+            <div class="row">  ide-ui</div>
+            <div class="row">README.md</div>
+          </aside>
+          <section class="main">
+            <div class="bufs"><span class="chip on">main.rs</span><span class="chip">lib.rs</span></div>
+            <div class="ed">${CODE}</div>
+          </section>
+        </div>
+        <div class="status"><span class="pill">CODE</span><span class="dim">Neovim · normal</span><span class="dim" style="margin-left:auto">Ctrl-⇧-A Agents</span></div>
+      </div>`;
+    }
+  },
+  {
+    id: "L2",
+    name: "Icon rail",
+    blurb: "Rail vertical izquierda para Modes (Code/DB/Sessions/Agents/Git). Más aire en el contenido. Muy “VS Code activity bar”.",
+    render() {
+      const icons = ["Cd","Db","Se","Ag","Gt"].map((t,i)=>`<div class="ic${i===0?" active":""}" title="${TABS[i]}">${t}</div>`).join("");
+      return `<div class="tui L2">
+        <aside class="rail">${icons}</aside>
+        <div class="head"><div class="brand">tui-ide</div><div class="path">Code · ~/Projects/tui-ide</div></div>
+        <div class="work">
+          <aside class="side">
+            <div class="h">Explorer</div>
+            <div class="row">▾ crates</div>
+            <div class="row active">  ide-app</div>
+            <div class="row">  ide-agents</div>
+          </aside>
+          <section class="main">
+            <div class="bufs"><span class="chip on">main.rs</span><span class="chip">app.rs</span></div>
+            <div class="ed">${CODE}</div>
+          </section>
+        </div>
+        <div class="status"><b>CODE</b> Neovim normal <span style="margin-left:auto">rail = product modes</span></div>
+      </div>`;
+    }
+  },
+  {
+    id: "L3",
+    name: "Airy underline",
+    blurb: "Máximo aire: tabs con underline, padding generoso, menos cajas. Se siente premium; necesita disciplina tipográfica.",
+    render() {
+      const tabs = TABS.map((t,i)=>`<span class="tab${i===0?" active":""}">${t}</span>`).join("");
+      return `<div class="tui L3">
+        <div class="hero">
+          <div class="hero-top"><div class="brand">tui-ide</div><div class="dim">~/Projects/tui-ide</div></div>
+          <div class="tabs">${tabs}</div>
+        </div>
+        <div class="body">
+          <aside class="side">
+            <div class="h">Files</div>
+            <div class="row">▾ crates</div>
+            <div class="row active">  ide-app</div>
+            <div class="row">  ide-ui</div>
+          </aside>
+          <section class="main">
+            <div class="bufs"><span class="chip on">main.rs</span><span class="chip">lib.rs</span></div>
+            <div class="ed">${CODE}</div>
+          </section>
+        </div>
+        <div class="status"><span class="hi">CODE</span><span>Neovim</span><span>normal</span></div>
+      </div>`;
+    }
+  },
+  {
+    id: "L4",
+    name: "Segmented + dual",
+    blurb: "Tabs producto segmentados arriba; sidebar con sub-segmentos Files/Git/Search. Bueno cuando Code y Agents comparten chrome.",
+    render() {
+      const tabs = TABS.map((t,i)=>`<span class="tab${i===0?" active":""}">${t}</span>`).join("");
+      return `<div class="tui L4">
+        <div class="bar">
+          <div style="display:flex;gap:12px;align-items:center"><div class="brand">tui-ide</div><div class="tabs">${tabs}</div></div>
+          <div class="dim">mono · amoled</div>
+        </div>
+        <div class="body">
+          <div class="left">
+            <div class="seg">
+              <span class="active">Files</span><span>Git</span><span>Search</span>
+            </div>
+            <div class="tree">
+              <div class="row">▾ crates</div>
+              <div class="row active">  ide-app</div>
+              <div class="row">  ide-agents</div>
+              <div class="row">README.md</div>
+            </div>
+          </div>
+          <section class="main">
+            <div class="dim">buffer · main.rs</div>
+            <div class="ed">${CODE}</div>
+          </section>
+        </div>
+        <div class="status"><span>CODE · Neovim · normal</span><span>Sessions / Agents = product tabs</span></div>
+      </div>`;
+    }
+  },
+  {
+    id: "L5",
+    name: "Bottom activity",
+    blurb: "Product modes en dock inferior (Code/DB/Sessions/Agents/Git). Arriba solo brand + contexto. Ideal para TUI angosta.",
+    render() {
+      const topTabs = ["main", "branch"].map((t,i)=>`<span class="tab${i===0?" active":""}">${t}</span>`).join("");
+      const acts = TABS.map((t,i)=>`<button type="button" class="${i===0?"active":""}">${t}</button>`).join("");
+      return `<div class="tui L5">
+        <div class="top">
+          <div class="brand">tui-ide</div>
+          <div class="dim">~/Projects/tui-ide</div>
+          <div class="tabs">${topTabs}</div>
+        </div>
+        <div class="body">
+          <aside class="side">
+            <div class="h">Files</div>
+            <div class="row">▾ crates</div>
+            <div class="row active">  ide-app</div>
+          </aside>
+          <section class="main">
+            <div class="bufs"><span class="chip on">main.rs</span><span class="chip">lib.rs</span></div>
+            <div class="ed">${CODE}</div>
+          </section>
+        </div>
+        <div class="activity">${acts}</div>
+        <div class="status"><span>CODE</span><span>Neovim normal</span><span style="margin-left:auto">dock = product modes</span></div>
+      </div>`;
+    }
+  },
+  {
+    id: "L6",
+    name: "Zen center",
+    blurb: "Editor centrado, gutters laterales mínimos, tabs centrados. Máximo aire. Menos “dashboard”, más foco.",
+    render() {
+      const tabs = TABS.map((t,i)=>`<span class="tab${i===0?" active":""}">${t}</span>`).join("");
+      return `<div class="tui L6">
+        <div class="top">
+          <div class="brandline"><div class="brand">tui-ide</div><div class="dim">~/Projects/tui-ide</div></div>
+          <div class="tabs">${tabs}</div>
+        </div>
+        <div class="body">
+          <aside class="gutter">
+            <div class="row active">Files</div>
+            <div class="row">Search</div>
+            <div class="row">Git</div>
+          </aside>
+          <section class="main">
+            <div class="bufs"><span class="chip on">main.rs</span><span class="chip">lib.rs</span></div>
+            <div class="ed">${CODE}</div>
+          </section>
+          <aside class="gutter right">
+            <div class="row">outline</div>
+            <div class="row">agents</div>
+          </aside>
+        </div>
+        <div class="status"><span class="hi">CODE</span><span>Neovim</span><span>normal</span></div>
+      </div>`;
+    }
+  },
+];
+
+const grid = document.getElementById("grid");
+const pick = document.getElementById("pick");
+const btnBlack = document.getElementById("btnBlack");
+const btnWhite = document.getElementById("btnWhite");
+let selected = null;
+let mode = "black";
+
+function setMode(m) {
+  mode = m;
+  document.body.classList.toggle("white-mode", m === "white");
+  document.body.classList.toggle("white-page", m === "white");
+  btnBlack.classList.toggle("on", m === "black");
+  btnWhite.classList.toggle("on", m === "white");
+  if (selected) {
+    const L = LAYOUTS.find(x => x.id === selected);
+    pick.textContent = `Seleccionado: ${selected} — ${L.name} · modo ${m}`;
+  }
+}
+
+btnBlack.onclick = () => setMode("black");
+btnWhite.onclick = () => setMode("white");
+
+LAYOUTS.forEach((L) => {
+  const el = document.createElement("article");
+  el.className = "card";
+  el.dataset.id = L.id;
+  el.innerHTML = `
+    <div class="meta">
+      <div class="id">${L.id}</div>
+      <h2>${L.name}</h2>
+      <p class="blurb">${L.blurb}</p>
+    </div>
+    <div class="stage">${L.render()}</div>
+  `;
+  el.addEventListener("click", () => {
+    selected = L.id;
+    document.querySelectorAll(".card").forEach(c => c.classList.remove("selected"));
+    el.classList.add("selected");
+    pick.textContent = `Seleccionado: ${L.id} — ${L.name} · modo ${mode}. Dilo en el chat.`;
+  });
+  grid.appendChild(el);
+});
+</script>
+</body>
+</html>

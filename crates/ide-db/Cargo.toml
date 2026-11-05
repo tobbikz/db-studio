@@ -1,0 +1,28 @@
+[package]
+name = "ide-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+dirs.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+toml.workspace = true
+tiberius.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+duckdb.workspace = true
+redis.workspace = true
+mongodb.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
