@@ -246,9 +246,14 @@ impl GitState {
 }
 
 async fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
+    // Never open `less` / system pager — Studio captures stdout via pipe, but some
+    // git builds still honor pager when mis-detected; force cat.
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await
         .context("spawn git")?;

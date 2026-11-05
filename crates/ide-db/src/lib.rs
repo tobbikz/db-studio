@@ -25,9 +25,12 @@ pub use secrets::{
 pub use snippets::{ensure_example_snippet, list_snippets};
 
 pub use query_params::{query_param_prompt_seed, sql_has_query_params, substitute_query_params};
-pub use query_paging::{paginate_select_sql, RESULT_PAGE_SIZE};
+pub use query_paging::{
+    has_limit_clause, next_select_limit_preset, paginate_select_sql, MAX_FETCH_ROWS,
+    RESULT_PAGE_SIZE,
+};
 pub use result_chart::chart_result;
-pub use schema_cache::{SchemaNameCache, SqlCompletionItem};
+pub use schema_cache::{expecting_relation, SchemaNameCache, SqlCompletionItem};
 
 use anyhow::{Context, Result, bail};
 use engines::{ClickhouseHttp, MssqlClient};
@@ -378,6 +381,68 @@ fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+fn mysql_quote_ident(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+fn mssql_quote_ident(name: &str) -> String {
+    format!("[{}]", name.replace(']', "]]"))
+}
+
+/// Qualify schema.table for SELECT * data tabs.
+pub fn qualify_table_name(driver: DbDriver, schema: &str, table: &str) -> String {
+    match driver {
+        DbDriver::Mysql | DbDriver::Clickhouse => {
+            format!(
+                "{}.{}",
+                mysql_quote_ident(schema),
+                mysql_quote_ident(table)
+            )
+        }
+        DbDriver::Mssql => {
+            format!(
+                "{}.{}",
+                mssql_quote_ident(schema),
+                mssql_quote_ident(table)
+            )
+        }
+        DbDriver::Sqlite | DbDriver::Duckdb if schema.is_empty() || schema == "main" => {
+            pg_quote_ident(table)
+        }
+        _ => format!("{}.{}", pg_quote_ident(schema), pg_quote_ident(table)),
+    }
+}
+
+/// Build DataGrip-style table data SQL with optional WHERE / ORDER BY fragments.
+pub fn build_table_data_sql(
+    driver: DbDriver,
+    schema: &str,
+    table: &str,
+    where_clause: &str,
+    order_by: &str,
+    limit: usize,
+) -> String {
+    match driver {
+        DbDriver::Redis => return format!("GET {table}\n"),
+        DbDriver::Mongo => return format!("find {table}\n"),
+        _ => {}
+    }
+    let qual = qualify_table_name(driver, schema, table);
+    let mut sql = format!("SELECT * FROM {qual}");
+    let w = where_clause.trim().trim_end_matches(';').trim();
+    if !w.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(w);
+    }
+    let o = order_by.trim().trim_end_matches(';').trim();
+    if !o.is_empty() {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(o);
+    }
+    sql.push_str(&format!(" LIMIT {limit};\n"));
+    sql
+}
+
 fn urlencoding_lite(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -442,7 +507,7 @@ impl ColumnInfo {
             "{}: {}{}",
             self.name,
             self.data_type,
-            if self.nullable { "?" } else { "" }
+            if self.nullable { " NULL" } else { "" }
         )
     }
 }
@@ -555,8 +620,14 @@ pub struct SqlTab {
     pub table_key: Option<String>,
     pub source_id: Option<String>,
     pub database: Option<String>,
+    /// Search-path schema for this console tab (DataGrip-style).
+    pub schema: Option<String>,
     /// Pinned tabs refuse casual close.
     pub pinned: bool,
+    /// DataGrip-style server-side filter for table data tabs.
+    pub where_clause: String,
+    /// DataGrip-style server-side sort for table data tabs.
+    pub order_by: String,
 }
 
 impl SqlTab {
@@ -573,7 +644,10 @@ impl SqlTab {
             table_key: None,
             source_id: None,
             database: None,
+            schema: None,
             pinned: false,
+            where_clause: String::new(),
+            order_by: String::new(),
         }
     }
 
@@ -1203,6 +1277,8 @@ pub struct DbWorkspace {
     pub active_source: Option<String>,
     /// Catalog override for the active query connection (Postgres/MySQL).
     pub active_database: Option<String>,
+    /// Schema search path for Console completions (DataGrip-style selector).
+    pub active_schema: Option<String>,
     pub sql: String,
     pub history: Vec<QueryHistoryEntry>,
     pub bookmarks: Vec<String>,
@@ -1233,6 +1309,8 @@ pub struct DbWorkspace {
     pub query_running: bool,
     /// Soft timeout for SQL (0 = off). Set from IdeConfig.
     pub query_timeout_secs: u64,
+    /// Auto LIMIT for SELECT without LIMIT (0 = disabled). Synced from IdeConfig.
+    pub select_limit: usize,
     /// Explorer health after last expand/ping.
     pub connection_health: HashMap<String, ConnHealth>,
     /// Cell edit undo stack: (row, col, previous value).
@@ -1310,6 +1388,7 @@ impl Default for DbWorkspace {
             explorer_scroll: 0,
             active_source: None,
             active_database: None,
+            active_schema: None,
             sql: "SELECT 1;\n".into(),
             history: Vec::new(),
             bookmarks: Vec::new(),
@@ -1334,6 +1413,7 @@ impl Default for DbWorkspace {
             query_cancel: Arc::new(AtomicBool::new(false)),
             query_running: false,
             query_timeout_secs: 120,
+            select_limit: RESULT_PAGE_SIZE,
             connection_health: HashMap::new(),
             cell_undo: Vec::new(),
             query_backend_pid: Arc::new(AtomicI64::new(0)),
@@ -1745,7 +1825,10 @@ impl DbWorkspace {
             table_key: None,
             source_id: self.active_source.clone(),
             database: self.active_database.clone(),
+            schema: None,
             pinned: false,
+            where_clause: String::new(),
+            order_by: String::new(),
         });
         self.active_tab = self.tabs.len() - 1;
         self.sql = entry.sql;
@@ -1809,6 +1892,9 @@ impl DbWorkspace {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.sql = self.sql.clone();
             tab.result = self.last_result.clone();
+            tab.source_id = self.active_source.clone();
+            tab.database = self.active_database.clone();
+            tab.schema = self.active_schema.clone();
         }
     }
 
@@ -1820,7 +1906,109 @@ impl DbWorkspace {
                 self.active_source = Some(sid.clone());
             }
             self.active_database = tab.database.clone();
+            self.active_schema = tab.schema.clone();
         }
+    }
+
+    fn sync_console_context_to_tab(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.source_id = self.active_source.clone();
+            tab.database = self.active_database.clone();
+            tab.schema = self.active_schema.clone();
+        }
+    }
+
+    /// Label for Console toolbar database dropdown.
+    pub fn console_database_label(&self) -> String {
+        self.active_database
+            .clone()
+            .or_else(|| {
+                self.active_source.as_ref().and_then(|id| {
+                    self.sources
+                        .iter()
+                        .find(|s| &s.id == id)
+                        .map(|s| s.database.clone())
+                        .filter(|d| !d.is_empty())
+                })
+            })
+            .unwrap_or_else(|| "database".into())
+    }
+
+    /// Label for Console toolbar schema dropdown.
+    pub fn console_schema_label(&self) -> String {
+        self.active_schema_name()
+            .unwrap_or_else(|| "schema".into())
+    }
+
+    pub async fn list_console_databases(&mut self) -> Result<Vec<String>> {
+        let source_id = self
+            .active_source
+            .clone()
+            .context("no active data source")?;
+        let prefix = format!("{source_id}#");
+        let has_pool = self.pools.contains_key(&source_id)
+            || self.pools.keys().any(|k| k.starts_with(&prefix));
+        if !has_pool {
+            let db = self.active_database.clone().or_else(|| {
+                self.sources
+                    .iter()
+                    .find(|s| s.id == source_id)
+                    .map(|s| s.database.clone())
+                    .filter(|d| !d.is_empty())
+            });
+            self.ensure_connected(&source_id, db.as_deref()).await?;
+        }
+        let nodes = self.introspect_databases(&source_id).await?;
+        Ok(nodes.into_iter().map(|n| n.label).collect())
+    }
+
+    pub async fn list_console_schemas(&mut self) -> Result<Vec<String>> {
+        let source_id = self
+            .active_source
+            .clone()
+            .context("no active data source")?;
+        let database = self.active_database.clone();
+        self.ensure_connected(&source_id, database.as_deref())
+            .await?;
+        let nodes = self
+            .introspect_schemas(&source_id, database.as_deref())
+            .await?;
+        Ok(nodes.into_iter().map(|n| n.label).collect())
+    }
+
+    pub async fn set_console_database(&mut self, database: &str) -> Result<()> {
+        let source_id = self
+            .active_source
+            .clone()
+            .context("no active data source")?;
+        self.ensure_connected(&source_id, Some(database)).await?;
+        self.active_database = Some(database.to_string());
+        self.active_schema = Some(self.default_schema_for_driver(&source_id));
+        self.schema_cache = SchemaNameCache::default();
+        let _ = self.refresh_schema_cache().await;
+        self.sync_console_context_to_tab();
+        self.status = format!(
+            "console · {database} · {}",
+            self.active_schema.as_deref().unwrap_or("?")
+        );
+        Ok(())
+    }
+
+    pub async fn set_console_schema(&mut self, schema: &str) -> Result<()> {
+        let source_id = self
+            .active_source
+            .clone()
+            .context("no active data source")?;
+        let database = self.active_database.clone();
+        self.ensure_connected(&source_id, database.as_deref())
+            .await?;
+        self.active_schema = Some(schema.to_string());
+        self.schema_cache = SchemaNameCache::default();
+        let _ = self.refresh_schema_cache().await;
+        self.sync_console_context_to_tab();
+        let db = self.console_database_label();
+        self.status = format!("console · {db} · {schema}");
+        Ok(())
     }
 
     pub fn select_tab(&mut self, idx: usize) {
@@ -1860,7 +2048,11 @@ impl DbWorkspace {
             .filter(|t| t.table_key.is_none())
             .count()
             .saturating_add(1);
-        self.tabs.push(SqlTab::query(n));
+        let mut tab = SqlTab::query(n);
+        tab.source_id = self.active_source.clone();
+        tab.database = self.active_database.clone();
+        tab.schema = self.active_schema.clone();
+        self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.load_active_tab();
         self.status = format!("new tab · {}", self.tabs[self.active_tab].title);
@@ -1874,8 +2066,10 @@ impl DbWorkspace {
             self.load_active_tab();
         }
         let trimmed = self.sql.trim();
-        let is_default = trimmed.is_empty() || trimmed == "SELECT 1;" || trimmed == "SELECT 1";
-        if !is_default || self.last_result.is_some() {
+        // Only rewrite the pristine `SqlTab::query` default — never reinject after the
+        // user clears the buffer (empty) or edits away from SELECT 1.
+        let is_pristine = trimmed == "SELECT 1;" || trimmed == "SELECT 1";
+        if !is_pristine || self.last_result.is_some() {
             if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                 if tab.source_id.is_none() {
                     tab.source_id = self.active_source.clone();
@@ -1883,19 +2077,25 @@ impl DbWorkspace {
             }
             return;
         }
-        let (name, driver) = self
+        let (name, _driver) = self
             .active_source
             .as_ref()
             .and_then(|id| self.sources.iter().find(|s| &s.id == id))
             .map(|s| (s.name.as_str(), s.driver.label()))
             .unwrap_or(("database", "SQL"));
         self.sql = format!(
-            "-- {name} ({driver}) · connected\n-- Explorer: Enter on a table · F5 / Ctrl-↵ run\nSELECT 1 AS ok;\n"
+            "-- {name}\nSELECT 1 AS ok;\n"
         );
+        if self.active_schema.is_none() {
+            if let Some(id) = self.active_source.clone() {
+                self.active_schema = Some(self.default_schema_for_driver(&id));
+            }
+        }
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.sql = self.sql.clone();
             tab.source_id = self.active_source.clone();
             tab.database = self.active_database.clone();
+            tab.schema = self.active_schema.clone();
         }
     }
 
@@ -2133,7 +2333,10 @@ impl DbWorkspace {
                 table_key: None,
                 source_id: Some(source_id.clone()),
                 database: None,
+                schema: None,
                 pinned: false,
+                where_clause: String::new(),
+                order_by: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -2245,7 +2448,10 @@ impl DbWorkspace {
                 table_key: None,
                 source_id: Some(source_id.into()),
                 database: database.map(|s| s.to_string()),
+                schema: None,
                 pinned: false,
+                where_clause: String::new(),
+                order_by: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -2412,7 +2618,10 @@ impl DbWorkspace {
                 table_key: None,
                 source_id: Some(entry.source_id.clone()),
                 database: None,
+                schema: None,
                 pinned: false,
+                where_clause: String::new(),
+                order_by: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
             self.sql = sql;
@@ -2459,11 +2668,6 @@ impl DbWorkspace {
             .find(|s| s.id == entry.source_id)
             .map(|s| s.driver)
             .unwrap_or_default();
-        let sql = match driver {
-            DbDriver::Redis => format!("GET {table}\n"),
-            DbDriver::Mongo => format!("find {table}\n"),
-            _ => format!("SELECT * FROM \"{schema}\".\"{table}\" LIMIT 100;\n"),
-        };
 
         self.flush_active_tab();
         if let Some(idx) = self
@@ -2472,6 +2676,12 @@ impl DbWorkspace {
             .position(|t| t.table_key.as_deref() == Some(table_key.as_str()))
         {
             self.active_tab = idx;
+            let (where_clause, order_by) = self
+                .tabs
+                .get(idx)
+                .map(|t| (t.where_clause.clone(), t.order_by.clone()))
+                .unwrap_or_default();
+            let sql = build_table_data_sql(driver, &schema, &table, &where_clause, &order_by, 100);
             if let Some(tab) = self.tabs.get_mut(idx) {
                 tab.sql = sql.clone();
                 tab.source_id = Some(entry.source_id.clone());
@@ -2480,6 +2690,7 @@ impl DbWorkspace {
             self.sql = sql;
             self.last_result = None;
         } else {
+            let sql = build_table_data_sql(driver, &schema, &table, "", "", 100);
             self.tabs.push(SqlTab {
                 id: table_key.clone(),
                 title: table.clone(),
@@ -2488,7 +2699,10 @@ impl DbWorkspace {
                 table_key: Some(table_key),
                 source_id: Some(entry.source_id.clone()),
                 database: db.clone(),
+                schema: None,
                 pinned: false,
+                where_clause: String::new(),
+                order_by: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
             self.sql = sql;
@@ -2496,6 +2710,131 @@ impl DbWorkspace {
         }
         self.status = format!("opened {schema}.{table}");
         Ok(true)
+    }
+
+    /// Active console tab is a table data viewer (has WHERE / ORDER BY bars).
+    pub fn active_is_table_tab(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|t| t.table_key.as_ref())
+            .is_some()
+    }
+
+    pub fn active_table_where(&self) -> &str {
+        self.tabs
+            .get(self.active_tab)
+            .map(|t| t.where_clause.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn active_table_order_by(&self) -> &str {
+        self.tabs
+            .get(self.active_tab)
+            .map(|t| t.order_by.as_str())
+            .unwrap_or("")
+    }
+
+    /// Rebuild SELECT for the active table tab from WHERE / ORDER BY bars.
+    pub fn sync_table_sql_from_filters(&mut self) -> Result<()> {
+        let Some(tab) = self.tabs.get(self.active_tab).cloned() else {
+            bail!("no active tab");
+        };
+        let Some(key) = tab.table_key.as_deref() else {
+            bail!("not a table data tab");
+        };
+        let parts: Vec<&str> = key.splitn(3, "::").collect();
+        if parts.len() != 3 {
+            bail!("invalid table key");
+        }
+        let source_id = parts[0];
+        let (schema, table) = parts[2].split_once('.').unwrap_or(("public", parts[2]));
+        let driver = self
+            .sources
+            .iter()
+            .find(|s| s.id == source_id)
+            .map(|s| s.driver)
+            .unwrap_or_default();
+        let sql = build_table_data_sql(
+            driver,
+            schema,
+            table,
+            &tab.where_clause,
+            &tab.order_by,
+            100,
+        );
+        if let Some(t) = self.tabs.get_mut(self.active_tab) {
+            t.sql = sql.clone();
+        }
+        self.sql = sql;
+        self.active_source = Some(source_id.into());
+        if !parts[1].is_empty() {
+            self.active_database = Some(parts[1].into());
+        }
+        Ok(())
+    }
+
+    pub fn set_active_table_where(&mut self, clause: impl Into<String>) {
+        if let Some(t) = self.tabs.get_mut(self.active_tab) {
+            if t.table_key.is_some() {
+                t.where_clause = clause.into();
+            }
+        }
+    }
+
+    pub fn set_active_table_order_by(&mut self, clause: impl Into<String>) {
+        if let Some(t) = self.tabs.get_mut(self.active_tab) {
+            if t.table_key.is_some() {
+                t.order_by = clause.into();
+            }
+        }
+    }
+
+    /// Apply WHERE / ORDER BY and re-run the table SELECT.
+    pub async fn apply_table_filters(&mut self) -> Result<()> {
+        self.sync_table_sql_from_filters()?;
+        self.result_page = 0;
+        self.execute_sql().await
+    }
+
+    /// Open a CREATE stub SQL tab (Create menu).
+    pub fn open_create_stub(&mut self, kind: &str) -> Result<()> {
+        let (title, sql) = match kind {
+            "create_query" => {
+                self.new_query_tab();
+                return Ok(());
+            }
+            "create_schema" => (
+                "New · Schema",
+                "CREATE SCHEMA new_schema;\n".to_string(),
+            ),
+            "create_table" => (
+                "New · Table",
+                "CREATE TABLE new_table (\n  id bigint PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,\n  name text NOT NULL,\n  created_at timestamptz NOT NULL DEFAULT now()\n);\n"
+                    .to_string(),
+            ),
+            "create_view" => (
+                "New · View",
+                "CREATE VIEW new_view AS\nSELECT 1 AS id;\n".to_string(),
+            ),
+            "create_index" => (
+                "New · Index",
+                "CREATE INDEX ON schema.table (column);\n".to_string(),
+            ),
+            "create_role" => ("New · Role", "CREATE ROLE new_role;\n".to_string()),
+            "create_database" => (
+                "New · Database",
+                "CREATE DATABASE new_database;\n".to_string(),
+            ),
+            _ => bail!("unknown create kind: {kind}"),
+        };
+        let source_id = self
+            .active_source
+            .clone()
+            .or_else(|| self.sources.first().map(|s| s.id.clone()))
+            .context("no data source")?;
+        let database = self.active_database.clone();
+        self.open_script_tab(&source_id, database.as_deref(), title, &sql);
+        Ok(())
     }
 
     pub async fn refresh_structure_for_selection(&mut self) -> Result<()> {
@@ -2551,6 +2890,95 @@ impl DbWorkspace {
         self.ensure_connected(source_id, database).await?;
         self.load_structure_for(source_id, database, schema, table)
             .await
+    }
+
+    /// When Explorer is not on a table, drive Structure from the Console SQL `FROM` target
+    /// (DataGrip-like: query context fills the structure pane).
+    pub async fn refresh_structure_from_console_query(&mut self) -> Result<()> {
+        if let Some(e) = self.flat.get(self.selected) {
+            if matches!(e.kind, DbNodeKind::Table | DbNodeKind::View) {
+                // Explorer table wins — leave current Structure alone.
+                return Ok(());
+            }
+        }
+        if self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.table_key.as_ref())
+            .is_some()
+        {
+            return self.refresh_structure_for_active_tab().await;
+        }
+        let Some(source_id) = self.active_source.clone() else {
+            self.set_structure_query_hint(None);
+            return Ok(());
+        };
+        let sql_snapshot = self.sql.clone();
+        let (schema_opt, table_opt) = parse_select_target(&sql_snapshot);
+        let Some(table) = table_opt.filter(|t| !t.is_empty()) else {
+            let preview = sql_snapshot
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            self.set_structure_query_hint(if preview.is_empty() {
+                None
+            } else {
+                Some(preview)
+            });
+            return Ok(());
+        };
+        let schema = schema_opt.unwrap_or_else(|| {
+            self.active_schema
+                .clone()
+                .unwrap_or_else(|| self.default_schema_for_driver(&source_id))
+        });
+        let database = self.active_database.clone();
+        self.ensure_connected(&source_id, database.as_deref())
+            .await?;
+        match self
+            .load_structure_for(&source_id, database.as_deref(), &schema, &table)
+            .await
+        {
+            Ok(()) => {
+                if !self.structure_title.is_empty()
+                    && !self.structure_title.starts_with("query ·")
+                {
+                    self.structure_title = format!("query · {}", self.structure_title);
+                }
+                Ok(())
+            }
+            Err(_) => {
+                self.set_structure_query_hint(Some(format!("{schema}.{table}")));
+                Ok(())
+            }
+        }
+    }
+
+    fn set_structure_query_hint(&mut self, preview: Option<String>) {
+        self.structure.clear();
+        self.structure_scroll = 0;
+        self.structure_title = "query".into();
+        let mut lines = vec![StructureLine::section("CONSOLE QUERY")];
+        if let Some(p) = preview.filter(|s| !s.is_empty()) {
+            let short = if p.chars().count() > 48 {
+                format!("{}…", p.chars().take(47).collect::<String>())
+            } else {
+                p
+            };
+            lines.push(StructureLine::ddl(short));
+        } else {
+            lines.push(StructureLine::item(String::from("(empty console)")));
+        }
+        lines.push(StructureLine::section("HINT"));
+        lines.push(StructureLine::item(String::from(
+            "Write FROM schema.table — columns appear here",
+        )));
+        lines.push(StructureLine::item(String::from(
+            "Or Enter a table in Explorer",
+        )));
+        self.structure_lines = lines;
     }
 
     async fn load_structure_for(
@@ -4009,10 +4437,17 @@ impl DbWorkspace {
 
     async fn introspect_databases(&self, source_id: &str) -> Result<Vec<DbTreeNode>> {
         let key = Self::pool_key(source_id, None);
+        let prefix = format!("{source_id}#");
         let pool = self
             .pools
             .get(&key)
             .or_else(|| self.pools.get(source_id))
+            .or_else(|| {
+                self.pools
+                    .iter()
+                    .find(|(k, _)| k.as_str() == source_id || k.starts_with(&prefix))
+                    .map(|(_, p)| p)
+            })
             .context("not connected")?;
         match pool {
             LivePool::Pg(p) => {
@@ -4416,7 +4851,7 @@ impl DbWorkspace {
             }
             self.guard_writable(&source_id, stmt)?;
             let exec_sql = if statements.len() == 1 {
-                paginate_select_sql(stmt, page)
+                paginate_select_sql(stmt, page, self.select_limit)
             } else {
                 stmt.to_string()
             };
@@ -4443,19 +4878,23 @@ impl DbWorkspace {
                     }
                 }
             };
-            if let Err(ref e) = outcome {
-                let msg = e.to_string();
-                if msg.contains("cancelled") || msg.contains("timed out") {
+            let result = match outcome {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
                     self.query_running = false;
-                    let _ = self.cancel_backend_best_effort(&key, driver).await;
-                    if msg.contains("cancelled") {
-                        self.disconnect_active_pool();
+                    if msg.contains("cancelled") || msg.contains("timed out") {
+                        let _ = self.cancel_backend_best_effort(&key, driver).await;
+                        if msg.contains("cancelled") {
+                            self.disconnect_active_pool();
+                        }
                     }
+                    return Err(e);
                 }
-            }
-            last = outcome?;
+            };
+            last = result;
             last.page = page;
-            last.has_more = last.rows.len() >= RESULT_PAGE_SIZE;
+            last.has_more = self.select_limit > 0 && last.rows.len() >= self.select_limit;
             last.elapsed_ms = stmt_start.elapsed().as_millis();
             self.history.push(QueryHistoryEntry {
                 sql: stmt.clone(),
@@ -4491,20 +4930,34 @@ impl DbWorkspace {
         last = last.with_meta(schema, table, pks);
         last.elapsed_ms = elapsed_ms;
         let page_tag = if page > 0 {
-            format!(" · page {} (offset {})", page + 1, page * RESULT_PAGE_SIZE)
+            format!(
+                " · page {} (offset {})",
+                page + 1,
+                page * self.select_limit.max(1)
+            )
         } else {
             String::new()
         };
         let more_tag = if last.has_more { " · more…" } else { "" };
         let txn_tag = if self.in_txn { " · TXN" } else { "" };
+        let limit_tag = if self.select_limit > 0
+            && statements.len() == 1
+            && query_paging::is_paged_query(statements[0].as_str())
+            && !has_limit_clause(&statements[0])
+        {
+            format!(" · lim {}", self.select_limit)
+        } else {
+            String::new()
+        };
         self.status = format!(
-            "{} cols · {} rows · {elapsed_ms} ms · {} stmt(s){}{}{}{}",
+            "{} cols · {} rows · {elapsed_ms} ms · {} stmt(s){}{}{}{}{}",
             last.columns.len(),
             last.rows.len(),
             statements.len(),
             if last.truncated { " (truncated)" } else { "" },
             page_tag,
             more_tag,
+            limit_tag,
             txn_tag
         );
         self.last_result = Some(last);
@@ -6441,7 +6894,7 @@ impl DbWorkspace {
     }
 }
 
-const MAX_ROWS: usize = RESULT_PAGE_SIZE;
+const MAX_ROWS: usize = MAX_FETCH_ROWS;
 
 async fn exec_pg(pool: &PgPool, sql: &str) -> Result<QueryResult> {
     let mut q = exec_pg_conn(pool, sql).await?;
@@ -8895,7 +9348,10 @@ impl DbWorkspace {
                 table_key: None,
                 source_id: Some(source_id.clone()),
                 database: left.database.clone().or(right.database.clone()),
+                schema: None,
                 pinned: false,
+                where_clause: String::new(),
+                order_by: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -9030,7 +9486,10 @@ impl DbWorkspace {
                 table_key: None,
                 source_id: Some(source_id),
                 database: left.database.clone().or(right.database.clone()),
+                schema: None,
                 pinned: false,
+                where_clause: String::new(),
+                order_by: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -9177,7 +9636,10 @@ impl DbWorkspace {
                 table_key: None,
                 source_id: Some(source_id.clone()),
                 database: left.database.clone().or(right.database.clone()),
+                schema: None,
                 pinned: false,
+                where_clause: String::new(),
+                order_by: String::new(),
             });
             self.active_tab = self.tabs.len() - 1;
         }

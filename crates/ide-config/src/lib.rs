@@ -68,16 +68,44 @@ pub struct DatabaseConfig {
     /// Soft SQL timeout in seconds (0 = disabled). Cancel still works via Esc.
     #[serde(default = "default_query_timeout")]
     pub query_timeout_secs: u64,
+    /// Studio Explorer pane width (cols). Ctrl+← / Ctrl+→ in Studio.
+    #[serde(default = "default_explorer_width")]
+    pub explorer_width: u16,
+    /// Explorer + Structure stack width (cols). Grows with Explorer as needed.
+    #[serde(default = "default_studio_left_width")]
+    pub studio_left_width: u16,
+    /// Results pane height percent (25–70). Ctrl+↑ / Ctrl+↓ in Studio.
+    #[serde(default = "default_results_pct")]
+    pub results_pct: u16,
+    /// Auto LIMIT for SELECT/WITH without an explicit LIMIT (0 = off). Alt-L cycles.
+    #[serde(default = "default_select_limit")]
+    pub select_limit: usize,
 }
 
 fn default_query_timeout() -> u64 {
     120
+}
+fn default_explorer_width() -> u16 {
+    28
+}
+fn default_studio_left_width() -> u16 {
+    48
+}
+fn default_results_pct() -> u16 {
+    40
+}
+fn default_select_limit() -> usize {
+    50
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             query_timeout_secs: default_query_timeout(),
+            explorer_width: default_explorer_width(),
+            studio_left_width: default_studio_left_width(),
+            results_pct: default_results_pct(),
+            select_limit: default_select_limit(),
         }
     }
 }

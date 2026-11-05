@@ -28,6 +28,7 @@ pub enum KeyContext {
     Commit,
     DbConnect,
     EditCell,
+    EditTableFilter,
     Settings,
     OpenFolder,
     ImportCsv,
@@ -197,6 +198,28 @@ pub enum Action {
     ToggleResultsDensity,
     /// Explorer: delete selected connection (confirm modal).
     DeleteDataSource,
+    /// Go to DDL for Explorer selection (script CREATE).
+    GoToDdl,
+    /// Create menu (New query / schema / table / …).
+    OpenCreateMenu,
+    /// Search Everywhere (tools + objects + commands).
+    SearchEverywhere,
+    /// Edit WHERE bar on table data Results.
+    EditTableWhere,
+    /// Edit ORDER BY bar on table data Results.
+    EditTableOrderBy,
+    /// Select all (SQL console buffer / editor).
+    SelectAll,
+    /// Copy selection or buffer to host clipboard.
+    ClipboardCopy,
+    /// Paste host clipboard at cursor.
+    ClipboardPaste,
+    /// Console: open database (catalog) picker.
+    OpenConsoleDatabase,
+    /// Console: open schema (search path) picker.
+    OpenConsoleSchema,
+    /// Cycle auto SELECT LIMIT preset (50/100/200/500/off).
+    CycleSelectLimit,
 }
 
 pub struct Keymap;
@@ -226,6 +249,7 @@ impl Keymap {
             Mode::SessionForm => KeyContext::SessionForm,
             Mode::AgentForm => KeyContext::AgentForm,
             Mode::ConfirmDeleteSource | Mode::ConfirmQuit => KeyContext::ConfirmDelete,
+            Mode::EditTableFilter => KeyContext::EditTableFilter,
             Mode::Normal => match focus {
                 Focus::Tree => KeyContext::Tree,
                 Focus::Diagnostics => KeyContext::Diagnostics,
@@ -244,7 +268,10 @@ impl Keymap {
     }
 
     pub fn map(ctx: KeyContext, key: KeyEvent) -> Option<Action> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Super (Win/Cmd) is the preferred host modifier; Control kept as fallback
+        // (many WMs eat Super before it reaches the TUI).
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match ctx {
             KeyContext::Normal => match (ctrl, shift, key.code) {
@@ -254,6 +281,13 @@ impl Keymap {
                 (true, false, KeyCode::Char('z')) => Some(Action::Undo),
                 (true, false, KeyCode::Char('y')) => Some(Action::Redo),
                 (true, false, KeyCode::Char(' ')) => Some(Action::RequestCompletion),
+                (true, false, KeyCode::Char('a') | KeyCode::Char('A')) => Some(Action::SelectAll),
+                (true, false, KeyCode::Char('c') | KeyCode::Char('C')) => {
+                    Some(Action::ClipboardCopy)
+                }
+                (true, false, KeyCode::Char('v') | KeyCode::Char('V')) => {
+                    Some(Action::ClipboardPaste)
+                }
                 (true, false, KeyCode::Char('b')) => Some(Action::ToggleTree),
                 (true, false, KeyCode::Char('f')) => Some(Action::Find),
                 (true, true, KeyCode::Char('f') | KeyCode::Char('F')) => Some(Action::OpenSearch),
@@ -300,18 +334,10 @@ impl Keymap {
                 (false, false, KeyCode::Char(':')) => Some(Action::EnterCommand),
                 (false, false, KeyCode::Char('q')) => Some(Action::Quit),
                 (false, false, KeyCode::Char('/')) => Some(Action::Find),
-                (false, false, KeyCode::Char('h')) | (false, false, KeyCode::Left) => {
-                    Some(Action::MoveLeft)
-                }
-                (false, false, KeyCode::Char('l')) | (false, false, KeyCode::Right) => {
-                    Some(Action::MoveRight)
-                }
-                (false, false, KeyCode::Char('k')) | (false, false, KeyCode::Up) => {
-                    Some(Action::MoveUp)
-                }
-                (false, false, KeyCode::Char('j')) | (false, false, KeyCode::Down) => {
-                    Some(Action::MoveDown)
-                }
+                (false, false, KeyCode::Left) => Some(Action::MoveLeft),
+                (false, false, KeyCode::Right) => Some(Action::MoveRight),
+                (false, false, KeyCode::Up) => Some(Action::MoveUp),
+                (false, false, KeyCode::Down) => Some(Action::MoveDown),
                 (false, false, KeyCode::Home) | (false, false, KeyCode::Char('0')) => {
                     Some(Action::MoveLineStart)
                 }
@@ -353,6 +379,13 @@ impl Keymap {
                 (true, false, KeyCode::Char('p')) => Some(Action::PrevCompletion),
                 (true, false, KeyCode::Char('d')) => Some(Action::AddCursorBelow),
                 (true, false, KeyCode::Char('e')) => Some(Action::ExplainQuery),
+                (true, false, KeyCode::Char('a') | KeyCode::Char('A')) => Some(Action::SelectAll),
+                (true, false, KeyCode::Char('c') | KeyCode::Char('C')) => {
+                    Some(Action::ClipboardCopy)
+                }
+                (true, false, KeyCode::Char('v') | KeyCode::Char('V')) => {
+                    Some(Action::ClipboardPaste)
+                }
                 (true, false, KeyCode::Enter) => Some(Action::RunQuery),
                 (true, false, KeyCode::Char('\n')) => Some(Action::RunQuery),
                 (true, false, KeyCode::Char('j')) => Some(Action::RunQuery),
@@ -391,13 +424,21 @@ impl Keymap {
                 KeyCode::Backspace => Some(Action::Backspace),
                 _ => None,
             },
+            KeyContext::EditTableFilter => match key.code {
+                KeyCode::Esc => Some(Action::Cancel),
+                KeyCode::Enter => Some(Action::Confirm),
+                KeyCode::Backspace => Some(Action::Backspace),
+                KeyCode::Tab => Some(Action::DbConnectNextField),
+                KeyCode::BackTab => Some(Action::DbConnectPrevField),
+                _ => None,
+            },
             KeyContext::DbConnect => match (ctrl, shift, key.code) {
                 (_, _, KeyCode::Esc) => Some(Action::Cancel),
                 (_, _, KeyCode::Enter) => Some(Action::Confirm),
                 (_, _, KeyCode::Backspace) => Some(Action::Backspace),
-                (true, _, KeyCode::Char('t')) | (_, _, KeyCode::F(6)) => {
-                    Some(Action::DbConnectTest)
-                }
+                (true, _, KeyCode::Char('t'))
+                | (true, _, KeyCode::Char('T'))
+                | (_, _, KeyCode::F(6)) => Some(Action::DbConnectTest),
                 (_, _, KeyCode::Tab) | (_, _, KeyCode::Down) => Some(Action::DbConnectNextField),
                 (_, true, KeyCode::BackTab) | (_, _, KeyCode::Up) => {
                     Some(Action::DbConnectPrevField)
@@ -416,9 +457,9 @@ impl Keymap {
             },
             KeyContext::Tree => match (ctrl, key.code) {
                 (false, KeyCode::Char('q')) => Some(Action::Quit),
-                (false, KeyCode::Char('j')) | (false, KeyCode::Down) => Some(Action::MoveDown),
-                (false, KeyCode::Char('k')) | (false, KeyCode::Up) => Some(Action::MoveUp),
-                (false, KeyCode::Enter) | (false, KeyCode::Char('l')) => Some(Action::ToggleOrOpen),
+                (false, KeyCode::Down) => Some(Action::MoveDown),
+                (false, KeyCode::Up) => Some(Action::MoveUp),
+                (false, KeyCode::Enter) => Some(Action::ToggleOrOpen),
                 (false, KeyCode::Char('2')) => Some(Action::FocusEditor),
                 (false, KeyCode::Char('r')) => Some(Action::RefreshTree),
                 (true, KeyCode::Char('p')) => Some(Action::OpenFilePalette),
@@ -427,19 +468,17 @@ impl Keymap {
             },
             KeyContext::Database => match (ctrl, shift, key.code) {
                 (false, false, KeyCode::Char('q')) => Some(Action::Quit),
-                (false, false, KeyCode::Char('j')) | (false, false, KeyCode::Down) => {
-                    Some(Action::MoveDown)
-                }
-                (false, false, KeyCode::Char('k')) | (false, false, KeyCode::Up) => {
-                    Some(Action::MoveUp)
-                }
-                (false, false, KeyCode::Enter) | (false, false, KeyCode::Char('l')) => {
-                    Some(Action::ToggleOrOpen)
-                }
+                (false, false, KeyCode::Down) => Some(Action::MoveDown),
+                (false, false, KeyCode::Up) => Some(Action::MoveUp),
+                (false, false, KeyCode::Enter) => Some(Action::ToggleOrOpen),
                 (false, false, KeyCode::Char('2')) => Some(Action::FocusEditor),
                 (false, false, KeyCode::Char('3')) => Some(Action::FocusResults),
                 (false, false, KeyCode::Char('r')) => Some(Action::RefreshTree),
                 (false, false, KeyCode::Char('e')) => Some(Action::EditDataSource),
+                (false, false, KeyCode::Char('d')) => Some(Action::GoToDdl),
+                (false, false, KeyCode::Char('n')) => Some(Action::OpenCreateMenu),
+                (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
+                (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Delete)
                 | (false, false, KeyCode::Backspace)
@@ -451,6 +490,16 @@ impl Keymap {
                 (true, false, KeyCode::Char('e')) => Some(Action::ExplainQuery),
                 (true, false, KeyCode::Char(']')) => Some(Action::CycleDbSourceNext),
                 (true, false, KeyCode::Char('[')) => Some(Action::CycleDbSourcePrev),
+                (true, true, KeyCode::Char('a') | KeyCode::Char('A')) => {
+                    Some(Action::SearchEverywhere)
+                }
+                (true, true, KeyCode::Char('g') | KeyCode::Char('G')) => Some(Action::OpenGit),
+                (true, true, KeyCode::Char('o') | KeyCode::Char('O')) => Some(Action::OpenOutline),
+                (true, true, KeyCode::Char('f') | KeyCode::Char('F')) => Some(Action::OpenSearch),
+                (true, false, KeyCode::Char('`')) => Some(Action::OpenTerminal),
+                (true, false, KeyCode::Char('7')) | (false, false, KeyCode::F(7)) => {
+                    Some(Action::OpenDebug)
+                }
                 (true, false, KeyCode::Enter)
                 | (true, false, KeyCode::Char('\n'))
                 | (true, false, KeyCode::Char('j'))
@@ -463,7 +512,10 @@ impl Keymap {
                 (false, false, KeyCode::Char('[')) => Some(Action::ResultPagePrev),
                 (true, false, KeyCode::Char(']')) => Some(Action::CycleDbSourceNext),
                 (true, false, KeyCode::Char('[')) => Some(Action::CycleDbSourcePrev),
-                (true, false, KeyCode::Enter)
+                // r / R refresh (re-run current Console SQL — Admin Activity, etc.)
+                (false, false, KeyCode::Char('r'))
+                | (false, false, KeyCode::Char('R'))
+                | (true, false, KeyCode::Enter)
                 | (true, false, KeyCode::Char('\n'))
                 | (true, false, KeyCode::Char('j'))
                 | (true, false, KeyCode::Char('r'))
@@ -474,27 +526,30 @@ impl Keymap {
                     Some(Action::ExportSql)
                 }
                 (true, true, KeyCode::Char('I')) => Some(Action::ImportCsv),
+                (true, true, KeyCode::Char('a') | KeyCode::Char('A')) => {
+                    Some(Action::SearchEverywhere)
+                }
+                (true, true, KeyCode::Char('g') | KeyCode::Char('G')) => Some(Action::OpenGit),
+                (true, false, KeyCode::Char('`')) => Some(Action::OpenTerminal),
                 (false, false, KeyCode::Char('K')) => Some(Action::KillSession),
                 (false, false, KeyCode::Char('a')) => Some(Action::ApplyRowUpdates),
                 (false, false, KeyCode::Char('u')) => Some(Action::Undo),
+                (false, false, KeyCode::Char('w')) => Some(Action::EditTableWhere),
+                (false, false, KeyCode::Char('o')) => Some(Action::EditTableOrderBy),
+                (false, false, KeyCode::Char('d')) => Some(Action::GoToDdl),
+                (false, false, KeyCode::Char('n')) => Some(Action::OpenCreateMenu),
+                (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),
+                (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
                 (false, false, KeyCode::Char('D')) => Some(Action::ToggleResultsDensity),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Char('i')) | (false, false, KeyCode::Enter) => {
                     Some(Action::EditCell)
                 }
                 (false, false, KeyCode::Char('y')) => Some(Action::YankResultCell),
-                (false, false, KeyCode::Char('j')) | (false, false, KeyCode::Down) => {
-                    Some(Action::MoveDown)
-                }
-                (false, false, KeyCode::Char('k')) | (false, false, KeyCode::Up) => {
-                    Some(Action::MoveUp)
-                }
-                (false, false, KeyCode::Char('h')) | (false, false, KeyCode::Left) => {
-                    Some(Action::MoveLeft)
-                }
-                (false, false, KeyCode::Char('l')) | (false, false, KeyCode::Right) => {
-                    Some(Action::MoveRight)
-                }
+                (false, false, KeyCode::Down) => Some(Action::MoveDown),
+                (false, false, KeyCode::Up) => Some(Action::MoveUp),
+                (false, false, KeyCode::Left) => Some(Action::MoveLeft),
+                (false, false, KeyCode::Right) => Some(Action::MoveRight),
                 (false, false, KeyCode::Char('2')) | (false, false, KeyCode::Esc) => {
                     Some(Action::FocusEditor)
                 }
@@ -503,8 +558,8 @@ impl Keymap {
                 _ => None,
             },
             KeyContext::Diagnostics => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
-                KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
+                KeyCode::Down => Some(Action::MoveDown),
+                KeyCode::Up => Some(Action::MoveUp),
                 KeyCode::Enter => Some(Action::Confirm),
                 KeyCode::Char('.') => Some(Action::ApplyQuickFix),
                 KeyCode::Char('2') | KeyCode::Esc => Some(Action::FocusEditor),
@@ -512,8 +567,8 @@ impl Keymap {
                 _ => None,
             },
             KeyContext::Git => match (shift, key.code) {
-                (false, KeyCode::Char('j')) | (false, KeyCode::Down) => Some(Action::MoveDown),
-                (false, KeyCode::Char('k')) | (false, KeyCode::Up) => Some(Action::MoveUp),
+                (false, KeyCode::Down) => Some(Action::MoveDown),
+                (false, KeyCode::Up) => Some(Action::MoveUp),
                 (false, KeyCode::Char('s')) => Some(Action::StageFile),
                 (false, KeyCode::Char('u')) => Some(Action::UnstageFile),
                 (false, KeyCode::Char('b')) => Some(Action::Blame),
@@ -525,23 +580,26 @@ impl Keymap {
                 (false, KeyCode::Char('o')) => Some(Action::CheckoutBranch),
                 (false, KeyCode::Char('r')) => Some(Action::RefreshTree),
                 (false, KeyCode::Enter) => Some(Action::Confirm),
-                (false, KeyCode::Esc) | (false, KeyCode::Char('2')) => Some(Action::FocusEditor),
+                // q = leave Git overlay (never Quit app from here)
+                (false, KeyCode::Esc)
+                | (false, KeyCode::Char('2'))
+                | (false, KeyCode::Char('q')) => Some(Action::FocusEditor),
                 _ => None,
             },
             KeyContext::Outline | KeyContext::Debug => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
-                KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
+                KeyCode::Down => Some(Action::MoveDown),
+                KeyCode::Up => Some(Action::MoveUp),
                 KeyCode::Enter => Some(Action::Confirm),
                 KeyCode::F(5) => Some(Action::DebugContinue),
                 KeyCode::F(9) => Some(Action::ToggleBreakpoint),
                 KeyCode::F(10) => Some(Action::DebugStepOver),
                 KeyCode::Char('r') if ctx == KeyContext::Debug => Some(Action::RefreshDebugLocals),
-                KeyCode::Esc | KeyCode::Char('2') => Some(Action::FocusEditor),
+                KeyCode::Esc | KeyCode::Char('2') | KeyCode::Char('q') => Some(Action::FocusEditor),
                 _ => None,
             },
             KeyContext::Sessions => match (ctrl, shift, key.code) {
-                (_, _, KeyCode::Char('j') | KeyCode::Down) => Some(Action::MoveDown),
-                (_, _, KeyCode::Char('k') | KeyCode::Up) => Some(Action::MoveUp),
+                (_, _, KeyCode::Down) => Some(Action::MoveDown),
+                (_, _, KeyCode::Up) => Some(Action::MoveUp),
                 (_, _, KeyCode::Enter) => Some(Action::SessionConnect),
                 (_, _, KeyCode::Char('a')) => Some(Action::SessionAddSsh),
                 (_, true, KeyCode::Char('A')) => Some(Action::SessionAddRdp),
@@ -563,8 +621,8 @@ impl Keymap {
                 _ => None,
             },
             KeyContext::Agents => match (ctrl, shift, key.code) {
-                (_, _, KeyCode::Char('j') | KeyCode::Down) => Some(Action::MoveDown),
-                (_, _, KeyCode::Char('k') | KeyCode::Up) => Some(Action::MoveUp),
+                (_, _, KeyCode::Down) => Some(Action::MoveDown),
+                (_, _, KeyCode::Up) => Some(Action::MoveUp),
                 (_, _, KeyCode::Enter) => Some(Action::AgentLaunch),
                 (true, true, KeyCode::Char('a') | KeyCode::Char('A')) => Some(Action::OpenAgents),
                 (false, false, KeyCode::Char('a')) => Some(Action::AgentAdd),

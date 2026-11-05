@@ -61,6 +61,8 @@ pub enum Mode {
     SessionForm,
     /// Add/edit agent CLI profile.
     AgentForm,
+    /// Table data tab: edit WHERE or ORDER BY bar (DataGrip-style).
+    EditTableFilter,
 }
 
 impl Mode {
@@ -90,8 +92,17 @@ impl Mode {
             Self::BrainAsk => "BRAIN-ASK",
             Self::SessionForm => "SESSION",
             Self::AgentForm => "AGENT",
+            Self::EditTableFilter => "TABLE-FILTER",
         }
     }
+}
+
+/// Which table-data filter bar is being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableFilterField {
+    #[default]
+    Where,
+    OrderBy,
 }
 
 /// Top-level product face: code IDE vs database IDE.

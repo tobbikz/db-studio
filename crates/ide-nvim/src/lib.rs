@@ -618,7 +618,8 @@ pub fn key_to_nvim(code: crossterm::event::KeyCode, mods: crossterm::event::KeyM
 /// Host keys that tui-ide intercepts and must NOT forward to Neovim.
 pub fn is_host_chord(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
-    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    // Super preferred; Control is the reliable fallback when WM eats Super.
+    let ctrl = mods.contains(KeyModifiers::CONTROL) || mods.contains(KeyModifiers::SUPER);
     let shift = mods.contains(KeyModifiers::SHIFT);
     if ctrl && shift && matches!(code, KeyCode::Char('d') | KeyCode::Char('D')) {
         return true;

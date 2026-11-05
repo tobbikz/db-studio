@@ -32,10 +32,9 @@ pub enum ConnField {
 }
 
 impl ConnField {
+    /// Primary connect fields first; cosmetics / TLS / SSH after.
     pub const ALL: [ConnField; 19] = [
         Self::Name,
-        Self::Group,
-        Self::Accent,
         Self::Driver,
         Self::Host,
         Self::Port,
@@ -43,11 +42,13 @@ impl ConnField {
         Self::Password,
         Self::Database,
         Self::File,
+        Self::ReadOnly,
+        Self::Role,
+        Self::Group,
+        Self::Accent,
         Self::SslMode,
         Self::SslTrustCert,
         Self::SslCa,
-        Self::ReadOnly,
-        Self::Role,
         Self::SshHost,
         Self::SshUser,
         Self::SshPort,
@@ -80,31 +81,31 @@ impl ConnField {
 
     pub fn hint(self, driver: DbDriver) -> &'static str {
         match self {
-            Self::Name => "display name",
-            Self::Group => "Explorer folder (optional)",
-            Self::Accent => "#RRGGBB or cyan/green/magenta/yellow",
-            Self::Driver => "← → PG · MySQL · SQLite · … · ES · Trino",
-            Self::Host => "DB host (as seen from jump / local)",
-            Self::Port => "5432 / 3306 / 1433 / 8123 / 9200 / 8080",
-            Self::User => "login user",
-            Self::Password => "env:VAR · vault · or type new",
-            Self::Database => "database / schema name",
+            Self::Name => "name",
+            Self::Group => "optional",
+            Self::Accent => "← → color",
+            Self::Driver => "← →",
+            Self::Host => "host",
+            Self::Port => "port",
+            Self::User => "user",
+            Self::Password => "password · env:VAR",
+            Self::Database => "database",
             Self::File => {
                 if driver == DbDriver::Sqlite {
-                    "path.db or :memory:"
+                    "path.db"
                 } else {
-                    "SQLite only"
+                    "—"
                 }
             }
-            Self::SslMode => "← → disable · prefer · require · verify-full",
-            Self::SslTrustCert => "← → yes/no (MSSQL server cert)",
-            Self::SslCa => "optional PEM path (verify modes)",
-            Self::ReadOnly => "← → block writes on this source",
-            Self::Role => "← → viewer · editor · admin",
-            Self::SshHost => "optional jump host (empty = direct)",
-            Self::SshUser => "optional (default: local user)",
+            Self::SslMode => "← →",
+            Self::SslTrustCert => "← →",
+            Self::SslCa => "optional",
+            Self::ReadOnly => "← →",
+            Self::Role => "← →",
+            Self::SshHost => "optional",
+            Self::SshUser => "optional",
             Self::SshPort => "22",
-            Self::SshKey => "optional -i identity file",
+            Self::SshKey => "optional",
         }
     }
 
@@ -144,6 +145,8 @@ pub struct DbConnectForm {
     pub ssh_port: String,
     pub ssh_key: String,
     pub focus: ConnField,
+    /// Last Ctrl-T / F6 test result — shown inside the modal (status bar is covered by scrim).
+    pub test_feedback: Option<(String, bool)>,
 }
 
 impl Default for DbConnectForm {
@@ -171,15 +174,91 @@ impl Default for DbConnectForm {
             ssh_port: "22".into(),
             ssh_key: String::new(),
             focus: ConnField::Name,
+            test_feedback: None,
         }
     }
 }
 
 impl DbConnectForm {
     pub fn fresh() -> Self {
-        let mut f = Self::default();
-        f.user = whoami_user();
-        f
+        // Empty User — never prefill $USER / whoami (blocks honest connect tests).
+        Self::default()
+    }
+
+    pub fn is_cycle_field(&self, field: ConnField) -> bool {
+        matches!(
+            field,
+            ConnField::Driver
+                | ConnField::Accent
+                | ConnField::SslMode
+                | ConnField::SslTrustCert
+                | ConnField::ReadOnly
+                | ConnField::Role
+        )
+    }
+
+    /// Named accent swatches for the connect-form color picker.
+    pub const ACCENT_PRESETS: [(&'static str, &'static str); 9] = [
+        ("", "none"),
+        ("ok", "ok"),
+        ("green", "green"),
+        ("cyan", "cyan"),
+        ("blue", "blue"),
+        ("magenta", "magenta"),
+        ("yellow", "yellow"),
+        ("red", "red"),
+        ("slate", "slate"),
+    ];
+
+    pub fn cycle_accent(&mut self, forward: bool) {
+        let cur = self.accent.trim().to_ascii_lowercase();
+        let idx = Self::ACCENT_PRESETS
+            .iter()
+            .position(|(v, _)| *v == cur.as_str())
+            .unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % Self::ACCENT_PRESETS.len()
+        } else {
+            (idx + Self::ACCENT_PRESETS.len() - 1) % Self::ACCENT_PRESETS.len()
+        };
+        self.accent = Self::ACCENT_PRESETS[next].0.to_string();
+    }
+
+    pub fn accent_label(&self) -> &'static str {
+        let cur = self.accent.trim().to_ascii_lowercase();
+        Self::ACCENT_PRESETS
+            .iter()
+            .find(|(v, _)| *v == cur.as_str())
+            .map(|(_, l)| *l)
+            .unwrap_or("custom")
+    }
+
+    pub fn accent_color(&self) -> ratatui::style::Color {
+        let s = self.accent.trim();
+        if s.is_empty() {
+            return theme::faint();
+        }
+        if let Some(hex) = s.strip_prefix('#') {
+            if hex.len() == 6 {
+                if let (Ok(r), Ok(g), Ok(b)) = (
+                    u8::from_str_radix(&hex[0..2], 16),
+                    u8::from_str_radix(&hex[2..4], 16),
+                    u8::from_str_radix(&hex[4..6], 16),
+                ) {
+                    return ratatui::style::Color::Rgb(r, g, b);
+                }
+            }
+        }
+        match s.to_ascii_lowercase().as_str() {
+            "ok" | "green" => theme::success(),
+            "cyan" => ratatui::style::Color::Cyan,
+            "blue" => ratatui::style::Color::Blue,
+            "magenta" | "pink" => ratatui::style::Color::Magenta,
+            "yellow" => ratatui::style::Color::Yellow,
+            "red" => ratatui::style::Color::Red,
+            "slate" => ratatui::style::Color::Rgb(148, 163, 184),
+            _ => theme::text(),
+        }
     }
 
     pub fn from_source(src: &DataSource) -> Self {
@@ -219,6 +298,7 @@ impl DbConnectForm {
             ssh_port: src.ssh_port.to_string(),
             ssh_key: src.ssh_key.clone(),
             focus: ConnField::Name,
+            test_feedback: None,
         }
     }
 
@@ -308,6 +388,10 @@ impl DbConnectForm {
         self.focus == ConnField::Driver
     }
 
+    pub fn on_accent_field(&self) -> bool {
+        self.focus == ConnField::Accent
+    }
+
     pub fn on_ssl_mode_field(&self) -> bool {
         self.focus == ConnField::SslMode
     }
@@ -395,8 +479,7 @@ impl DbConnectForm {
         match self.focus {
             ConnField::Name => Some(&mut self.name),
             ConnField::Group => Some(&mut self.group),
-            ConnField::Accent => Some(&mut self.accent),
-            ConnField::Driver => None,
+            ConnField::Accent | ConnField::Driver => None,
             ConnField::Host => Some(&mut self.host),
             ConnField::Port => Some(&mut self.port),
             ConnField::User => Some(&mut self.user),
@@ -418,6 +501,7 @@ impl DbConnectForm {
         if matches!(
             self.focus,
             ConnField::Driver
+                | ConnField::Accent
                 | ConnField::SslMode
                 | ConnField::SslTrustCert
                 | ConnField::ReadOnly
@@ -440,7 +524,13 @@ impl DbConnectForm {
         match field {
             ConnField::Name => self.name.clone(),
             ConnField::Group => self.group.clone(),
-            ConnField::Accent => self.accent.clone(),
+            ConnField::Accent => {
+                if self.accent.trim().is_empty() {
+                    String::new()
+                } else {
+                    self.accent_label().to_string()
+                }
+            }
             ConnField::Driver => self.driver.label().to_string(),
             ConnField::Host => self.host.clone(),
             ConnField::Port => self.port.clone(),
@@ -482,14 +572,15 @@ impl DbConnectForm {
     }
 }
 
-fn whoami_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "user".into())
-}
-
 pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectForm) {
-    let width = screen.width.min(68).max(48);
+    // Same AMOLED black as Home — plate is border-only elevation, not a gray card.
+    frame.render_widget(Clear, screen);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::bg())),
+        screen,
+    );
+
+    let width = screen.width.min(64).max(52);
     let height = screen.height.min(26).max(18);
     let x = screen.x + (screen.width.saturating_sub(width)) / 2;
     let y = screen.y + (screen.height.saturating_sub(height)) / 5;
@@ -501,66 +592,116 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
     };
 
     let title = if form.is_edit {
-        " DB Studio · edit connection "
+        " Edit connection "
     } else {
-        " DB Studio · new connection · Tab fields · Enter save "
+        " New connection "
     };
+    let title_style = Style::default()
+        .fg(theme::bg())
+        .bg(theme::text())
+        .add_modifier(Modifier::BOLD);
 
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::border_idle()))
-            .style(Style::default().bg(theme::surface()))
-            .title(title),
+            .border_style(Style::default().fg(theme::text()))
+            .style(Style::default().bg(theme::bg()))
+            .title(Span::styled(title, title_style)),
         area,
     );
 
-    let inner = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
+    let has_feedback = form.test_feedback.is_some();
+    let constraints: Vec<Constraint> = if has_feedback {
+        vec![
             Constraint::Min(10),
             Constraint::Length(1),
             Constraint::Length(1),
-        ])
-        .margin(1)
+        ]
+    } else {
+        vec![Constraint::Min(12), Constraint::Length(1)]
+    };
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .margin(2)
         .split(area);
 
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "  Source · TLS · read-only · SSH jump (host empty = direct)",
-            theme::style_muted(),
-        )),
-        inner[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "  ─────────────────────────────────────────────",
-            theme::style_faint(),
-        )),
-        inner[1],
-    );
-
     let mut lines: Vec<Line> = Vec::new();
+    let mut saw_ssl = false;
     let mut saw_ssh = false;
     for field in ConnField::ALL {
         if !form.field_enabled(field) {
             continue;
         }
+        // Quiet section breaks — no heavy chrome.
+        if matches!(field, ConnField::SslMode | ConnField::SslTrustCert) && !saw_ssl {
+            saw_ssl = true;
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("tls", theme::style_faint())));
+        }
         if matches!(field, ConnField::SshHost) && !saw_ssh {
             saw_ssh = true;
-            lines.push(Line::from(Span::styled(
-                "   — SSH jump (optional) —",
-                theme::style_faint(),
-            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("ssh", theme::style_faint())));
         }
+
         let focused = form.focus == field;
-        let marker = if focused { "▸" } else { " " };
-        let label = format!("{:<12}", field.label());
+        let cycle = form.is_cycle_field(field);
         let value = form.display_value(field);
-        let value_shown = if value.is_empty() {
+        let empty = value.is_empty();
+
+        let cursor = if focused { "›" } else { " " };
+        let cursor_style = if focused {
+            theme::style_text().add_modifier(Modifier::BOLD)
+        } else {
+            theme::style_faint()
+        };
+        let label_style = if focused {
+            theme::style_text().add_modifier(Modifier::BOLD)
+        } else {
+            theme::style_faint()
+        };
+
+        // Accent: live color picker swatch.
+        if field == ConnField::Accent {
+            let label = if empty {
+                "none"
+            } else {
+                form.accent_label()
+            };
+            let swatch = if empty { "·" } else { "██" };
+            let shown = if focused {
+                format!("‹ {swatch} {label} ›")
+            } else {
+                format!("{swatch} {label}")
+            };
+            let swatch_style = if empty {
+                theme::style_faint()
+            } else {
+                Style::default()
+                    .fg(form.accent_color())
+                    .add_modifier(if focused {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    })
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{cursor} "), cursor_style),
+                Span::styled(format!("{:<11}", field.label()), label_style),
+                Span::styled(shown, swatch_style),
+            ]));
+            continue;
+        }
+
+        let value_shown = if cycle {
+            if focused {
+                format!("‹ {value} ›")
+            } else {
+                value
+            }
+        } else if empty {
             field.hint(form.driver).to_string()
         } else if focused {
             format!("{value}▌")
@@ -568,61 +709,53 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
             value
         };
 
-        let label_style = if focused {
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::BOLD)
+        let value_style = if focused {
+            theme::style_text().add_modifier(Modifier::BOLD)
+        } else if empty && !cycle {
+            theme::style_faint()
         } else {
             theme::style_muted()
         };
-        let value_style = if focused {
-            Style::default()
-                .fg(theme::text())
-                .bg(theme::surface_2())
-                .add_modifier(Modifier::BOLD)
-        } else if form.display_value(field).is_empty() {
-            theme::style_faint()
-        } else {
-            theme::style_text()
-        };
 
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {marker} "),
-                if focused {
-                    theme::style_accent()
-                } else {
-                    theme::style_faint()
-                },
-            ),
-            Span::styled(label, label_style),
-            Span::styled(" ", theme::style_faint()),
-            Span::styled(format!(" {value_shown} "), value_style),
+            Span::styled(format!("{cursor} "), cursor_style),
+            Span::styled(format!("{:<11}", field.label()), label_style),
+            Span::styled(value_shown, value_style),
         ]));
     }
-    frame.render_widget(Paragraph::new(lines), inner[2]);
+    frame.render_widget(Paragraph::new(lines), inner[0]);
 
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "  ─────────────────────────────────────────────",
-            theme::style_faint(),
-        )),
-        inner[3],
-    );
+    let foot_idx = if let Some((ref msg, err)) = form.test_feedback {
+        let badge = if err {
+            Span::styled(" ERR ", theme::style_err_badge())
+        } else {
+            Span::styled(" OK ", theme::style_ok_badge())
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                badge,
+                Span::styled(format!(" {msg}"), theme::style_text()),
+            ])),
+            inner[1],
+        );
+        2
+    } else {
+        1
+    };
+
+    // One key per action (F6 still works; not advertised).
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("  ", theme::style_faint()),
-            Span::styled("Tab", theme::style_pill_off()),
-            Span::styled(" field · ", theme::style_faint()),
-            Span::styled("password", theme::style_muted()),
-            Span::styled(" env:VAR / vault · ", theme::style_faint()),
-            Span::styled("SSH", theme::style_muted()),
-            Span::styled(" jump optional · ", theme::style_faint()),
-            Span::styled("Enter", theme::style_pill_off()),
-            Span::styled(" save · ", theme::style_faint()),
-            Span::styled("Esc", theme::style_pill_off()),
-            Span::styled(" cancel", theme::style_faint()),
+            Span::styled("Tab", theme::style_faint()),
+            Span::styled(" · ", theme::style_faint()),
+            Span::styled("←→", theme::style_faint()),
+            Span::styled(" · ", theme::style_faint()),
+            Span::styled("^T", theme::style_faint()),
+            Span::styled(" test · ", theme::style_faint()),
+            Span::styled("Enter", theme::style_faint()),
+            Span::styled(" · ", theme::style_faint()),
+            Span::styled("Esc", theme::style_faint()),
         ])),
-        inner[4],
+        inner[foot_idx],
     );
 }

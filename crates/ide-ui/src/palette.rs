@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -17,8 +17,18 @@ pub enum PaletteMode {
     Files,
     CodeActions,
     Projects,
+    /// Home W — DB connection workspaces.
+    Workspaces,
     /// Fuzzy jump to table/view rows visible in the DB explorer.
     DbObjects,
+    /// Create menu (New query / schema / table / …).
+    Create,
+    /// Search Everywhere — tools + commands + DB objects.
+    SearchEverywhere,
+    /// Console toolbar: pick database (catalog).
+    ConsoleDatabase,
+    /// Console toolbar: pick schema (search path).
+    ConsoleSchema,
 }
 
 #[derive(Debug, Clone)]
@@ -89,11 +99,16 @@ impl Palette {
             item("Rename SQL tab", "rename_tab"),
             item("Close SQL tab", "close_tab"),
             item("New SQL tab", "new_tab"),
+            item("Set console database…", "console_database"),
+            item("Set console schema…", "console_schema"),
             item("Studio help", "studio_help"),
             item("Code help", "code_help"),
             item("Yank Neovim → host clipboard", "yank_clipboard"),
             item("Paste host clipboard → editor", "paste_clipboard"),
-            item("Script object (CREATE)", "script_object"),
+            item("Script object / Go to DDL", "script_object"),
+            item("Create… (New)", "create_menu"),
+            item("Search Everywhere", "search_everywhere"),
+            item("Go to DDL", "script_object"),
             item("Query history", "query_history"),
             item("Pin / unpin connection", "pin_connection"),
             item("Health overview (active driver)", "health_overview"),
@@ -288,6 +303,134 @@ impl Palette {
         p
     }
 
+    pub fn open_workspaces(actions: Vec<(String, String)>) -> Self {
+        let items = actions
+            .into_iter()
+            .map(|(label, id)| PaletteItem {
+                label,
+                id,
+                path: None,
+                subtitle: None,
+            })
+            .collect();
+        let mut p = Self {
+            mode: PaletteMode::Workspaces,
+            query: String::new(),
+            items,
+            filtered: Vec::new(),
+            selected: 0,
+        };
+        p.refilter();
+        p
+    }
+
+    pub fn open_create() -> Self {
+        let items = vec![
+            item("Query Console", "create_query"),
+            item("Schema", "create_schema"),
+            item("Table", "create_table"),
+            item("View", "create_view"),
+            item("Index", "create_index"),
+            item("Role / User", "create_role"),
+            item("Database", "create_database"),
+            item("Data Source…", "add_datasource"),
+        ];
+        let mut p = Self {
+            mode: PaletteMode::Create,
+            query: String::new(),
+            items,
+            filtered: Vec::new(),
+            selected: 0,
+        };
+        p.refilter();
+        p
+    }
+
+    /// Tools first, then optional DB objects, then remaining commands.
+    pub fn open_search_everywhere(
+        db_objects: Vec<(String, String, String)>,
+    ) -> Self {
+        let mut items = vec![
+            item("Git", "git"),
+            item("Terminal", "terminal"),
+            item("Debug", "debug"),
+            item("Hierarchy (Outline)", "outline"),
+            item("Project Search", "search"),
+            item("Go to DDL", "script_object"),
+            item("Create…", "create_menu"),
+            item("Find table/view", "db_object_search"),
+            item("New Query", "new_tab"),
+            item("Set console database…", "console_database"),
+            item("Set console schema…", "console_schema"),
+        ];
+        for (label, subtitle, flat_idx) in db_objects {
+            items.push(PaletteItem {
+                label,
+                id: format!("dbobj:{flat_idx}"),
+                path: None,
+                subtitle: Some(subtitle),
+            });
+        }
+        // Append a trimmed command set (skip duplicates already listed).
+        for it in Self::open_commands().items {
+            if items.iter().any(|e| e.id == it.id) {
+                continue;
+            }
+            items.push(it);
+        }
+        let mut p = Self {
+            mode: PaletteMode::SearchEverywhere,
+            query: String::new(),
+            items,
+            filtered: Vec::new(),
+            selected: 0,
+        };
+        p.refilter();
+        p
+    }
+
+    pub fn open_console_databases(names: Vec<String>) -> Self {
+        let items = names
+            .into_iter()
+            .map(|name| PaletteItem {
+                id: format!("condb:{name}"),
+                label: name,
+                path: None,
+                subtitle: Some("database".into()),
+            })
+            .collect();
+        let mut p = Self {
+            mode: PaletteMode::ConsoleDatabase,
+            query: String::new(),
+            items,
+            filtered: Vec::new(),
+            selected: 0,
+        };
+        p.refilter();
+        p
+    }
+
+    pub fn open_console_schemas(names: Vec<String>) -> Self {
+        let items = names
+            .into_iter()
+            .map(|name| PaletteItem {
+                id: format!("conschema:{name}"),
+                label: name,
+                path: None,
+                subtitle: Some("schema".into()),
+            })
+            .collect();
+        let mut p = Self {
+            mode: PaletteMode::ConsoleSchema,
+            query: String::new(),
+            items,
+            filtered: Vec::new(),
+            selected: 0,
+        };
+        p.refilter();
+        p
+    }
+
     fn haystack(it: &PaletteItem) -> String {
         match &it.subtitle {
             Some(s) => format!("{} {}", it.label, s),
@@ -376,8 +519,14 @@ fn item(label: &str, id: &str) -> PaletteItem {
 }
 
 pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
-    let width = screen.width.min(78).max(48);
-    let height = screen.height.min(22).max(12);
+    // Full-screen black scrim — same plate language as Home / connect modal.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::bg())),
+        screen,
+    );
+
+    let width = screen.width.min(64).max(40);
+    let height = screen.height.min(18).max(10);
     let x = screen.x + (screen.width.saturating_sub(width)) / 2;
     let y = screen.y + (screen.height.saturating_sub(height)) / 4;
     let area = Rect {
@@ -389,65 +538,50 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
 
     frame.render_widget(Clear, area);
 
-    let (title, hint) = match palette.mode {
-        PaletteMode::Commands => ("commands", "type to filter"),
-        PaletteMode::Files => ("open file", "fuzzy path"),
-        PaletteMode::CodeActions => ("code actions", "pick an action"),
-        PaletteMode::Projects => ("projects", "recent workspaces"),
-        PaletteMode::DbObjects => ("find object", "tables & views in explorer"),
+    let title = match palette.mode {
+        PaletteMode::Commands => " commands ",
+        PaletteMode::Files => " open file ",
+        PaletteMode::CodeActions => " actions ",
+        PaletteMode::Projects => " projects ",
+        PaletteMode::Workspaces => " workspaces ",
+        PaletteMode::DbObjects => " find object ",
+        PaletteMode::Create => " new ",
+        PaletteMode::SearchEverywhere => " search everywhere ",
+        PaletteMode::ConsoleDatabase => " database ",
+        PaletteMode::ConsoleSchema => " schema ",
     };
 
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::border_idle()))
-            .style(Style::default().bg(theme::surface()))
-            .title(format!(" {title} ")),
+            .style(Style::default().bg(theme::bg()))
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            )),
         area,
     );
 
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // subtitle
-            Constraint::Length(1), // spacer line
             Constraint::Length(1), // filter
-            Constraint::Length(1), // rule
+            Constraint::Length(1), // blank
             Constraint::Min(4),    // list
-            Constraint::Length(1), // rule
+            Constraint::Length(1), // blank
             Constraint::Length(1), // footer
         ])
-        .margin(1)
+        .margin(2)
         .split(area);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("  ", theme::style_faint()),
-            Span::styled(hint, theme::style_muted()),
-            Span::styled(
-                format!("  ·  {} matches", palette.filtered.len()),
-                theme::style_faint(),
-            ),
-        ])),
-        inner[0],
-    );
-
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "  ─────────────────────────────────────────────────────────",
-            theme::style_faint(),
-        )),
-        inner[1],
-    );
-
     let filter_text = if palette.query.is_empty() {
-        Line::from(vec![
-            Span::styled("  filter  ", theme::style_faint()),
-            Span::styled("…", theme::style_faint()),
-        ])
+        Line::from(Span::styled("type to filter…", theme::style_faint()))
     } else {
         Line::from(vec![
-            Span::styled("  filter  ", theme::style_faint()),
             Span::styled(
                 palette.query.as_str(),
                 Style::default()
@@ -458,88 +592,47 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
         ])
     };
     frame.render_widget(
-        Paragraph::new(filter_text).style(Style::default().bg(theme::surface_2())),
-        inner[2],
+        Paragraph::new(filter_text).style(Style::default().bg(theme::bg())),
+        inner[0],
     );
 
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "  ─────────────────────────────────────────────────────────",
-            theme::style_faint(),
-        )),
-        inner[3],
-    );
-
-    let list_h = inner[4].height as usize;
+    let list_h = inner[2].height as usize;
     let start = palette
         .selected
         .saturating_sub(list_h.saturating_sub(1) / 2)
         .min(palette.filtered.len().saturating_sub(list_h));
     let mut lines: Vec<Line> = Vec::new();
+    let label_w = (width as usize).saturating_sub(6).max(12);
     for (vis_off, &idx) in palette.filtered.iter().enumerate().skip(start).take(list_h) {
         let it = &palette.items[idx];
         let selected = vis_off == palette.selected;
-        let marker = if selected { "▸" } else { " " };
         let name_style = if selected {
             Style::default()
                 .fg(theme::text())
-                .bg(theme::surface_2())
-                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             theme::style_text()
         };
-        let sub_style = if selected {
-            Style::default().fg(theme::muted()).bg(theme::surface_2())
+        let label = if let Some(sub) = &it.subtitle {
+            truncate(&format!("{}  ·  {sub}", it.label), label_w)
         } else {
-            theme::style_faint()
+            truncate(&it.label, label_w)
         };
-        let mut spans = vec![
-            Span::styled(
-                format!(" {marker} "),
-                if selected {
-                    theme::style_accent()
-                } else {
-                    theme::style_faint()
-                },
-            ),
-            Span::styled(format!("{:<22}", truncate(&it.label, 22)), name_style),
-        ];
-        if let Some(sub) = &it.subtitle {
-            spans.push(Span::styled("  ", sub_style));
-            spans.push(Span::styled(truncate(sub, (width as usize).saturating_sub(32)), sub_style));
-        }
-        if selected {
-            // pad feel: marker already set
-        }
-        lines.push(Line::from(spans));
+        lines.push(Line::from(Span::styled(format!(" {label} "), name_style)));
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  no matches",
+            " no matches ",
             theme::style_faint(),
         )));
     }
-    frame.render_widget(Paragraph::new(lines), inner[4]);
-
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "  ─────────────────────────────────────────────────────────",
-            theme::style_faint(),
-        )),
-        inner[5],
-    );
+    frame.render_widget(Paragraph::new(lines), inner[2]);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("  ", theme::style_faint()),
-            Span::styled("Enter", theme::style_pill_off()),
-            Span::styled(" open   ", theme::style_faint()),
-            Span::styled("Esc", theme::style_pill_off()),
-            Span::styled(" close   ", theme::style_faint()),
-            Span::styled("↑↓", theme::style_pill_off()),
-            Span::styled(" move", theme::style_faint()),
+            Span::styled(" Enter open  ·  Esc close ", theme::style_faint()),
         ])),
-        inner[6],
+        inner[4],
     );
 }
 
@@ -969,6 +1062,101 @@ pub fn render_confirm_delete(frame: &mut Frame, screen: Rect, title: &str, messa
     render_confirm_dialog(frame, screen, title, message, "delete");
 }
 
+/// Blocking error ack (query failure). Enter / Esc dismiss.
+pub fn render_error_dialog(frame: &mut Frame, screen: Rect, title: &str, message: &str) {
+    frame.render_widget(Clear, screen);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::bg())),
+        screen,
+    );
+
+    let width = screen.width.min(72).max(44);
+    let wrapped_lines = textwrap_lines(message, (width as usize).saturating_sub(6).max(20));
+    let body_h = (wrapped_lines.len() as u16).clamp(2, 10);
+    let height = body_h.saturating_add(8).min(screen.height.saturating_sub(2));
+    let x = screen.x + (screen.width.saturating_sub(width)) / 2;
+    let y = screen.y + (screen.height.saturating_sub(height)) / 3;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, area);
+    let title_style = Style::default()
+        .fg(theme::bg())
+        .bg(theme::danger())
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::danger()))
+            .style(Style::default().bg(theme::bg()))
+            .title(Span::styled(format!(" {title} "), title_style)),
+        area,
+    );
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .margin(2)
+        .split(area);
+    let body: Vec<Line> = wrapped_lines
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, theme::style_text())))
+        .collect();
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" / ", theme::style_faint()),
+            Span::styled(" Esc ", theme::style_pill_off()),
+            Span::styled(" dismiss · fix SQL in Console", theme::style_faint()),
+        ])),
+        inner[3],
+    );
+}
+
+fn textwrap_lines(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in s.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if line.is_empty() {
+                line = word.to_string();
+            } else if line.chars().count() + 1 + word.chars().count() <= width {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+        }
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 pub fn render_confirm_dialog(
     frame: &mut Frame,
     screen: Rect,
@@ -976,10 +1164,10 @@ pub fn render_confirm_dialog(
     message: &str,
     action_verb: &str,
 ) {
-    // Full-screen scrim so chrome cannot bleed through the dialog.
+    // Same AMOLED black as Home / connect form (border-only elevation).
     frame.render_widget(Clear, screen);
     frame.render_widget(
-        Block::default().style(Style::default().bg(theme::scrim())),
+        Block::default().style(Style::default().bg(theme::bg())),
         screen,
     );
 
@@ -994,22 +1182,6 @@ pub fn render_confirm_dialog(
         height,
     };
 
-    // Outer plate (halo) — one cell larger, solid elevated fill.
-    let halo = Rect {
-        x: area.x.saturating_sub(1),
-        y: area.y.saturating_sub(1),
-        width: area.width.saturating_add(2).min(screen.width.saturating_sub(area.x.saturating_sub(1))),
-        height: area
-            .height
-            .saturating_add(2)
-            .min(screen.height.saturating_sub(area.y.saturating_sub(1))),
-    };
-    frame.render_widget(Clear, halo);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(theme::modal())),
-        halo,
-    );
-
     frame.render_widget(Clear, area);
     let title_style = Style::default()
         .fg(theme::bg())
@@ -1018,12 +1190,8 @@ pub fn render_confirm_dialog(
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(
-                Style::default()
-                    .fg(theme::text())
-                    .add_modifier(Modifier::BOLD),
-            )
-            .style(Style::default().bg(theme::modal()))
+            .border_style(Style::default().fg(theme::text()))
+            .style(Style::default().bg(theme::bg()))
             .title(Span::styled(format!(" {title} "), title_style)),
         area,
     );
@@ -1054,17 +1222,18 @@ pub fn render_confirm_dialog(
         Paragraph::new(Span::styled(hint, theme::style_muted())),
         inner[2],
     );
+    // One key per action (y/n still work; not advertised).
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " Enter/y ",
+                " Enter ",
                 Style::default()
                     .fg(theme::bg())
                     .bg(theme::text())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!(" {action_verb}   "), theme::style_faint()),
-            Span::styled(" Esc/n ", theme::style_pill_off()),
+            Span::styled(" Esc ", theme::style_pill_off()),
             Span::styled(" cancel", theme::style_faint()),
         ])),
         inner[4],

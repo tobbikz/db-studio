@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -16,6 +16,7 @@ use ide_buffer::{Buffer, BufferSet};
 use ide_config::IdeConfig;
 use ide_core::{
     BottomPanel, CodeSurface, Cursor, DbSurface, Focus, Mode, ProductMode, Sidebar,
+    TableFilterField,
 };
 use ide_db::{
     default_brain_source, query_param_prompt_seed, sql_has_query_params, substitute_query_params,
@@ -140,8 +141,207 @@ impl App {
         };
         app.config.remember_project(&app.workspace.root);
         app.db.query_timeout_secs = app.config.database.query_timeout_secs;
+        app.db.select_limit = app.config.database.select_limit;
+        app.apply_studio_layout_from_config();
         app.refresh_queries_dir();
         Ok(app)
+    }
+
+    fn apply_studio_layout_from_config(&mut self) {
+        let db = &self.config.database;
+        self.ui.explorer_width = db.explorer_width.clamp(14, 100);
+        self.ui.studio_left_width = db.studio_left_width.clamp(28, 120);
+        self.ui.results_pct = db.results_pct.clamp(25, 70);
+    }
+
+    fn persist_studio_layout(&mut self) {
+        self.config.database.explorer_width = self.ui.explorer_width;
+        self.config.database.studio_left_width = self.ui.studio_left_width;
+        self.config.database.results_pct = self.ui.results_pct;
+        self.config.database.select_limit = self.db.select_limit;
+        if let Err(e) = self.config.save() {
+            self.set_status(format!("layout save: {e:#}"), true);
+        }
+    }
+
+    fn cycle_select_limit(&mut self) {
+        self.db.select_limit = ide_db::next_select_limit_preset(self.db.select_limit);
+        self.config.database.select_limit = self.db.select_limit;
+        let _ = self.config.save();
+        let msg = if self.db.select_limit == 0 {
+            "SELECT limit · off (no auto LIMIT)".to_string()
+        } else {
+            format!(
+                "SELECT limit · {} · Alt-L cycle · applies when SQL has no LIMIT",
+                self.db.select_limit
+            )
+        };
+        self.set_status(msg, false);
+    }
+
+    /// Ctrl+arrows — resize only the focused pane's divider.
+    fn resize_focused_pane(&mut self, code: KeyCode) {
+        match self.ui.focus {
+            // Explorer: ← shrink / → grow its width (auto-grows left stack).
+            Focus::Database => match code {
+                KeyCode::Right => {
+                    let next = (self.ui.explorer_width + 2).min(100);
+                    let need_left = next.saturating_add(12);
+                    if need_left > self.ui.studio_left_width {
+                        self.ui.studio_left_width = need_left.min(120);
+                    }
+                    self.ui.explorer_width = next
+                        .min(self.ui.studio_left_width.saturating_sub(12).max(14));
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("explorer · {} cols (saved)", self.ui.explorer_width),
+                        false,
+                    );
+                }
+                KeyCode::Left => {
+                    self.ui.explorer_width =
+                        self.ui.explorer_width.saturating_sub(2).max(14);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("explorer · {} cols (saved)", self.ui.explorer_width),
+                        false,
+                    );
+                }
+                KeyCode::Down => {
+                    self.ui.results_pct = (self.ui.results_pct + 5).min(70);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("results · {}% (saved)", self.ui.results_pct),
+                        false,
+                    );
+                }
+                KeyCode::Up => {
+                    self.ui.results_pct =
+                        self.ui.results_pct.saturating_sub(5).max(25);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("results · {}% (saved)", self.ui.results_pct),
+                        false,
+                    );
+                }
+                _ => {}
+            },
+            // Structure: ← more explorer / → more structure (move shared split).
+            Focus::Structure => match code {
+                KeyCode::Left => {
+                    let next = (self.ui.explorer_width + 2).min(100);
+                    let need_left = next.saturating_add(12);
+                    if need_left > self.ui.studio_left_width {
+                        self.ui.studio_left_width = need_left.min(120);
+                    }
+                    self.ui.explorer_width = next
+                        .min(self.ui.studio_left_width.saturating_sub(12).max(14));
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("structure ← explorer · {} cols", self.ui.explorer_width),
+                        false,
+                    );
+                }
+                KeyCode::Right => {
+                    self.ui.explorer_width =
+                        self.ui.explorer_width.saturating_sub(2).max(14);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("structure → · explorer {} cols", self.ui.explorer_width),
+                        false,
+                    );
+                }
+                KeyCode::Down => {
+                    self.ui.results_pct = (self.ui.results_pct + 5).min(70);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("results · {}% (saved)", self.ui.results_pct),
+                        false,
+                    );
+                }
+                KeyCode::Up => {
+                    self.ui.results_pct =
+                        self.ui.results_pct.saturating_sub(5).max(25);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("results · {}% (saved)", self.ui.results_pct),
+                        false,
+                    );
+                }
+                _ => {}
+            },
+            // Console: ← grow console (shrink left) / → grow left stack.
+            Focus::Editor => match code {
+                KeyCode::Left => {
+                    self.ui.studio_left_width =
+                        self.ui.studio_left_width.saturating_sub(2).max(28);
+                    let max_ex = self.ui.studio_left_width.saturating_sub(12).max(14);
+                    if self.ui.explorer_width > max_ex {
+                        self.ui.explorer_width = max_ex;
+                    }
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("console ← · left {} cols", self.ui.studio_left_width),
+                        false,
+                    );
+                }
+                KeyCode::Right => {
+                    self.ui.studio_left_width =
+                        (self.ui.studio_left_width + 2).min(120);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("console → · left {} cols", self.ui.studio_left_width),
+                        false,
+                    );
+                }
+                KeyCode::Down => {
+                    self.ui.results_pct = (self.ui.results_pct + 5).min(70);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("results · {}% (saved)", self.ui.results_pct),
+                        false,
+                    );
+                }
+                KeyCode::Up => {
+                    self.ui.results_pct =
+                        self.ui.results_pct.saturating_sub(5).max(25);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("results · {}% (saved)", self.ui.results_pct),
+                        false,
+                    );
+                }
+                _ => {}
+            },
+            // Results: ↑ shrink / ↓ grow height only.
+            Focus::Results => match code {
+                KeyCode::Down => {
+                    self.ui.results_pct = (self.ui.results_pct + 5).min(70);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("results · {}% (saved)", self.ui.results_pct),
+                        false,
+                    );
+                }
+                KeyCode::Up => {
+                    self.ui.results_pct =
+                        self.ui.results_pct.saturating_sub(5).max(25);
+                    self.persist_studio_layout();
+                    self.set_status(
+                        format!("results · {}% (saved)", self.ui.results_pct),
+                        false,
+                    );
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    self.set_status(
+                        "results · Ctrl+↑↓ height (←→ for Explorer/Console)",
+                        false,
+                    );
+                }
+                _ => {}
+            },
+            _ => {}
+        }
     }
 
     fn refresh_queries_dir(&mut self) {
@@ -157,6 +357,44 @@ impl App {
     fn open_projects_palette(&mut self) {
         self.ui.mode = Mode::Palette;
         self.ui.palette = Palette::open_projects(&self.config.recent_projects);
+    }
+
+    /// Home W: pick a DB connection workspace → open Studio.
+    fn open_db_workspaces_palette(&mut self) {
+        if self.db.sources.is_empty() {
+            self.set_status("no workspaces — A to add", false);
+            return;
+        }
+        let items: Vec<(String, String)> = self
+            .db
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let where_ = match s.driver {
+                    ide_db::DbDriver::Sqlite => {
+                        if s.file.is_empty() {
+                            "sqlite".into()
+                        } else {
+                            s.file.clone()
+                        }
+                    }
+                    _ => {
+                        if s.database.is_empty() {
+                            format!("{}:{}", s.host, s.port)
+                        } else {
+                            format!("{}:{}/{}", s.host, s.port, s.database)
+                        }
+                    }
+                };
+                (
+                    format!("{} · {} · {where_}", s.name, s.driver.label()),
+                    format!("workspace:{}", i + 1),
+                )
+            })
+            .collect();
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_workspaces(items);
     }
 
     async fn switch_workspace(&mut self, path: PathBuf) -> Result<()> {
@@ -393,6 +631,165 @@ impl App {
         self.ui.palette = Palette::open_db_objects(items);
     }
 
+    fn db_object_palette_items(&self) -> Vec<(String, String, String)> {
+        self.db
+            .flat
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.kind, DbNodeKind::Table | DbNodeKind::View))
+            .map(|(i, e)| {
+                let label = e.label.clone();
+                let sub = match (&e.schema, &e.database) {
+                    (Some(s), Some(d)) if !d.is_empty() => format!("{d}.{s}"),
+                    (Some(s), _) => s.clone(),
+                    _ => e.source_id.clone(),
+                };
+                (label, sub, i.to_string())
+            })
+            .collect()
+    }
+
+    fn open_create_menu(&mut self) {
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_create();
+        self.set_status("Create · type to filter · Enter", false);
+    }
+
+    fn open_search_everywhere(&mut self) {
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_search_everywhere(self.db_object_palette_items());
+        self.set_status("Search Everywhere · tools · objects · commands", false);
+    }
+
+    fn resume_console_editing(&mut self) {
+        self.ui.focus = Focus::Editor;
+        self.ui.mode = Mode::Insert;
+        self.ui.show_completions = false;
+        self.ui.resume_console_insert = false;
+        self.ui.db_sql_all_selected = false;
+    }
+
+    async fn open_console_database_palette(&mut self) {
+        if self.ui.product != ProductMode::Database {
+            return;
+        }
+        // Always return to Insert on Console after picking — bare `b` left users stuck in NORMAL.
+        self.ui.resume_console_insert = true;
+        match self.db.list_console_databases().await {
+            Ok(names) if names.is_empty() => {
+                self.ui.resume_console_insert = false;
+                self.set_status("no databases to list for this source", true);
+            }
+            Ok(names) => {
+                self.ui.mode = Mode::Palette;
+                self.ui.palette = Palette::open_console_databases(names);
+                self.set_status("database · type to filter · Enter · Esc back to Console", false);
+            }
+            Err(e) => {
+                self.ui.resume_console_insert = false;
+                self.set_status(format!("databases: {e:#}"), true);
+            }
+        }
+    }
+
+    async fn open_console_schema_palette(&mut self) {
+        if self.ui.product != ProductMode::Database {
+            return;
+        }
+        self.ui.resume_console_insert = true;
+        match self.db.list_console_schemas().await {
+            Ok(names) if names.is_empty() => {
+                self.ui.resume_console_insert = false;
+                self.set_status("no schemas to list — pick a database first", true);
+            }
+            Ok(names) => {
+                self.ui.mode = Mode::Palette;
+                self.ui.palette = Palette::open_console_schemas(names);
+                self.set_status("schema · type to filter · Enter · Esc back to Console", false);
+            }
+            Err(e) => {
+                self.ui.resume_console_insert = false;
+                self.set_status(format!("schemas: {e:#}"), true);
+            }
+        }
+    }
+
+    fn begin_table_filter_edit(&mut self, field: TableFilterField) {
+        if !self.db.active_is_table_tab() {
+            self.set_status("WHERE / ORDER BY only on table data tabs", true);
+            return;
+        }
+        self.ui.table_filter_field = field;
+        self.ui.table_filter_draft = match field {
+            TableFilterField::Where => self.db.active_table_where().to_string(),
+            TableFilterField::OrderBy => self.db.active_table_order_by().to_string(),
+        };
+        self.ui.focus = Focus::Results;
+        self.ui.mode = Mode::EditTableFilter;
+        let label = match field {
+            TableFilterField::Where => "WHERE",
+            TableFilterField::OrderBy => "ORDER BY",
+        };
+        self.set_status(format!("{label} · Enter apply · Tab switch · Esc cancel"), false);
+    }
+
+    async fn confirm_table_filter(&mut self) -> Result<()> {
+        let draft = self.ui.table_filter_draft.clone();
+        match self.ui.table_filter_field {
+            TableFilterField::Where => self.db.set_active_table_where(draft),
+            TableFilterField::OrderBy => self.db.set_active_table_order_by(draft),
+        }
+        self.ui.mode = Mode::Normal;
+        self.ui.table_filter_draft.clear();
+        self.ui.focus = Focus::Results;
+        match self.db.apply_table_filters().await {
+            Ok(()) => {
+                self.ui.bottom = BottomPanel::Results;
+                self.set_status(self.db.status.clone(), false);
+            }
+            Err(e) => self.set_status(format!("filter: {e:#}"), true),
+        }
+        Ok(())
+    }
+
+    fn cycle_table_filter_field(&mut self, forward: bool) {
+        if self.ui.mode != Mode::EditTableFilter {
+            return;
+        }
+        // Persist current draft into the active field before switching.
+        let draft = self.ui.table_filter_draft.clone();
+        match self.ui.table_filter_field {
+            TableFilterField::Where => self.db.set_active_table_where(draft),
+            TableFilterField::OrderBy => self.db.set_active_table_order_by(draft),
+        }
+        self.ui.table_filter_field = if forward {
+            match self.ui.table_filter_field {
+                TableFilterField::Where => TableFilterField::OrderBy,
+                TableFilterField::OrderBy => TableFilterField::Where,
+            }
+        } else {
+            match self.ui.table_filter_field {
+                TableFilterField::Where => TableFilterField::OrderBy,
+                TableFilterField::OrderBy => TableFilterField::Where,
+            }
+        };
+        self.ui.table_filter_draft = match self.ui.table_filter_field {
+            TableFilterField::Where => self.db.active_table_where().to_string(),
+            TableFilterField::OrderBy => self.db.active_table_order_by().to_string(),
+        };
+    }
+
+    async fn go_to_ddl(&mut self) -> Result<()> {
+        match self.db.script_object_at_selection().await {
+            Ok(()) => {
+                self.ui.focus = Focus::Editor;
+                self.set_status(self.db.status.clone(), false);
+            }
+            Err(e) => self.set_status(format!("DDL: {e:#}"), true),
+        }
+        Ok(())
+    }
+
     fn selected_connection_id(&self) -> Option<String> {
         self.db
             .flat
@@ -474,13 +871,44 @@ impl App {
     }
 
     fn set_status(&mut self, text: impl Into<String>, error: bool) {
-        let raw = text.into();
-        let text = if error {
-            Self::human_err(&raw)
+        let tone = if error {
+            ide_ui::StatusTone::Error
         } else {
-            Self::human_ok(&raw)
+            ide_ui::StatusTone::Info
         };
-        self.ui.status = Some(StatusMessage { text, error });
+        self.push_status(text, tone);
+    }
+
+    /// Green OK badge — only for real successes (test/connect/health), not pane tips.
+    fn set_ok(&mut self, text: impl Into<String>) {
+        self.push_status(text, ide_ui::StatusTone::Success);
+    }
+
+    fn push_status(&mut self, text: impl Into<String>, tone: ide_ui::StatusTone) {
+        let raw = text.into();
+        let text = match tone {
+            ide_ui::StatusTone::Error => Self::human_err(&raw),
+            _ => Self::human_ok(&raw),
+        };
+        let secs = match tone {
+            ide_ui::StatusTone::Error => 4,
+            ide_ui::StatusTone::Success => 3,
+            ide_ui::StatusTone::Info => 2,
+        };
+        self.ui.status = Some(StatusMessage {
+            text,
+            error: matches!(tone, ide_ui::StatusTone::Error),
+            tone,
+            until: std::time::Instant::now() + Duration::from_secs(secs),
+        });
+    }
+
+    fn clear_expired_status(&mut self) {
+        if let Some(msg) = &self.ui.status {
+            if std::time::Instant::now() >= msg.until {
+                self.ui.status = None;
+            }
+        }
     }
 
     fn human_ok(raw: &str) -> String {
@@ -740,7 +1168,7 @@ impl App {
                 self.db.status = format!("connected · {}", src.name);
                 self.ui.busy_label = None;
                 self.enter_db_studio();
-                self.set_status(format!("connected · {}", src.name), false);
+                self.set_ok(format!("connected · {}", src.name));
             }
             Err(e) => {
                 self.ui.busy_label = None;
@@ -1272,7 +1700,10 @@ impl App {
     }
 
     fn db_insert_char(&mut self, c: char) {
-        self.db_push_undo();
+        let replaced = self.clear_db_sql_selection_or_all();
+        if !replaced {
+            self.db_push_undo();
+        }
         let row = self.ui.db_cursor.row;
         let col = self.ui.db_cursor.col;
         let mut lines: Vec<String> = if self.db.sql.is_empty() {
@@ -1293,11 +1724,163 @@ impl App {
         };
         lines[row] = line;
         self.db.sql = lines.join("\n");
+        self.sync_active_sql_tab();
         self.ui.db_cursor.col += 1;
         self.db_clamp_cursor();
     }
 
+    fn sync_active_sql_tab(&mut self) {
+        if let Some(tab) = self.db.tabs.get_mut(self.db.active_tab) {
+            tab.sql = self.db.sql.clone();
+        }
+    }
+
+    fn db_insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let replaced = self.clear_db_sql_selection_or_all();
+        if !replaced {
+            self.db_push_undo();
+        }
+        for ch in text.chars() {
+            if ch == '\n' || ch == '\r' {
+                if ch == '\r' {
+                    continue;
+                }
+                self.db_insert_newline();
+            } else {
+                // Avoid double undo frames per char — manually insert.
+                let row = self.ui.db_cursor.row;
+                let col = self.ui.db_cursor.col;
+                let mut lines: Vec<String> = if self.db.sql.is_empty() {
+                    vec![String::new()]
+                } else {
+                    self.db.sql.lines().map(|l| l.to_string()).collect()
+                };
+                while lines.len() <= row {
+                    lines.push(String::new());
+                }
+                let line = if col >= lines[row].chars().count() {
+                    format!("{}{}", lines[row], ch)
+                } else {
+                    let mut s: String = lines[row].chars().take(col).collect();
+                    s.push(ch);
+                    s.push_str(&lines[row].chars().skip(col).collect::<String>());
+                    s
+                };
+                lines[row] = line;
+                self.db.sql = lines.join("\n");
+                self.ui.db_cursor.col += 1;
+                self.db_clamp_cursor();
+            }
+        }
+        self.sync_active_sql_tab();
+    }
+
+    fn clipboard_copy_sql_or_editor(&mut self) {
+        let text = if self.editing_db_sql() {
+            self.db.sql.clone()
+        } else if let Some(buf) = self.active_buffer() {
+            buf.text()
+        } else {
+            self.set_status("copy: nothing to copy", true);
+            return;
+        };
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+            Ok(()) => self.set_status(
+                format!("copied {} chars", text.chars().count()),
+                false,
+            ),
+            Err(e) => self.set_status(format!("clipboard: {e}"), true),
+        }
+    }
+
+    fn clipboard_paste_sql_or_editor(&mut self) {
+        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_status(format!("clipboard: {e}"), true);
+                return;
+            }
+        };
+        if text.is_empty() {
+            self.set_status("clipboard empty", true);
+            return;
+        }
+        if self.editing_db_sql() {
+            if self.ui.mode != Mode::Insert {
+                self.ui.mode = Mode::Insert;
+            }
+            self.db_insert_text(&text);
+            self.set_status(format!("pasted {} chars", text.chars().count()), false);
+        } else if let Some(buf) = self.active_buffer_mut() {
+            for ch in text.chars() {
+                if ch == '\n' {
+                    buf.insert_newline();
+                } else if ch != '\r' {
+                    buf.insert_char(ch);
+                }
+            }
+            self.set_status(format!("pasted {} chars", text.chars().count()), false);
+        } else {
+            self.set_status("paste: focus Console (3) first", true);
+        }
+    }
+
+    fn select_all_sql_or_editor(&mut self) {
+        if self.editing_db_sql() {
+            self.ui.db_sql_all_selected = !self.db.sql.is_empty();
+            self.ui.db_cursor.row = 0;
+            self.ui.db_cursor.col = 0;
+            self.ui.db_scroll_row = 0;
+            if self.ui.mode != Mode::Insert {
+                self.ui.mode = Mode::Insert;
+            }
+            let n = self.db.sql.chars().count();
+            if self.ui.db_sql_all_selected {
+                self.set_status(
+                    format!("all selected · {n} chars · Backspace/Delete clear · type replaces"),
+                    false,
+                );
+            } else {
+                self.set_status("Console empty", false);
+            }
+        } else if self.ui.product == ProductMode::Database
+            && self.ui.db_surface == DbSurface::Studio
+        {
+            // Ctrl-A from another pane — jump to Console and select.
+            self.ui.focus = Focus::Editor;
+            self.ui.mode = Mode::Insert;
+            self.select_all_sql_or_editor();
+        } else if let Some(buf) = self.active_buffer_mut() {
+            buf.cursor.row = 0;
+            buf.cursor.col = 0;
+            self.set_status("Select all · Ctrl-C copy buffer", false);
+        } else {
+            self.set_status("select all: focus Console (3)", true);
+        }
+    }
+
+    fn clear_db_sql_selection_or_all(&mut self) -> bool {
+        if !self.ui.db_sql_all_selected {
+            return false;
+        }
+        self.db_push_undo();
+        self.db.sql.clear();
+        self.sync_active_sql_tab();
+        self.ui.db_sql_all_selected = false;
+        self.ui.db_cursor.row = 0;
+        self.ui.db_cursor.col = 0;
+        self.ui.db_scroll_row = 0;
+        self.ui.show_completions = false;
+        true
+    }
+
     fn db_insert_newline(&mut self) {
+        if self.clear_db_sql_selection_or_all() {
+            return;
+        }
         self.db_push_undo();
         let row = self.ui.db_cursor.row;
         let col = self.ui.db_cursor.col;
@@ -1319,12 +1902,16 @@ impl App {
         } else {
             format!("{}\n", lines.join("\n"))
         };
+        self.sync_active_sql_tab();
         self.ui.db_cursor.row += 1;
         self.ui.db_cursor.col = 0;
         self.db_clamp_cursor();
     }
 
     fn db_backspace(&mut self) {
+        if self.clear_db_sql_selection_or_all() {
+            return;
+        }
         self.db_push_undo();
         if self.ui.db_cursor.col > 0 {
             let row = self.ui.db_cursor.row;
@@ -1354,10 +1941,51 @@ impl App {
             self.ui.db_cursor.row -= 1;
             self.ui.db_cursor.col = prev_len;
         }
+        self.sync_active_sql_tab();
+        self.ui.show_completions = false;
         self.db_clamp_cursor();
     }
 
+    fn db_delete_forward(&mut self) {
+        if self.clear_db_sql_selection_or_all() {
+            return;
+        }
+        self.db_push_undo();
+        let row = self.ui.db_cursor.row;
+        let col = self.ui.db_cursor.col;
+        let mut lines: Vec<String> = if self.db.sql.is_empty() {
+            vec![String::new()]
+        } else {
+            self.db.sql.lines().map(|l| l.to_string()).collect()
+        };
+        while lines.len() <= row {
+            lines.push(String::new());
+        }
+        let len = lines[row].chars().count();
+        if col < len {
+            let s: String = lines[row]
+                .chars()
+                .enumerate()
+                .filter_map(|(i, c)| if i == col { None } else { Some(c) })
+                .collect();
+            lines[row] = s;
+            self.db.sql = lines.join("\n");
+        } else if row + 1 < lines.len() {
+            let next = lines.remove(row + 1);
+            lines[row].push_str(&next);
+            self.db.sql = lines.join("\n");
+        }
+        self.sync_active_sql_tab();
+        self.ui.show_completions = false;
+        self.db_clamp_cursor();
+    }
+
+    fn db_clear_selection_mark(&mut self) {
+        self.ui.db_sql_all_selected = false;
+    }
+
     fn db_move_left(&mut self) {
+        self.db_clear_selection_mark();
         if self.ui.db_cursor.col > 0 {
             self.ui.db_cursor.col -= 1;
         } else if self.ui.db_cursor.row > 0 {
@@ -1367,6 +1995,7 @@ impl App {
     }
 
     fn db_move_right(&mut self) {
+        self.db_clear_selection_mark();
         let len = self.db_line(self.ui.db_cursor.row).chars().count();
         if self.ui.db_cursor.col < len {
             self.ui.db_cursor.col += 1;
@@ -1377,6 +2006,7 @@ impl App {
     }
 
     fn db_move_up(&mut self) {
+        self.db_clear_selection_mark();
         if self.ui.db_cursor.row > 0 {
             self.ui.db_cursor.row -= 1;
             self.db_clamp_cursor();
@@ -1384,6 +2014,7 @@ impl App {
     }
 
     fn db_move_down(&mut self) {
+        self.db_clear_selection_mark();
         if self.ui.db_cursor.row + 1 < self.db_line_count() {
             self.ui.db_cursor.row += 1;
             self.db_clamp_cursor();
@@ -1391,10 +2022,12 @@ impl App {
     }
 
     fn db_move_line_start(&mut self) {
+        self.db_clear_selection_mark();
         self.ui.db_cursor.col = 0;
     }
 
     fn db_move_line_end(&mut self) {
+        self.db_clear_selection_mark();
         self.ui.db_cursor.col = self.db_line(self.ui.db_cursor.row).chars().count();
     }
 
@@ -1418,10 +2051,42 @@ impl App {
 
     fn queue_db_query(&mut self) {
         self.db.result_page = 0;
-        self.db.query_running = true;
+        // `query_running` is owned by execute_sql; busy_label covers the UI gap.
         self.pending_db_query = true;
         self.ui.busy_label = Some("RUNNING…".into());
         self.set_status("RUNNING… Esc cancels", false);
+    }
+
+    fn finish_query_ui(&mut self) {
+        self.db.query_running = false;
+        self.ui.busy_label = None;
+    }
+
+    fn show_query_error(&mut self, msg: String) {
+        self.finish_query_ui();
+        self.db.last_result = Some(ide_db::QueryResult {
+            columns: vec!["error".into()],
+            rows: vec![vec![msg.clone()]],
+            affected: None,
+            elapsed_ms: 0,
+            truncated: false,
+            source_schema: None,
+            source_table: None,
+            primary_keys: Vec::new(),
+            original_rows: vec![vec![msg.clone()]],
+            cursor_row: 0,
+            cursor_col: 0,
+            explain: None,
+            chart: None,
+            page: 0,
+            has_more: false,
+        });
+        // Stay in Console Insert so Backspace / typing work immediately after dismiss.
+        self.ui.focus = Focus::Editor;
+        self.ui.mode = Mode::Insert;
+        self.ui.bottom = BottomPanel::Results;
+        self.ui.query_error = Some(msg.clone());
+        self.set_status(format!("query: {msg}"), true);
     }
 
     async fn run_query_executed(&mut self) -> Result<()> {
@@ -1437,36 +2102,19 @@ impl App {
                 self.db.active_source = Some(src.id.clone());
             }
         }
-        match self.db.execute_sql().await {
+        let result = self.db.execute_sql().await;
+        // Always clear RUNNING chrome — execute_sql can fail before/after its guard.
+        self.finish_query_ui();
+        match result {
             Ok(()) => {
                 self.ui.focus = Focus::Results;
                 self.ui.mode = Mode::Normal;
-                self.ui.busy_label = None;
+                self.ui.query_error = None;
+                let _ = self.db.refresh_structure_from_console_query().await;
                 self.set_status(self.db.status.clone(), false);
             }
             Err(e) => {
-                let msg = format!("{e:#}");
-                self.db.last_result = Some(ide_db::QueryResult {
-                    columns: vec!["error".into()],
-                    rows: vec![vec![msg.clone()]],
-                    affected: None,
-                    elapsed_ms: 0,
-                    truncated: false,
-                    source_schema: None,
-                    source_table: None,
-                    primary_keys: Vec::new(),
-                    original_rows: vec![vec![msg.clone()]],
-                    cursor_row: 0,
-                    cursor_col: 0,
-                    explain: None,
-                    chart: None,
-                    page: 0,
-                    has_more: false,
-                });
-                self.ui.focus = Focus::Results;
-                self.ui.mode = Mode::Normal;
-                self.ui.busy_label = None;
-                self.set_status(format!("query: {msg}"), true);
+                self.show_query_error(format!("{e:#}"));
             }
         }
         Ok(())
@@ -2288,6 +2936,7 @@ impl App {
         self.config = IdeConfig::load_from(&path)?;
         ide_ui::theme::set_mode_name(&self.config.theme.name);
         self.db.query_timeout_secs = self.config.database.query_timeout_secs;
+        self.db.select_limit = self.config.database.select_limit;
         self.lsp = LspManager::new(self.workspace.root.clone(), self.config.clone());
         self.set_status("config saved and reloaded", false);
         Ok(())
@@ -2440,7 +3089,7 @@ impl App {
         self.ui.db_connect_input.clear();
         self.ui.db_connect_edit_id = None;
         self.ui.db_connect_form = DbConnectForm::fresh();
-        self.set_status("new connection — Tab fields · Enter save · Esc cancel", false);
+        self.set_status("new connection — ←→ choose · Ctrl-T test · Enter save", false);
     }
 
     fn start_edit_connection(&mut self, source_id: &str) {
@@ -2459,7 +3108,7 @@ impl App {
         self.ui.db_connect_edit_id = Some(source_id.to_string());
         self.ui.db_connect_form = DbConnectForm::from_source(&src);
         self.set_status(
-            "edit connection — Tab fields · Enter save · Esc cancel",
+            "edit connection — Tab · Enter save · Esc",
             false,
         );
     }
@@ -3026,12 +3675,14 @@ impl App {
             self.set_status(format!("schema cache: {e:#}"), true);
             return;
         }
+        let _ = self.db.refresh_structure_from_console_query().await;
         let row = self.ui.db_cursor.row;
         let col = self.ui.db_cursor.col;
         let line = self.db_line(row);
+        let rel = ide_db::expecting_relation(&line, col);
         let items: Vec<ide_lsp::CompletionItemView> = self
             .db
-            .sql_completions(line, col)
+            .sql_completions(&line, col)
             .into_iter()
             .map(|c| ide_lsp::CompletionItemView {
                 label: c.label,
@@ -3043,11 +3694,19 @@ impl App {
                 filter_text: None,
             })
             .collect();
+        let n = items.len();
         self.ui.completions = items;
         self.ui.completion_idx = 0;
-        self.ui.show_completions = !self.ui.completions.is_empty();
-        if self.ui.completions.is_empty() {
-            self.set_status("no SQL completions", false);
+        self.ui.show_completions = n > 0;
+        if n == 0 {
+            let hint = if rel {
+                "no tables yet · Enter on DataLake in Explorer to connect/expand"
+            } else {
+                "no SQL completions"
+            };
+            self.set_status(hint, false);
+        } else {
+            self.set_status(format!("{n} completions · Tab accept · Ctrl-n/p"), false);
         }
     }
 
@@ -3558,40 +4217,63 @@ impl App {
             }
             Action::OpenDbObjectPalette => self.open_db_object_palette(),
             Action::Cancel => {
+                if self.ui.query_error.is_some() {
+                    self.ui.query_error = None;
+                }
                 if self.db.query_running || self.pending_db_query {
                     self.db.request_query_cancel();
                     self.pending_db_query = false;
+                    self.finish_query_ui();
                     self.set_status("cancelling query…", false);
                 }
                 let was_edit_cell = self.ui.mode == Mode::EditCell;
-                self.ui.mode = Mode::Normal;
-                self.ui.command.clear();
-                self.ui.rename_input.clear();
-                self.ui.search_input.clear();
-                self.ui.find_query.clear();
-                self.ui.replace_query.clear();
-                self.ui.commit_input.clear();
-                self.ui.db_connect_input.clear();
-                self.ui.db_connect_form = DbConnectForm::default();
-                self.ui.db_connect_edit_id = None;
-                self.ui.open_folder_input.clear();
-                self.ui.import_csv_input.clear();
-                self.ui.query_params_for_explain = false;
-                self.ui.cell_edit_input.clear();
-                self.ui.settings_draft.clear();
-                self.ui.confirm_delete_source_id = None;
-                self.ui.confirm_delete_label.clear();
-                self.ui.confirm_quit_label.clear();
-                self.pending_workspace_path = None;
-                self.ui.confirm_apply_pending = false;
-                self.ui.confirm_run_sql = None;
-                self.ui.rename_tab_pending = false;
-                self.ui.show_completions = false;
-                self.ui.hover = None;
-                self.ui.pending_code_actions.clear();
-                if was_edit_cell {
-                    self.ui.focus = Focus::Results;
-                    self.set_status("edit cancelled", false);
+                let was_table_filter = self.ui.mode == Mode::EditTableFilter;
+                let resume_console = self.ui.resume_console_insert
+                    || matches!(
+                        self.ui.palette.mode,
+                        PaletteMode::ConsoleDatabase | PaletteMode::ConsoleSchema
+                    );
+                if resume_console {
+                    self.resume_console_editing();
+                    self.set_status("Console · INSERT · keep typing", false);
+                } else {
+                    self.ui.mode = Mode::Normal;
+                    self.ui.command.clear();
+                    self.ui.rename_input.clear();
+                    self.ui.search_input.clear();
+                    self.ui.find_query.clear();
+                    self.ui.replace_query.clear();
+                    self.ui.commit_input.clear();
+                    self.ui.db_connect_input.clear();
+                    self.ui.db_connect_form = DbConnectForm::default();
+                    self.ui.db_connect_edit_id = None;
+                    self.ui.open_folder_input.clear();
+                    self.ui.import_csv_input.clear();
+                    self.ui.query_params_for_explain = false;
+                    self.ui.cell_edit_input.clear();
+                    self.ui.table_filter_draft.clear();
+                    self.ui.settings_draft.clear();
+                    self.ui.confirm_delete_source_id = None;
+                    self.ui.confirm_delete_label.clear();
+                    self.ui.confirm_quit_label.clear();
+                    self.pending_workspace_path = None;
+                    self.ui.confirm_apply_pending = false;
+                    self.ui.confirm_run_sql = None;
+                    self.ui.rename_tab_pending = false;
+                    self.ui.show_completions = false;
+                    self.ui.hover = None;
+                    self.ui.pending_code_actions.clear();
+                    if was_edit_cell || was_table_filter {
+                        self.ui.focus = Focus::Results;
+                        self.set_status(
+                            if was_table_filter {
+                                "filter cancelled"
+                            } else {
+                                "edit cancelled"
+                            },
+                            false,
+                        );
+                    }
                 }
             }
             Action::Confirm => match self.ui.mode {
@@ -3616,6 +4298,7 @@ impl App {
                 Mode::Rename => self.confirm_rename().await?,
                 Mode::Search => self.run_search().await?,
                 Mode::Find => self.confirm_find().await?,
+                Mode::EditTableFilter => self.confirm_table_filter().await?,
                 Mode::Replace => self.confirm_replace().await?,
                 Mode::Commit => self.confirm_git_commit().await?,
                 Mode::DbConnect => self.confirm_db_connect().await?,
@@ -3911,6 +4594,9 @@ impl App {
                 Mode::Find => {
                     self.ui.find_query.pop();
                 }
+                Mode::EditTableFilter => {
+                    self.ui.table_filter_draft.pop();
+                }
                 Mode::Replace => {
                     self.ui.replace_query.pop();
                 }
@@ -3955,10 +4641,13 @@ impl App {
                 _ => {}
             },
             Action::Delete => {
-                if let Some(b) = self.active_buffer_mut() {
+                if self.editing_db_sql() {
+                    self.db_delete_forward();
+                    self.db_ensure_cursor_visible(view_h);
+                } else if let Some(b) = self.active_buffer_mut() {
                     b.delete_forward();
+                    self.sync_lsp_change().await;
                 }
-                self.sync_lsp_change().await;
             }
             Action::Undo => {
                 if self.ui.focus == Focus::Results && self.db.undo_last_cell_edit() {
@@ -4007,6 +4696,18 @@ impl App {
                 if self.ui.product == ProductMode::Database
                     && self.ui.db_surface == DbSurface::Studio
                 {
+                    // Leaving a tool window overlay → back to Console.
+                    if matches!(
+                        self.ui.focus,
+                        Focus::Git
+                            | Focus::Search
+                            | Focus::Outline
+                            | Focus::Debug
+                            | Focus::Terminal
+                    ) {
+                        self.ui.sidebar = Sidebar::Database;
+                        self.ui.bottom = BottomPanel::Results;
+                    }
                     self.ui.focus = Focus::Editor;
                     self.ui.mode = Mode::Normal;
                     self.set_status("Console focused · i insert SQL · Ctrl-Enter run", false);
@@ -4037,7 +4738,12 @@ impl App {
                     self.ui.show_sidebar = true;
                 }
             }
-            Action::CycleDbPane => self.cycle_db_pane(),
+            Action::CycleDbPane => {
+                self.cycle_db_pane();
+                if self.ui.focus == Focus::Structure {
+                    let _ = self.db.refresh_structure_from_console_query().await;
+                }
+            }
             Action::FocusDiagnostics => {
                 self.ui.focus = Focus::Diagnostics;
                 self.ui.bottom = BottomPanel::Problems;
@@ -4093,6 +4799,11 @@ impl App {
                         "Astro search · Ctrl-⇧F · <Space>fw",
                     )
                     .await?;
+                } else if self.ui.product == ProductMode::Database
+                    && self.ui.db_surface == DbSurface::Studio
+                {
+                    // In Studio prefer Search Everywhere; project grep still available.
+                    self.open_search_everywhere();
                 } else {
                     self.ui.mode = Mode::Search;
                     self.ui.search_input.clear();
@@ -4103,16 +4814,45 @@ impl App {
             }
             Action::ProductTab(n) => self.goto_product_tab(n).await?,
             Action::OpenGit => {
-                if self.nvim_active() {
+                // Database Studio: always the in-app Git panel (never lazygit / less).
+                if self.ui.product == ProductMode::Database
+                    || !self.nvim_active()
+                {
+                    if self.git.is_none() {
+                        match GitState::discover(&self.workspace.root).await {
+                            Ok(g) => self.git = Some(g),
+                            Err(e) => {
+                                self.set_status(format!("Git: {e:#}"), true);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    if let Some(git) = self.git.as_mut() {
+                        if let Err(e) = git.refresh().await {
+                            self.set_status(format!("Git refresh: {e:#}"), true);
+                        }
+                    }
+                    self.ui.sidebar = Sidebar::Git;
+                    self.ui.focus = Focus::Git;
+                    self.ui.show_sidebar = true;
+                    self.ui.bottom = BottomPanel::Results;
+                    self.set_status("Git · s stage · c commit · Esc/q back", false);
+                } else {
                     self.astro_cmd(
                         "lua pcall(function() Snacks.lazygit() end)",
                         "Astro lazygit · Ctrl-⇧G · <Space>tl",
                     )
                     .await?;
-                } else {
-                    self.set_status("Git needs AstroNvim (Snacks.lazygit / <Space>tl)", true);
                 }
             }
+            Action::GoToDdl => self.go_to_ddl().await?,
+            Action::OpenCreateMenu => self.open_create_menu(),
+            Action::SearchEverywhere => self.open_search_everywhere(),
+            Action::OpenConsoleDatabase => self.open_console_database_palette().await,
+            Action::OpenConsoleSchema => self.open_console_schema_palette().await,
+            Action::CycleSelectLimit => self.cycle_select_limit(),
+            Action::EditTableWhere => self.begin_table_filter_edit(TableFilterField::Where),
+            Action::EditTableOrderBy => self.begin_table_filter_edit(TableFilterField::OrderBy),
             Action::OpenOutline => {
                 if self.nvim_active() {
                     self.astro_cmd(
@@ -4120,6 +4860,20 @@ impl App {
                         "Astro aerial · Ctrl-⇧O · <Space>lS",
                     )
                     .await?;
+                } else if self.ui.product == ProductMode::Database
+                    && self.ui.db_surface == DbSurface::Studio
+                {
+                    if self.ui.focus == Focus::Outline {
+                        self.ui.focus = Focus::Structure;
+                        self.ui.sidebar = Sidebar::Database;
+                        self.set_status("Hierarchy closed", false);
+                    } else {
+                        self.ui.sidebar = Sidebar::Outline;
+                        self.ui.focus = Focus::Outline;
+                        self.ui.show_outline = true;
+                        let _ = self.db.refresh_structure_for_selection().await;
+                        self.set_status("Hierarchy · Esc back", false);
+                    }
                 } else {
                     self.ui.show_outline = !self.ui.show_outline;
                     if self.ui.show_outline {
@@ -4352,23 +5106,55 @@ impl App {
             Action::DbConnectTest => {
                 let form = self.ui.db_connect_form.clone();
                 let edit_id = self.ui.db_connect_edit_id.clone();
+                self.ui.db_connect_form.test_feedback =
+                    Some(("testing…".into(), false));
                 match Self::data_source_from_form(&form, edit_id.as_deref()) {
                     Ok(src) => {
                         self.set_status("testing connection…", false);
                         match ide_db::DbWorkspace::test_data_source(&src).await {
-                            Ok(msg) => self.set_status(format!("test ok · {msg}"), false),
-                            Err(e) => self.set_status(format!("test failed: {e:#}"), true),
+                            Ok(msg) => {
+                                let text = format!("test ok · {msg}");
+                                self.ui.db_connect_form.test_feedback =
+                                    Some((text.clone(), false));
+                                self.set_ok(text);
+                            }
+                            Err(e) => {
+                                let text = format!("test failed: {e:#}");
+                                let shown = Self::human_err(&text);
+                                self.ui.db_connect_form.test_feedback =
+                                    Some((shown.clone(), true));
+                                self.set_status(text, true);
+                            }
                         }
                     }
-                    Err(e) => self.set_status(format!("test: {e:#}"), true),
+                    Err(e) => {
+                        let text = format!("test: {e:#}");
+                        let shown = Self::human_err(&text);
+                        self.ui.db_connect_form.test_feedback = Some((shown.clone(), true));
+                        self.set_status(text, true);
+                    }
                 }
             }
-            Action::DbConnectNextField => self.ui.db_connect_form.next_field(),
-            Action::DbConnectPrevField => self.ui.db_connect_form.prev_field(),
+            Action::DbConnectNextField => {
+                if self.ui.mode == Mode::EditTableFilter {
+                    self.cycle_table_filter_field(true);
+                } else {
+                    self.ui.db_connect_form.next_field();
+                }
+            }
+            Action::DbConnectPrevField => {
+                if self.ui.mode == Mode::EditTableFilter {
+                    self.cycle_table_filter_field(false);
+                } else {
+                    self.ui.db_connect_form.prev_field();
+                }
+            }
             Action::DbConnectDriverNext => {
                 let form = &mut self.ui.db_connect_form;
                 if form.on_driver_field() {
                     form.cycle_driver(true);
+                } else if form.on_accent_field() {
+                    form.cycle_accent(true);
                 } else if form.on_ssl_mode_field() {
                     form.cycle_ssl_mode(true);
                 } else if form.on_role_field() {
@@ -4381,6 +5167,8 @@ impl App {
                 let form = &mut self.ui.db_connect_form;
                 if form.on_driver_field() {
                     form.cycle_driver(false);
+                } else if form.on_accent_field() {
+                    form.cycle_accent(false);
                 } else if form.on_ssl_mode_field() {
                     form.cycle_ssl_mode(false);
                 } else if form.on_role_field() {
@@ -4478,6 +5266,9 @@ impl App {
             }
             Action::EditCell => self.start_edit_cell(),
             Action::YankResultCell => self.yank_result_cell(),
+            Action::SelectAll => self.select_all_sql_or_editor(),
+            Action::ClipboardCopy => self.clipboard_copy_sql_or_editor(),
+            Action::ClipboardPaste => self.clipboard_paste_sql_or_editor(),
             Action::FocusResults => {
                 self.ui.bottom = BottomPanel::Results;
                 self.ui.focus = Focus::Results;
@@ -4833,16 +5624,21 @@ impl App {
                 self.set_status("action has no edit", false);
                 return Ok(());
             }
-            if let Ok(edit) = serde_json::from_str::<WorkspaceEdit>(&item.id) {
-                self.apply_workspace_edit(&edit)?;
-                self.sync_lsp_change().await;
-                self.refresh_lsp_extras().await;
-                self.set_status("applied code action", false);
-            } else {
-                self.set_status("failed to parse action edit", true);
+            // Real LSP code actions store a JSON WorkspaceEdit in `id`.
+            // open_actions() also reuses this mode for plain ids (workspace:N, …)
+            // — those must fall through to the handlers below.
+            if item.id.starts_with('{') {
+                if let Ok(edit) = serde_json::from_str::<WorkspaceEdit>(&item.id) {
+                    self.apply_workspace_edit(&edit)?;
+                    self.sync_lsp_change().await;
+                    self.refresh_lsp_extras().await;
+                    self.set_status("applied code action", false);
+                } else {
+                    self.set_status("failed to parse action edit", true);
+                }
+                self.ui.pending_code_actions.clear();
+                return Ok(());
             }
-            self.ui.pending_code_actions.clear();
-            return Ok(());
         }
         if mode == PaletteMode::Projects {
             if item.id == "open_folder" {
@@ -4854,7 +5650,29 @@ impl App {
             }
             return Ok(());
         }
-        if mode == PaletteMode::DbObjects {
+        if mode == PaletteMode::ConsoleDatabase {
+            if let Some(name) = item.id.strip_prefix("condb:") {
+                match self.db.set_console_database(name).await {
+                    Ok(()) => self.set_status(self.db.status.clone(), false),
+                    Err(e) => self.set_status(format!("database: {e:#}"), true),
+                }
+            }
+            self.resume_console_editing();
+            return Ok(());
+        }
+        if mode == PaletteMode::ConsoleSchema {
+            if let Some(name) = item.id.strip_prefix("conschema:") {
+                match self.db.set_console_schema(name).await {
+                    Ok(()) => self.set_status(self.db.status.clone(), false),
+                    Err(e) => self.set_status(format!("schema: {e:#}"), true),
+                }
+            }
+            self.resume_console_editing();
+            return Ok(());
+        }
+        if mode == PaletteMode::DbObjects
+            || (mode == PaletteMode::SearchEverywhere && item.id.starts_with("dbobj:"))
+        {
             if let Some(idx_str) = item.id.strip_prefix("dbobj:") {
                 if let Ok(idx) = idx_str.parse::<usize>() {
                     if self.db.select_flat_index(idx) {
@@ -4865,6 +5683,18 @@ impl App {
                         self.set_status(format!("→ {}", item.label), false);
                     }
                 }
+            }
+            if mode == PaletteMode::DbObjects {
+                return Ok(());
+            }
+            // SearchEverywhere dbobj handled — stop before command match.
+            if item.id.starts_with("dbobj:") {
+                return Ok(());
+            }
+        }
+        if let Some(slot_str) = item.id.strip_prefix("workspace:") {
+            if let Ok(slot) = slot_str.parse::<u8>() {
+                self.open_db_source_slot(slot).await;
             }
             return Ok(());
         }
@@ -5218,6 +6048,23 @@ impl App {
                     self.set_status(self.db.status.clone(), false);
                 }
                 Err(e) => self.set_status(format!("script: {e:#}"), true),
+            },
+            "create_menu" => self.open_create_menu(),
+            "console_database" => self.open_console_database_palette().await,
+            "console_schema" => self.open_console_schema_palette().await,
+            "search_everywhere" => self.open_search_everywhere(),
+            id @ ("create_query"
+            | "create_schema"
+            | "create_table"
+            | "create_view"
+            | "create_index"
+            | "create_role"
+            | "create_database") => match self.db.open_create_stub(id) {
+                Ok(()) => {
+                    self.ui.focus = Focus::Editor;
+                    self.set_status(self.db.status.clone(), false);
+                }
+                Err(e) => self.set_status(format!("create: {e:#}"), true),
             },
             "pin_connection" => {
                 let Some(id) = self.selected_connection_id() else {
@@ -5720,6 +6567,140 @@ fn parse_postgres_url(url: &str) -> Result<DataSource> {
     })
 }
 
+/// Best-effort layout sniff (cached). Prefers `setxkbmap`, then env.
+fn keyboard_layout_is_spanish() -> bool {
+    use std::sync::OnceLock;
+    static SPANISH: OnceLock<bool> = OnceLock::new();
+    *SPANISH.get_or_init(|| {
+        if let Ok(out) = std::process::Command::new("setxkbmap")
+            .arg("-query")
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("layout:") {
+                    let layout = rest.trim();
+                    if layout == "es"
+                        || layout.starts_with("es,")
+                        || layout.contains(",es")
+                        || layout.starts_with("latam")
+                    {
+                        return true;
+                    }
+                    // Explicit non-Spanish layout from XKB wins over LANG.
+                    return false;
+                }
+            }
+        }
+        for var in ["XKB_DEFAULT_LAYOUT", "LANG", "LC_ALL", "LC_CTYPE"] {
+            if let Ok(v) = std::env::var(var) {
+                let v = v.to_ascii_lowercase();
+                if v.starts_with("es") || v.contains("es_") || v.starts_with("latam") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
+/// Unshifted base key → Shift glyph (Kitty REPORT_ALL sends base + SHIFT, not `%`).
+fn shift_symbol(base: char, spanish: bool) -> Option<char> {
+    if spanish {
+        Some(match base {
+            '1' => '!',
+            '2' => '"',
+            '3' => '·',
+            '4' => '$',
+            '5' => '%',
+            '6' => '&',
+            '7' => '/',
+            '8' => '(',
+            '9' => ')',
+            '0' => '=',
+            '\'' => '?',
+            '¡' => '¿',
+            // Shared / US-like punctuation still present on many ES boards:
+            '-' => '_',
+            '=' => '+',
+            '[' => '{',
+            ']' => '}',
+            '\\' => '|',
+            ';' => ':',
+            ',' => ';',
+            '.' => ':',
+            '`' => '^',
+            '<' => '>',
+            // Latin America variants often keep these:
+            '+' => '*',
+            '{' => '[',
+            '}' => ']',
+            _ => return None,
+        })
+    } else {
+        Some(match base {
+            '1' => '!',
+            '2' => '@',
+            '3' => '#',
+            '4' => '$',
+            '5' => '%',
+            '6' => '^',
+            '7' => '&',
+            '8' => '*',
+            '9' => '(',
+            '0' => ')',
+            '-' => '_',
+            '=' => '+',
+            '[' => '{',
+            ']' => '}',
+            '\\' => '|',
+            ';' => ':',
+            '\'' => '"',
+            ',' => '<',
+            '.' => '>',
+            '/' => '?',
+            '`' => '~',
+            _ => return None,
+        })
+    }
+}
+
+/// Fold SHIFT / Caps Lock into the character for Kitty `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
+/// (letters arrive as base glyph + SHIFT and/or `KeyEventState::CAPS_LOCK`; digits/punct
+/// as unshifted base + SHIFT).
+fn normalize_typed_key(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(c) = key.code {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SUPER)
+        {
+            return key;
+        }
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let caps = key.state.contains(KeyEventState::CAPS_LOCK);
+        if c.is_ascii_alphabetic() {
+            // Caps Lock XOR Shift (standard keyboards). Kitty reports base letter
+            // (usually lowercase) + CAPS_LOCK state — without this, Caps Lock does nothing.
+            // Legacy TTYs already deliver the final case with empty flags; leave those alone.
+            if caps || shift {
+                let want_upper = caps ^ shift;
+                key.code = KeyCode::Char(if want_upper {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                });
+                key.modifiers.remove(KeyModifiers::SHIFT);
+            }
+        } else if shift {
+            if let Some(sym) = shift_symbol(c, keyboard_layout_is_spanish()) {
+                key.code = KeyCode::Char(sym);
+            }
+            key.modifiers.remove(KeyModifiers::SHIFT);
+        }
+    }
+    key
+}
+
 fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let s = uri.as_str();
     if let Some(rest) = s.strip_prefix("file://") {
@@ -5803,15 +6784,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
         }
     }
     app.db.refresh_stale_health().await;
-    let n = app.db.sources.len();
-    app.set_status(
-        if n == 0 {
-            "DB Studio · a add connection".to_string()
-        } else {
-            format!("DB Home · {n} source(s) · Enter open · a connect · r health")
-        },
-        false,
-    );
+    // No boot toast — Home footer already shows keybinds (toast would hide them).
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -6105,33 +7078,16 @@ async fn event_loop(
             tokio::select! {
                 res = app.run_query_executed() => {
                     app.pending_db_query = false;
+                    app.finish_query_ui();
                     if let Err(e) = res {
-                        let msg = format!("{e:#}");
-                        app.db.last_result = Some(ide_db::QueryResult {
-                            columns: vec!["error".into()],
-                            rows: vec![vec![msg.clone()]],
-                            affected: None,
-                            elapsed_ms: 0,
-                            truncated: false,
-                            source_schema: None,
-                            source_table: None,
-                            primary_keys: Vec::new(),
-                            original_rows: vec![vec![msg.clone()]],
-                            cursor_row: 0,
-                            cursor_col: 0,
-                            explain: None,
-                            chart: None,
-                            page: 0,
-                            has_more: false,
-                        });
-                        app.ui.focus = Focus::Results;
-                        app.set_status(format!("query: {msg}"), true);
+                        app.show_query_error(format!("{e:#}"));
                     }
                 }
                 maybe_ev = events.next() => {
                     if let Some(Ok(Event::Key(key))) = maybe_ev {
                         if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
                             app.db.request_query_cancel();
+                            app.set_status("cancelling query…", false);
                         }
                     }
                 }
@@ -6141,6 +7097,7 @@ async fn event_loop(
 
         tokio::select! {
             _ = tick.tick() => {
+                app.clear_expired_status();
                 // ~ every 45s: mark stale + re-ping up to 3 sources (Wave 7).
                 app.health_tick_counter = app.health_tick_counter.saturating_add(1);
                 if app.health_tick_counter >= 1360 {
@@ -6175,6 +7132,19 @@ async fn event_loop(
                             app.ui.import_csv_input.push_str(&text);
                         } else if app.ui.mode == Mode::EditCell {
                             app.ui.cell_edit_input.push_str(&text);
+                        } else if app.ui.mode == Mode::EditTableFilter {
+                            app.ui.table_filter_draft.push_str(&text);
+                        } else if app.editing_db_sql()
+                            && matches!(app.ui.mode, Mode::Insert | Mode::Normal)
+                        {
+                            if app.ui.mode != Mode::Insert {
+                                app.ui.mode = Mode::Insert;
+                            }
+                            app.db_insert_text(&text);
+                            app.set_status(
+                                format!("pasted {} chars", text.chars().count()),
+                                false,
+                            );
                         } else if app.ui.focus == Focus::Results
                             && app.ui.product == ProductMode::Database
                         {
@@ -6241,15 +7211,38 @@ async fn event_loop(
                         }
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
-                        // Host chords always available (never forwarded to Neovim)
+                        // Kitty/enhanced protocol reports base letter + SHIFT; fold to real glyph.
+                        let key = normalize_typed_key(key);
+                        // Query error modal — Enter/Esc dismiss (Console stays in Insert underneath).
+                        if app.ui.query_error.is_some()
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::SUPER)
+                        {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Enter => {
+                                    app.ui.query_error = None;
+                                    app.ui.focus = Focus::Editor;
+                                    app.ui.mode = Mode::Insert;
+                                    app.set_status("Console · fix SQL · F5 run", false);
+                                    continue;
+                                }
+                                _ => {
+                                    // Swallow other keys until dismissed so focus isn't stolen.
+                                    continue;
+                                }
+                            }
+                        }
+                        // Host chords: Super preferred, Control fallback (WM often eats Super).
+                        let modk = key.modifiers.contains(KeyModifiers::CONTROL)
+                            || key.modifiers.contains(KeyModifiers::SUPER);
                         if ide_nvim::is_host_chord(key.code, key.modifiers) {
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                            if modk
                                 && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
                             {
                                 app.request_quit().await?;
                                 continue;
                             }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                            if modk
                                 && !key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
                             {
@@ -6257,7 +7250,7 @@ async fn event_loop(
                                     .await?;
                                 continue;
                             }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                            if modk
                                 && !key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Char('`'))
                             {
@@ -6265,7 +7258,7 @@ async fn event_loop(
                                     .await?;
                                 continue;
                             }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                            if modk
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
                             {
@@ -6273,21 +7266,21 @@ async fn event_loop(
                                 app.toggle_product_mode();
                                 continue;
                             }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                            if modk
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
                             {
                                 app.open_command_palette();
                                 continue;
                             }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                            if modk
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H'))
                             {
                                 app.go_home();
                                 continue;
                             }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                            if modk
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
                             {
@@ -6296,7 +7289,7 @@ async fn event_loop(
                                 continue;
                             }
                             // Git / Sessions / Agents / Outline are not part of db-studio.
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                            if modk
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(
                                     key.code,
@@ -6311,14 +7304,12 @@ async fn event_loop(
                                 )
                             {
                                 app.set_status(
-                                    "db-studio · Ctrl-⇧H home · Ctrl-⇧D studio · 1–4 panes",
+                                    "db-studio · Super-⇧H home · Super-⇧D studio · 1–4 panes",
                                     false,
                                 );
                                 continue;
                             }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && !key.modifiers.contains(KeyModifiers::SHIFT)
-                            {
+                            if modk && !key.modifiers.contains(KeyModifiers::SHIFT) {
                                 if let KeyCode::Char(d) = key.code {
                                     if matches!(d, '1' | '2' | '3' | '4') {
                                         let tab = d as u8 - b'1';
@@ -6486,14 +7477,15 @@ async fn event_loop(
                             && app.ui.code_surface == CodeSurface::Home
                             && app.ui.mode == Mode::Normal
                             && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::SUPER)
                         {
                             match key.code {
-                                KeyCode::Up | KeyCode::Char('k') => {
+                                KeyCode::Up => {
                                     app.ui.home_selected =
                                         app.ui.home_selected.saturating_sub(1);
                                     continue;
                                 }
-                                KeyCode::Down | KeyCode::Char('j') => {
+                                KeyCode::Down => {
                                     if app.ui.home_selected < 2 {
                                         app.ui.home_selected += 1;
                                     }
@@ -6550,27 +7542,15 @@ async fn event_loop(
                             }
                         }
 
-                        // Database Home: Tab pane · j/k · Enter · 1-9 · a · r · p
+                        // Database Home: A add · W workspaces only
                         if app.ui.product == ProductMode::Database
                             && app.ui.db_surface == DbSurface::Home
                             && app.ui.mode == Mode::Normal
                             && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::SUPER)
                         {
+                            app.ui.home_pane = ide_ui::HomePane::Sources;
                             match key.code {
-                                KeyCode::Tab | KeyCode::BackTab => {
-                                    app.ui.home_pane = match app.ui.home_pane {
-                                        ide_ui::HomePane::Sources => ide_ui::HomePane::Recents,
-                                        ide_ui::HomePane::Recents => ide_ui::HomePane::Favorites,
-                                        ide_ui::HomePane::Favorites => ide_ui::HomePane::Sources,
-                                    };
-                                    let label = match app.ui.home_pane {
-                                        ide_ui::HomePane::Sources => "sources",
-                                        ide_ui::HomePane::Recents => "recents",
-                                        ide_ui::HomePane::Favorites => "favorites",
-                                    };
-                                    app.set_status(format!("Home · {label}"), false);
-                                    continue;
-                                }
                                 KeyCode::Char('?') => {
                                     app.ui.show_help = !app.ui.show_help;
                                     continue;
@@ -6579,99 +7559,37 @@ async fn event_loop(
                                     app.ui.show_help = false;
                                     continue;
                                 }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    match app.ui.home_pane {
-                                        ide_ui::HomePane::Sources => {
-                                            app.ui.home_selected =
-                                                app.ui.home_selected.saturating_sub(1);
-                                        }
-                                        ide_ui::HomePane::Recents => {
-                                            app.ui.home_recent_selected =
-                                                app.ui.home_recent_selected.saturating_sub(1);
-                                        }
-                                        ide_ui::HomePane::Favorites => {
-                                            app.ui.home_favorite_selected =
-                                                app.ui.home_favorite_selected.saturating_sub(1);
-                                        }
+                                KeyCode::Esc if app.ui.status.is_some() => {
+                                    app.ui.status = None;
+                                    continue;
+                                }
+                                KeyCode::Up | KeyCode::Left => {
+                                    app.ui.home_selected =
+                                        app.ui.home_selected.saturating_sub(1).min(1);
+                                    continue;
+                                }
+                                KeyCode::Down | KeyCode::Right => {
+                                    if app.ui.home_selected < 1 {
+                                        app.ui.home_selected = 1;
                                     }
                                     continue;
                                 }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    match app.ui.home_pane {
-                                        ide_ui::HomePane::Sources => {
-                                            let max =
-                                                app.db.sources.len().saturating_sub(1).min(8);
-                                            if app.ui.home_selected < max {
-                                                app.ui.home_selected += 1;
-                                            }
-                                        }
-                                        ide_ui::HomePane::Recents => {
-                                            let max = app
-                                                .db
-                                                .history
-                                                .len()
-                                                .saturating_sub(1)
-                                                .min(5);
-                                            if app.ui.home_recent_selected < max {
-                                                app.ui.home_recent_selected += 1;
-                                            }
-                                        }
-                                        ide_ui::HomePane::Favorites => {
-                                            let max = app
-                                                .db
-                                                .sources
-                                                .iter()
-                                                .filter(|s| s.pinned)
-                                                .count()
-                                                .saturating_sub(1);
-                                            if app.ui.home_favorite_selected < max {
-                                                app.ui.home_favorite_selected += 1;
-                                            }
-                                        }
+                                KeyCode::Enter => {
+                                    if app.ui.home_selected >= 1 {
+                                        app.open_db_workspaces_palette();
+                                    } else {
+                                        app.start_add_connection();
                                     }
-                                    continue;
-                                }
-                                KeyCode::Char('e')
-                                | KeyCode::Char('E')
-                                | KeyCode::Enter => {
-                                    app.home_enter_studio().await;
                                     continue;
                                 }
                                 KeyCode::Char('a') | KeyCode::Char('A') => {
+                                    app.ui.home_selected = 0;
                                     app.start_add_connection();
                                     continue;
                                 }
-                                KeyCode::Char('c') | KeyCode::Char('C') => {
-                                    app.open_settings();
-                                    continue;
-                                }
-                                KeyCode::Char('r') | KeyCode::Char('R') => {
-                                    app.set_status("refreshing health…", false);
-                                    app.db.mark_stale_health(0);
-                                    app.db.refresh_stale_health().await;
-                                    app.set_status("health refreshed", false);
-                                    continue;
-                                }
-                                KeyCode::Char('p') | KeyCode::Char('P') => {
-                                    let idx = app.ui.home_selected;
-                                    if let Some(id) =
-                                        app.db.sources.get(idx).map(|s| s.id.clone())
-                                    {
-                                        match app.db.toggle_pin_source(&id) {
-                                            Ok(_) => {
-                                                app.set_status(app.db.status.clone(), false)
-                                            }
-                                            Err(e) => {
-                                                app.set_status(format!("pin: {e:#}"), true)
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
-                                KeyCode::Char(d) if d.is_ascii_digit() && d != '0' => {
-                                    let n = d as u8 - b'0';
-                                    app.ui.home_pane = ide_ui::HomePane::Sources;
-                                    app.open_db_source_slot(n).await;
+                                KeyCode::Char('w') | KeyCode::Char('W') => {
+                                    app.ui.home_selected = 1;
+                                    app.open_db_workspaces_palette();
                                     continue;
                                 }
                                 _ => {}
@@ -6683,10 +7601,57 @@ async fn event_loop(
                             && app.ui.db_surface == DbSurface::Studio
                             && matches!(app.ui.mode, Mode::Normal | Mode::Insert)
                         {
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::SUPER);
                             if is_run_query_key(key) {
                                 app.handle_action(Action::RunQuery, view_h, term_rows).await?;
                                 continue;
+                            }
+                            let alt = key.modifiers.contains(KeyModifiers::ALT);
+                            // Alt-L: cycle auto SELECT LIMIT (50 → 100 → 200 → 500 → off).
+                            if alt
+                                && !ctrl
+                                && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
+                            {
+                                app.handle_action(Action::CycleSelectLimit, view_h, term_rows)
+                                    .await?;
+                                continue;
+                            }
+                            // Console DB/schema: Normal uses bare b/s; Insert uses Alt-b / Alt-s
+                            // so typing "select" / "schema" never opens the picker mid-edit.
+                            if app.ui.focus == Focus::Editor
+                                && !ctrl
+                                && matches!(
+                                    key.code,
+                                    KeyCode::Char('b')
+                                        | KeyCode::Char('B')
+                                        | KeyCode::Char('s')
+                                        | KeyCode::Char('S')
+                                )
+                            {
+                                let from_insert_alt = app.ui.mode == Mode::Insert && alt;
+                                let from_normal_bare = app.ui.mode == Mode::Normal && !alt;
+                                if from_insert_alt || from_normal_bare {
+                                    match key.code {
+                                        KeyCode::Char('b') | KeyCode::Char('B') => {
+                                            app.handle_action(
+                                                Action::OpenConsoleDatabase,
+                                                view_h,
+                                                term_rows,
+                                            )
+                                            .await?;
+                                        }
+                                        _ => {
+                                            app.handle_action(
+                                                Action::OpenConsoleSchema,
+                                                view_h,
+                                                term_rows,
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                    continue;
+                                }
                             }
                             // SQL console tabs: Ctrl-Tab / [ ] / Alt-1..9 / t+ / x
                             if app.ui.mode == Mode::Normal
@@ -6698,7 +7663,6 @@ async fn event_loop(
                                         | Focus::Structure
                                 )
                             {
-                                let alt = key.modifiers.contains(KeyModifiers::ALT);
                                 let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
                                 // Ctrl-Tab / Ctrl-Shift-Tab
@@ -6826,12 +7790,17 @@ async fn event_loop(
                                     );
                                     continue;
                                 }
+
                             }
                             match key.code {
                                 KeyCode::Tab
                                     if !ctrl && app.ui.mode == Mode::Normal =>
                                 {
                                     app.cycle_db_pane();
+                                    if app.ui.focus == Focus::Structure {
+                                        let _ =
+                                            app.db.refresh_structure_from_console_query().await;
+                                    }
                                     continue;
                                 }
                                 KeyCode::Esc if app.ui.mode == Mode::Insert => {
@@ -6886,6 +7855,13 @@ async fn event_loop(
                                     app.cycle_db_source(-1).await;
                                     continue;
                                 }
+                                // Resize the focused pane only (each "cajita" owns its divider).
+                                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                                    if ctrl && app.ui.mode == Mode::Normal =>
+                                {
+                                    app.resize_focused_pane(key.code);
+                                    continue;
+                                }
                                 KeyCode::Char('D')
                                     if !ctrl && app.ui.mode == Mode::Normal
                                         && app.ui.focus == Focus::Results =>
@@ -6897,6 +7873,20 @@ async fn event_loop(
                                         "comfort"
                                     };
                                     app.set_status(format!("results density · {label}"), false);
+                                    continue;
+                                }
+                                // Console Normal: Backspace/Delete always edit SQL (enter Insert).
+                                KeyCode::Backspace | KeyCode::Delete
+                                    if !ctrl
+                                        && app.ui.mode == Mode::Normal
+                                        && app.ui.focus == Focus::Editor =>
+                                {
+                                    app.ui.mode = Mode::Insert;
+                                    match key.code {
+                                        KeyCode::Backspace => app.db_backspace(),
+                                        _ => app.db_delete_forward(),
+                                    }
+                                    app.db_ensure_cursor_visible(view_h);
                                     continue;
                                 }
                                 KeyCode::Delete
@@ -6930,7 +7920,8 @@ async fn event_loop(
                                 }
                                 KeyCode::Char('2') if !ctrl && app.ui.mode == Mode::Normal => {
                                     app.focus_db_pane(2);
-                                    app.set_status("2 Structure · j/k scroll", false);
+                                    let _ = app.db.refresh_structure_from_console_query().await;
+                                    app.set_status("2 Structure · from query / Explorer", false);
                                     continue;
                                 }
                                 KeyCode::Char('3') if !ctrl && app.ui.mode == Mode::Normal => {
@@ -6974,7 +7965,14 @@ async fn event_loop(
                                         if app.editing_db_sql() {
                                             app.db_insert_char(c);
                                             app.db_ensure_cursor_visible(view_h);
-                                            if c == '.' || c.is_ascii_alphanumeric() || c == '_' {
+                                            let line = app.db_line(app.ui.db_cursor.row);
+                                            let col = app.ui.db_cursor.col;
+                                            let want = c == '.'
+                                                || c.is_ascii_alphanumeric()
+                                                || c == '_'
+                                                || (c == ' '
+                                                    && ide_db::expecting_relation(&line, col));
+                                            if want {
                                                 app.request_db_completion().await;
                                             } else {
                                                 app.ui.show_completions = false;
@@ -7013,6 +8011,11 @@ async fn event_loop(
                                     app.ui.find_query.push(c);
                                 }
                             }
+                            Mode::EditTableFilter => {
+                                if let KeyCode::Char(c) = key.code {
+                                    app.ui.table_filter_draft.push(c);
+                                }
+                            }
                             Mode::Replace => {
                                 if let KeyCode::Char(c) = key.code {
                                     app.ui.replace_query.push(c);
@@ -7025,7 +8028,21 @@ async fn event_loop(
                             }
                             Mode::DbConnect => {
                                 if let KeyCode::Char(c) = key.code {
-                                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                        // Ctrl chords handled via keymap (e.g. Ctrl-T test).
+                                    } else if c == ' '
+                                        && app.ui.db_connect_form.is_cycle_field(
+                                            app.ui.db_connect_form.focus,
+                                        )
+                                    {
+                                        // Space = next option on dropdown fields only.
+                                        app.handle_action(
+                                            Action::DbConnectDriverNext,
+                                            view_h,
+                                            term_rows,
+                                        )
+                                        .await?;
+                                    } else {
                                         app.ui.db_connect_form.push_char(c);
                                     }
                                 }
@@ -7124,14 +8141,17 @@ fn nvim_normal_mode(mode: &str) -> bool {
 
 /// Studio run chords. Plain terminals often emit Ctrl-J (LF) for Ctrl-Enter;
 /// with kitty keyboard protocol we also get Enter+CONTROL / Char('\\n')+CONTROL.
+/// Super is preferred; Control remains the reliable TTY fallback.
 fn is_run_query_key(key: KeyEvent) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let modk = key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER);
     match key.code {
         KeyCode::F(5) => true,
-        KeyCode::Enter if ctrl => true,
-        KeyCode::Char('r' | 'R') if ctrl => true,
-        KeyCode::Char('\n') if ctrl => true,
-        KeyCode::Char('j' | 'J') if ctrl => true,
+        KeyCode::Enter if modk => true,
+        KeyCode::Char('r' | 'R') if modk => true,
+        KeyCode::Char('\n') if modk => true,
+        // TTY alias only: Ctrl-Enter often arrives as Ctrl-J (not a vim nav bind).
+        KeyCode::Char('j' | 'J') if modk => true,
         _ => false,
     }
 }
@@ -7148,4 +8168,68 @@ fn expand_user_path(raw: &str) -> PathBuf {
         }
     }
     PathBuf::from(raw)
+}
+
+#[cfg(test)]
+mod typed_key_tests {
+    use super::normalize_typed_key;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn key(code: KeyCode, mods: KeyModifiers, state: KeyEventState) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state,
+        }
+    }
+
+    fn char_of(ev: KeyEvent) -> char {
+        match ev.code {
+            KeyCode::Char(c) => c,
+            other => panic!("expected Char, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caps_lock_uppercases_letters() {
+        let ev = normalize_typed_key(key(
+            KeyCode::Char('s'),
+            KeyModifiers::empty(),
+            KeyEventState::CAPS_LOCK,
+        ));
+        assert_eq!(char_of(ev), 'S');
+        assert!(!ev.modifiers.contains(KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn shift_uppercases_letters() {
+        let ev = normalize_typed_key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::SHIFT,
+            KeyEventState::empty(),
+        ));
+        assert_eq!(char_of(ev), 'A');
+        assert!(!ev.modifiers.contains(KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn caps_plus_shift_cancels_to_lowercase() {
+        let ev = normalize_typed_key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::SHIFT,
+            KeyEventState::CAPS_LOCK,
+        ));
+        assert_eq!(char_of(ev), 'a');
+    }
+
+    #[test]
+    fn legacy_uppercase_without_flags_kept() {
+        let ev = normalize_typed_key(key(
+            KeyCode::Char('A'),
+            KeyModifiers::empty(),
+            KeyEventState::empty(),
+        ));
+        assert_eq!(char_of(ev), 'A');
+    }
 }

@@ -49,6 +49,10 @@ impl TerminalPane {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
+        // Avoid trapping the embedded TTY in `less` after `git log` / man / etc.
+        cmd.env("PAGER", "cat");
+        cmd.env("GIT_PAGER", "cat");
+        cmd.env("LESS", "FRX");
 
         let child = pair
             .slave

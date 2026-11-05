@@ -118,6 +118,30 @@ pub fn error_c() -> Color {
 pub fn info() -> Color {
     muted()
 }
+/// Success / health-ok green — the OK badge color (use everywhere “ok” means healthy).
+pub fn success() -> Color {
+    Color::Rgb(34, 197, 94)
+}
+pub fn danger() -> Color {
+    Color::Rgb(239, 68, 68)
+}
+pub fn style_ok() -> Style {
+    Style::default()
+        .fg(success())
+        .add_modifier(Modifier::BOLD)
+}
+pub fn style_ok_badge() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(success())
+        .add_modifier(Modifier::BOLD)
+}
+pub fn style_err_badge() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(danger())
+        .add_modifier(Modifier::BOLD)
+}
 pub fn code_pill() -> Color {
     text()
 }

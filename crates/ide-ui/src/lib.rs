@@ -14,6 +14,7 @@ pub use palette::{Palette, PaletteMode};
 use ide_buffer::BufferSet;
 use ide_core::{
     BottomPanel, CodeSurface, Cursor, DbSurface, Focus, LanguageId, Mode, ProductMode, Sidebar,
+    TableFilterField,
 };
 use ide_dap::{StackFrameView, VariableView};
 use ide_db::{DbNodeKind, DbWorkspace, StructureLineKind};
@@ -29,10 +30,23 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    /// Quiet tip — no colored badge (pane focus, resize hints, …).
+    Info,
+    /// Real success — green OK badge (test/connect/health).
+    Success,
+    /// Failure — red ERR badge.
+    Error,
+}
+
 #[derive(Debug, Clone)]
 pub struct StatusMessage {
     pub text: String,
     pub error: bool,
+    pub tone: StatusTone,
+    /// When reached, Home/Studio footer drops the toast and shows keybinds again.
+    pub until: std::time::Instant,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +114,12 @@ pub struct UiState {
     pub save_materialize_temp: bool,
     /// Results grid: compact (dense) vs comfortable (padded rows).
     pub results_compact: bool,
+    /// Explorer pane width in columns (Studio). `[` `]` when Explorer focused.
+    pub explorer_width: u16,
+    /// Left stack (Explorer + Structure) total width.
+    pub studio_left_width: u16,
+    /// Results pane height percent (25–70).
+    pub results_pct: u16,
     /// Keep first N result columns frozen while H-scrolling (0 = off).
     pub results_pinned_cols: usize,
     /// BrainAsk prompt is collecting an OAuth token instead of a RAG question.
@@ -128,6 +148,16 @@ pub struct UiState {
     pub show_help: bool,
     /// Transient chrome busy label (`connecting…` / `RUNNING…`).
     pub busy_label: Option<String>,
+    /// Query failure modal body (Enter/Esc dismiss).
+    pub query_error: Option<String>,
+    /// Console Ctrl-A: entire SQL buffer selected (Backspace/Delete/type clears).
+    pub db_sql_all_selected: bool,
+    /// After Console DB/schema palette, restore Insert on Console.
+    pub resume_console_insert: bool,
+    /// EditTableFilter: which bar (WHERE vs ORDER BY).
+    pub table_filter_field: TableFilterField,
+    /// Draft text while editing a table filter bar.
+    pub table_filter_draft: String,
 }
 
 /// Which column is active on DB Home.
@@ -190,6 +220,9 @@ impl Default for UiState {
             confirm_delete_label: String::new(),
             save_materialize_temp: true,
             results_compact: true,
+            explorer_width: 28,
+            studio_left_width: 48,
+            results_pct: 40,
             results_pinned_cols: 1,
             oauth_paste_pending: false,
             confirm_apply_pending: false,
@@ -204,6 +237,11 @@ impl Default for UiState {
             home_favorite_selected: 0,
             show_help: false,
             busy_label: None,
+            query_error: None,
+            db_sql_all_selected: false,
+            resume_console_insert: false,
+            table_filter_field: TableFilterField::Where,
+            table_filter_draft: String::new(),
         }
     }
 }
@@ -526,7 +564,7 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
                     .split(size);
                 render_host_header(frame, root[0], &ctx, false);
                 render_db_home(frame, root[1], &ctx);
-                render_db_home_status(frame, root[2]);
+                render_db_home_status(frame, root[2], &ctx);
             }
             DbSurface::Studio => {
                 render_database_studio(frame, size, &ctx);
@@ -648,6 +686,14 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
         }
         if ctx.ui.show_help {
             render_db_help_overlay(frame, size, ctx.ui.db_surface);
+        }
+        if ctx.ui.show_completions && !ctx.ui.completions.is_empty() {
+            // Anchor popup to the Console (right) pane of Studio.
+            let console = studio_console_area(size, ctx.ui);
+            render_completion_popup(frame, console, ctx.ui, ctx.buffers, ctx.db);
+        }
+        if let Some(err) = ctx.ui.query_error.as_deref() {
+            palette::render_error_dialog(frame, size, " query error ", err);
         }
         return;
     }
@@ -904,31 +950,40 @@ fn render_sidebar(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
 }
 
-fn parse_accent_color(raw: &str) -> Color {
-    let s = raw.trim();
-    if s.is_empty() {
-        return theme::accent();
-    }
-    if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() == 6 {
-            if let (Ok(r), Ok(g), Ok(b)) = (
-                u8::from_str_radix(&hex[0..2], 16),
-                u8::from_str_radix(&hex[2..4], 16),
-                u8::from_str_radix(&hex[4..6], 16),
-            ) {
-                return Color::Rgb(r, g, b);
-            }
+/// Whether a later flat sibling exists at `depth` before climbing above it.
+fn explorer_has_following_sibling(flat: &[ide_db::FlatDbEntry], idx: usize, depth: usize) -> bool {
+    for e in flat.iter().skip(idx + 1) {
+        if e.depth < depth {
+            return false;
+        }
+        if e.depth == depth {
+            return true;
         }
     }
-    match s.to_ascii_lowercase().as_str() {
-        "cyan" => Color::Cyan,
-        "green" => Color::Green,
-        "magenta" | "pink" => Color::Magenta,
-        "yellow" => Color::Yellow,
-        "red" => Color::Red,
-        "blue" => Color::Blue,
-        _ => theme::accent(),
+    false
+}
+
+/// Box-drawing indent: `│  ├─ └─` (pack E). Width-1 only.
+fn explorer_tree_prefix(flat: &[ide_db::FlatDbEntry], idx: usize) -> String {
+    let depth = flat[idx].depth;
+    if depth == 0 {
+        return String::new();
     }
+    let mut out = String::with_capacity(depth * 3);
+    for d in 0..depth {
+        if d + 1 < depth {
+            if explorer_has_following_sibling(flat, idx, d + 1) {
+                out.push_str("│  ");
+            } else {
+                out.push_str("   ");
+            }
+        } else if explorer_has_following_sibling(flat, idx, depth) {
+            out.push_str("├─ ");
+        } else {
+            out.push_str("└─ ");
+        }
+    }
+    out
 }
 
 fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focused: bool) {
@@ -943,56 +998,13 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
             .skip(scroll)
             .take(inner_h.max(1))
             .map(|(i, e)| {
-                // ASCII / width-1 only. ☰ is EastAsian Wide and left ghost "t" cells.
-                let source_accent = |source_id: &str| -> Color {
-                    ws.sources
-                        .iter()
-                        .find(|s| s.id == source_id)
-                        .map(|s| parse_accent_color(&s.accent))
-                        .unwrap_or(theme::accent())
-                };
-                let (glyph, color) = match e.kind {
-                    DbNodeKind::Group => ("G", theme::muted()),
-                    DbNodeKind::Source => {
-                        let health = ws.connection_health.get(&e.source_id);
-                        match health {
-                            Some(ide_db::ConnHealth::Dead(_)) => ("!", theme::warn()),
-                            Some(ide_db::ConnHealth::Ok { .. }) => ("*", Color::Green),
-                            Some(ide_db::ConnHealth::Stale { .. }) => ("~", theme::warn()),
-                            None => ("*", source_accent(&e.source_id)),
-                        }
-                    }
-                    DbNodeKind::Database => ("#", theme::accent()),
-                    DbNodeKind::Schema => ("~", theme::muted()),
-                    DbNodeKind::Table => ("+", theme::text()),
-                    DbNodeKind::View => ("=", theme::muted()),
-                    DbNodeKind::Column => (".", theme::faint()),
-                    DbNodeKind::Admin => ("@", theme::accent()),
-                    DbNodeKind::AdminQuery => ("!", theme::muted()),
-                    DbNodeKind::AdminAction => (">", theme::accent()),
-                    DbNodeKind::Routine => ("*", theme::muted()),
-                };
-                let twist = match e.kind {
-                    DbNodeKind::Column
-                    | DbNodeKind::Table
-                    | DbNodeKind::View
-                    | DbNodeKind::AdminQuery
-                    | DbNodeKind::AdminAction
-                    | DbNodeKind::Routine => " ",
-                    _ if e.expanded => "-",
-                    _ => ">",
-                };
-                let indent = " ".repeat(e.depth.saturating_mul(2));
+                // Pack E only: box-drawing tree + label. No kind/health glyphs.
+                let tree = explorer_tree_prefix(&ws.flat, i);
                 let selected = i == ws.selected;
                 let row_style = if selected {
                     theme::style_selected()
                 } else {
                     Style::default()
-                };
-                let glyph_style = if selected {
-                    theme::style_selected()
-                } else {
-                    Style::default().fg(color)
                 };
                 let label_style = if selected {
                     theme::style_selected()
@@ -1000,9 +1012,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     Style::default().fg(theme::text())
                 };
                 let inner_w = area.width.saturating_sub(2) as usize;
-                let twist_part = format!("{indent}{twist} ");
-                let glyph_part = format!("{glyph} ");
-                let used = twist_part.chars().count() + glyph_part.chars().count();
+                let used = tree.chars().count();
                 let label_max = inner_w.saturating_sub(used).max(4);
                 let role_tag = if matches!(e.kind, DbNodeKind::Source) {
                     ws.sources
@@ -1019,8 +1029,14 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     label.push_str(&" ".repeat(pad));
                 }
                 ListItem::new(Line::from(vec![
-                    Span::styled(twist_part, if selected { row_style } else { theme::style_faint() }),
-                    Span::styled(glyph_part, glyph_style),
+                    Span::styled(
+                        tree,
+                        if selected {
+                            row_style
+                        } else {
+                            theme::style_faint()
+                        },
+                    ),
                     Span::styled(label, label_style),
                 ]))
             })
@@ -1055,36 +1071,14 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
             theme::style_faint(),
         ))],
     };
-    let title = match db {
-        Some(ws) => {
-            let n = ws.sources.len();
-            let active = ws
-                .active_source
-                .as_ref()
-                .and_then(|id| ws.sources.iter().find(|s| &s.id == id))
-                .map(|s| s.driver.label())
-                .unwrap_or("—");
-            if focused {
-                format!(" ▸ EXPLORER · {n} src · {active} ")
-            } else {
-                format!(" Explorer · {n} src · {active} ")
-            }
-        }
-        None => {
-            if focused {
-                " ▸ EXPLORER ".into()
-            } else {
-                " Explorer ".into()
-            }
-        }
-    };
+    let title = if focused { " Explorer " } else { " explorer " };
     frame.render_widget(
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
                 .border_style(Style::default().fg(border))
-                .style(Style::default().bg(theme::surface())),
+                .style(Style::default().bg(theme::bg())),
         ),
         area,
     );
@@ -1096,9 +1090,9 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
     let (title, items) = match db {
         Some(ws) if !ws.structure_lines.is_empty() => {
             let title = if focused {
-                format!(" ▸ STRUCTURE · {} ", truncate_chars(&ws.structure_title, 28))
-            } else {
                 format!(" Structure · {} ", truncate_chars(&ws.structure_title, 28))
+            } else {
+                format!(" structure · {} ", truncate_chars(&ws.structure_title, 28))
             };
             let scroll = ws.structure_scroll.min(ws.structure_lines.len().saturating_sub(1));
             let inner_w = area.width.saturating_sub(2) as usize;
@@ -1129,9 +1123,9 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
         }
         Some(ws) => {
             let title = if focused {
-                " ▸ STRUCTURE ".into()
-            } else {
                 " Structure ".into()
+            } else {
+                " structure ".into()
             };
             let dead_msg = ws.flat.get(ws.selected).and_then(|e| {
                 if matches!(e.kind, DbNodeKind::Source) {
@@ -1164,10 +1158,20 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
                     )),
                 ]
             } else {
-                vec![ListItem::new(Span::styled(
-                    " select a table · columns · indexes · grants · DDL ",
-                    theme::style_faint(),
-                ))]
+                vec![
+                    ListItem::new(Span::styled(
+                        " Structure follows the query ",
+                        theme::style_text().add_modifier(Modifier::BOLD),
+                    )),
+                    ListItem::new(Span::styled(
+                        " Console: FROM schema.table → columns here ",
+                        theme::style_muted(),
+                    )),
+                    ListItem::new(Span::styled(
+                        " Or Enter a table in Explorer ",
+                        theme::style_faint(),
+                    )),
+                ]
             };
             (title, items)
         }
@@ -1182,7 +1186,7 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
                 .borders(Borders::ALL)
                 .title(title)
                 .border_style(Style::default().fg(border))
-                .style(Style::default().bg(theme::surface())),
+                .style(Style::default().bg(theme::bg())),
         ),
         area,
     );
@@ -1191,29 +1195,12 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
 fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let focused = ctx.ui.focus == Focus::Editor;
     let border = theme::border(focused);
-    let (conn, driver) = ctx
-        .db
-        .map(|d| {
-            let src = d
-                .active_source
-                .as_ref()
-                .and_then(|id| d.sources.iter().find(|s| &s.id == id));
-            (
-                src.map(|s| s.name.as_str()).unwrap_or(d.status.as_str()),
-                src.map(|s| s.driver.label()).unwrap_or("SQL"),
-            )
-        })
-        .unwrap_or(("database", "SQL"));
-    let title = if focused {
-        format!(" ▸ CONSOLE · {driver} · {conn} ")
-    } else {
-        format!(" Console · {driver} · {conn} ")
-    };
+    let title = if focused { " Console " } else { " console " };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme::surface()));
+        .style(Style::default().bg(theme::bg()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1243,7 +1230,7 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 spans.push(Span::styled(label, style));
             }
             frame.render_widget(
-                Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::surface_2())),
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
                 Rect {
                     x: inner.x,
                     y,
@@ -1256,25 +1243,58 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         }
     }
 
-    // Toolbar strip inside console
+    // Quiet toolbar — run + DataGrip-style DB / schema selectors
     if h >= 2 {
         let run_hint = if ctx.db.map(|d| d.query_running).unwrap_or(false)
             || ctx.ui.busy_label.as_deref() == Some("RUNNING…")
         {
             Span::styled(" RUNNING… Esc ", theme::style_selected())
         } else {
-            Span::styled(" F5 run ", theme::style_text())
+            Span::styled(" F5 run ", theme::style_faint())
         };
-        let hist_n = ctx.db.map(|d| d.history.len()).unwrap_or(0);
+        let db_label = ctx
+            .db
+            .map(|d| d.console_database_label())
+            .unwrap_or_else(|| "database".into());
+        let schema_label = ctx
+            .db
+            .map(|d| d.console_schema_label())
+            .unwrap_or_else(|| "schema".into());
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" ", theme::style_faint()),
                 run_hint,
-                Span::styled(" · hist ", theme::style_faint()),
-                Span::styled(format!("{hist_n}"), theme::style_muted()),
-                Span::styled(" · Ctrl-] source ", theme::style_faint()),
+                Span::styled(" │ ", theme::style_faint()),
+                Span::styled(
+                    if focused && matches!(ctx.ui.mode, Mode::Insert) {
+                        "Alt-b "
+                    } else {
+                        "b "
+                    },
+                    theme::style_faint(),
+                ),
+                Span::styled(format!("{db_label} ▾"), theme::style_muted()),
+                Span::styled(" │ ", theme::style_faint()),
+                Span::styled(
+                    if focused && matches!(ctx.ui.mode, Mode::Insert) {
+                        "Alt-s "
+                    } else {
+                        "s "
+                    },
+                    theme::style_faint(),
+                ),
+                Span::styled(format!("{schema_label} ▾"), theme::style_muted()),
+                Span::styled(" │ ", theme::style_faint()),
+                Span::styled("Alt-L ", theme::style_faint()),
+                Span::styled(
+                    match ctx.db.map(|d| d.select_limit).unwrap_or(50) {
+                        0 => "lim off".into(),
+                        n => format!("lim {n}"),
+                    },
+                    theme::style_muted(),
+                ),
             ]))
-            .style(Style::default().bg(theme::surface_2())),
+            .style(Style::default().bg(theme::bg())),
             Rect {
                 x: inner.x,
                 y,
@@ -1340,8 +1360,22 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                         .min(visible_end)
                 });
             let slice: String = chars[col..run_end].iter().collect();
-            spans.push(Span::styled(slice, style_for(kind)));
+            let style = if ctx.ui.db_sql_all_selected {
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::accent())
+            } else {
+                style_for(kind)
+            };
+            spans.push(Span::styled(slice, style));
             col = run_end;
+        }
+        // Empty selected lines still need a visible bar.
+        if ctx.ui.db_sql_all_selected && visible_end == 0 {
+            spans.push(Span::styled(
+                " ",
+                Style::default().fg(theme::bg()).bg(theme::accent()),
+            ));
         }
         out_lines.push(Line::from(spans));
     }
@@ -2073,65 +2107,101 @@ fn render_bottom(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
 }
 
+fn render_table_filter_bars(
+    frame: &mut Frame,
+    area: Rect,
+    ctx: &RenderCtx<'_>,
+    db: &DbWorkspace,
+) {
+    let editing = ctx.ui.mode == Mode::EditTableFilter && ctx.ui.focus == Focus::Results;
+    let where_val = if editing && ctx.ui.table_filter_field == TableFilterField::Where {
+        format!("{}▌", ctx.ui.table_filter_draft)
+    } else {
+        db.active_table_where().to_string()
+    };
+    let order_val = if editing && ctx.ui.table_filter_field == TableFilterField::OrderBy {
+        format!("{}▌", ctx.ui.table_filter_draft)
+    } else {
+        db.active_table_order_by().to_string()
+    };
+    let where_focus = editing && ctx.ui.table_filter_field == TableFilterField::Where;
+    let order_focus = editing && ctx.ui.table_filter_field == TableFilterField::OrderBy;
+    let where_style = if where_focus {
+        Style::default()
+            .fg(theme::bg())
+            .bg(theme::accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme::style_text()
+    };
+    let order_style = if order_focus {
+        Style::default()
+            .fg(theme::bg())
+            .bg(theme::accent())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme::style_text()
+    };
+    // One compact row: WHERE … │ ORDER BY …
+    let label_w = " WHERE ".chars().count() + " │ ORDER BY ".chars().count();
+    let budget = (area.width as usize).saturating_sub(label_w).max(4);
+    let where_budget = (budget * 3 / 5).max(2);
+    let order_budget = budget.saturating_sub(where_budget).max(2);
+    let where_shown = truncate_chars(&where_val, where_budget);
+    let order_shown = truncate_chars(&order_val, order_budget);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" WHERE ", theme::style_muted().add_modifier(Modifier::BOLD)),
+            Span::styled(where_shown, where_style),
+            Span::styled(" │ ORDER BY ", theme::style_muted().add_modifier(Modifier::BOLD)),
+            Span::styled(order_shown, order_style),
+        ]))
+        .style(Style::default().bg(theme::surface())),
+        area,
+    );
+}
+
 fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let focused = ctx.ui.focus == Focus::Results;
     let border = theme::border(focused);
     let Some(db) = ctx.db else {
         frame.render_widget(
-            Paragraph::new(Span::styled(" no results ", theme::style_faint())).block(
+            Paragraph::new(Span::styled(" — ", theme::style_faint())).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(if focused {
-                        " ▸ RESULTS "
-                    } else {
-                        " Results "
-                    })
+                    .title(if focused { " Results " } else { " results " })
                     .border_style(Style::default().fg(border))
-                    .style(Style::default().bg(theme::surface())),
+                    .style(Style::default().bg(theme::bg())),
             ),
             area,
         );
         return;
     };
+    let table_tab = db.active_is_table_tab();
     let Some(result) = &db.last_result else {
-        let results_title = if focused {
-            " ▸ RESULTS "
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(if focused { " Results " } else { " results " })
+            .border_style(Style::default().fg(border))
+            .style(Style::default().bg(theme::bg()));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if table_tab && inner.height >= 2 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(inner);
+            render_table_filter_bars(frame, chunks[0], ctx, db);
+            frame.render_widget(
+                Paragraph::new(Span::styled("  F5 / Enter run ", theme::style_faint())),
+                chunks[1],
+            );
         } else {
-            " Results "
-        };
-        let conn = db
-            .active_source
-            .as_ref()
-            .and_then(|id| db.sources.iter().find(|s| &s.id == id))
-            .map(|s| s.name.as_str())
-            .unwrap_or("—");
-        let hint = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("  connected · {conn}"),
-                theme::style_muted(),
-            )),
-            Line::from(Span::styled(
-                "  F5 / Ctrl+↵  run Console SQL",
-                theme::style_faint(),
-            )),
-            Line::from(Span::styled(
-                "  1 Explorer · Enter on a table",
-                theme::style_faint(),
-            )),
-            Line::from(Span::styled(
-                "  Ctrl-⇧E CSV · Ctrl-⇧L SQL · D density",
-                theme::style_faint(),
-            )),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(results_title)
-                .border_style(Style::default().fg(border))
-                .style(Style::default().bg(theme::surface())),
-        );
-        frame.render_widget(hint, area);
+            frame.render_widget(
+                Paragraph::new(Span::styled("  F5 run ", theme::style_faint())),
+                inner,
+            );
+        }
         return;
     };
 
@@ -2162,7 +2232,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     };
     let title = format!(
         " {}{nrows}×{ncols} · {} ms{}{}{}{}{}{} · {density_tag} ",
-        if focused { "▸ RESULTS · " } else { "Results · " },
+        if focused { "Results · " } else { "results · " },
         result.elapsed_ms,
         if table_label.is_empty() {
             String::new()
@@ -2186,9 +2256,20 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme::surface()));
+        .style(Style::default().bg(theme::bg()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    let inner = if table_tab && inner.height >= 3 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(2)])
+            .split(inner);
+        render_table_filter_bars(frame, chunks[0], ctx, db);
+        chunks[1]
+    } else {
+        inner
+    };
 
     let max_col_width = if compact { 14usize } else { 22usize };
     let row_stride = if compact { 1usize } else { 2usize };
@@ -2267,7 +2348,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                             draft
                         }
                     } else if is_null {
-                        truncate_chars("∅", max_col_width)
+                        truncate_chars("NULL", max_col_width)
                     } else {
                         truncate_chars(cell, max_col_width)
                     };
@@ -2492,10 +2573,10 @@ fn render_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         }
     }
     if let Some(msg) = &ctx.ui.status {
-        let style = if msg.error {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::Green)
+        let style = match msg.tone {
+            StatusTone::Success => theme::style_ok(),
+            StatusTone::Error => theme::style_err_badge(),
+            StatusTone::Info => theme::style_muted(),
         };
         spans.push(Span::styled(format!(" | {} ", msg.text), style));
     }
@@ -2512,22 +2593,73 @@ fn render_completion_popup(
     buffers: &BufferSet,
     db: Option<&DbWorkspace>,
 ) {
-    let height = (ui.completions.len().min(10) as u16).saturating_add(2);
-    let width = 56u16.min(editor_area.width.saturating_sub(4));
-    let row = if ui.product == ProductMode::Database && ui.focus == Focus::Editor {
-        ui.db_cursor
-            .row
-            .saturating_sub(ui.db_scroll_row) as u16
+    if editor_area.width < 12 || editor_area.height < 3 {
+        return;
+    }
+    let height = (ui.completions.len().min(10) as u16)
+        .saturating_add(2)
+        .min(editor_area.height.saturating_sub(1));
+    let width = 48u16
+        .min(editor_area.width.saturating_sub(2))
+        .max(24)
+        .min(editor_area.width);
+
+    // Caret in screen coords. Console chrome = border + tabs + toolbar.
+    let (caret_x, caret_y) = if ui.product == ProductMode::Database {
+        let has_tabs = db.map(|d| !d.tabs.is_empty()).unwrap_or(false);
+        let chrome_y = 1u16 // top border
+            + u16::from(has_tabs)
+            + 1; // F5 / db ▾ / schema ▾ toolbar
+        let sql = db.map(|d| d.sql.as_str()).unwrap_or("");
+        let line_count = sql.lines().count().max(1);
+        let gutter = (line_count.ilog10() as u16) + 1;
+        let rel = ui.db_cursor.row.saturating_sub(ui.db_scroll_row) as u16;
+        let col = ui.db_cursor.col as u16;
+        let x = editor_area
+            .x
+            .saturating_add(1) // left border
+            .saturating_add(gutter)
+            .saturating_add(1) // gutter space
+            .saturating_add(col);
+        let y = editor_area.y.saturating_add(chrome_y).saturating_add(rel);
+        (x, y)
     } else if let Some(buf) = buffers.active() {
-        buf.cursor.row.saturating_sub(buf.scroll_row) as u16
+        let rel = buf.cursor.row.saturating_sub(buf.scroll_row) as u16;
+        let x = editor_area
+            .x
+            .saturating_add(6)
+            .saturating_add(buf.cursor.col as u16);
+        let y = editor_area.y.saturating_add(1).saturating_add(rel);
+        (x, y)
     } else {
         return;
     };
-    let _ = db;
-    let y = (editor_area.y + 1 + row + 1)
-        .min(editor_area.y + editor_area.height.saturating_sub(height));
+
+    let top = editor_area.y;
+    let bottom = editor_area.y.saturating_add(editor_area.height);
+    let right = editor_area.x.saturating_add(editor_area.width);
+
+    // Prefer BELOW the caret so typed text stays visible; flip ABOVE if needed.
+    let y = if caret_y.saturating_add(1).saturating_add(height) <= bottom {
+        caret_y.saturating_add(1)
+    } else if caret_y.saturating_sub(top) >= height {
+        caret_y.saturating_sub(height)
+    } else {
+        // Squeeze into remaining pane — pin to bottom edge of Console.
+        bottom.saturating_sub(height).max(top)
+    };
+
+    // Prefer to the RIGHT of the caret (prefix stays readable); else left; else clamp.
+    let x = if caret_x.saturating_add(2).saturating_add(width) <= right {
+        caret_x.saturating_add(2)
+    } else if caret_x > editor_area.x.saturating_add(width.saturating_add(1)) {
+        caret_x.saturating_sub(width.saturating_add(1))
+    } else {
+        right.saturating_sub(width).max(editor_area.x)
+    };
+
     let area = Rect {
-        x: editor_area.x + 6,
+        x,
         y,
         width,
         height,
@@ -2549,7 +2681,13 @@ fn render_completion_popup(
         .collect();
     frame.render_widget(Clear, area);
     frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(" Completions ")),
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::border_idle()))
+                .style(Style::default().bg(theme::bg()))
+                .title(" Completions "),
+        ),
         area,
     );
 }
@@ -2574,6 +2712,23 @@ fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
 }
 
 fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_active: bool) {
+    let brand = Span::styled(
+        " DB Studio ",
+        Style::default()
+            .fg(theme::bg())
+            .bg(theme::text())
+            .add_modifier(Modifier::BOLD),
+    );
+
+    // Home: brand only — actions live in the body (A / W).
+    if ctx.ui.db_surface == DbSurface::Home {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![brand])).style(Style::default().bg(theme::bg())),
+            area,
+        );
+        return;
+    }
+
     let active_id = ctx.db.and_then(|d| d.active_source.as_deref());
     let conn = ctx
         .db
@@ -2582,16 +2737,7 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
                 .and_then(|id| d.sources.iter().find(|s| s.id == id))
                 .map(|s| s.name.as_str())
         })
-        .unwrap_or("no connection");
-    let health = ctx
-        .db
-        .and_then(|d| active_id.and_then(|id| d.connection_health.get(id)))
-        .map(|h| h.badge())
         .unwrap_or("—");
-    let surface = match ctx.ui.db_surface {
-        DbSurface::Home => "home",
-        DbSurface::Studio => "studio",
-    };
     let busy = ctx
         .ui
         .busy_label
@@ -2603,25 +2749,12 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
                 None
             }
         });
-    let density = if ctx.ui.results_compact {
-        "compact"
-    } else {
-        "comfort"
-    };
+    // Quiet chrome like Home — no health "ok" badge in the header.
     let mut spans = vec![
-        Span::styled(
-            " DB Studio ",
-            Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {surface}  "), theme::style_muted()),
+        brand,
+        Span::styled("  studio  ", theme::style_muted()),
         Span::styled("·  ", theme::style_faint()),
         Span::styled(conn.to_string(), theme::style_faint()),
-        Span::styled("  ", theme::style_faint()),
-        Span::styled(health, theme::style_muted()),
-        Span::styled(format!("  ·  {density}"), theme::style_faint()),
     ];
     if let Some(b) = busy {
         spans.push(Span::styled("  ·  ", theme::style_faint()));
@@ -2654,18 +2787,13 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
     };
     let lines: Vec<Line> = match surface {
         DbSurface::Home => vec![
-            Line::from(Span::styled("Tab", theme::style_text())),
             Line::from(Span::styled(
-                "  sources · recents · favorites",
-                theme::style_faint(),
-            )),
-            Line::from(Span::styled(
-                "Enter open · 1-9 source · a add · p pin · r health",
+                "A add connection",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Drivers: Postgres · MySQL · SQLite · DuckDB · …",
-                theme::style_faint(),
+                "W workspaces · pick connection → Studio",
+                theme::style_muted(),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -2679,24 +2807,28 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Esc explorer → Esc Home · Ctrl-] / Ctrl-[ switch source",
+                "Explorer: Enter open · d Go to DDL · n Create menu",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Delete / x · remove connection (confirm)",
+                "Table data: w WHERE · o ORDER BY · Enter apply",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "F5 run · D density · y yank · ! source = connect error in Structure",
+                "Super-⇧A Search Everywhere · Super-⇧G Git · Super-` Terminal",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Ctrl-⇧E CSV · Ctrl-⇧L SQL · e edit connection",
+                "Super-⇧O Hierarchy · F7 Debug · Super-⇧F Search",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "SSH jump: set SSH host on connection form",
-                theme::style_faint(),
+                "Ctrl+arrows resize focused pane · Esc Home",
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "F5 run · b database · s schema · D density · Super-⇧E CSV",
+                theme::style_muted(),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -2853,325 +2985,114 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         area,
     );
 
-    let inner = Layout::default()
+    // Home is actions-only: A add · W workspaces (no source list).
+    let sel = ctx.ui.home_selected.min(1);
+    let col = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
-            Constraint::Min(10),
-            Constraint::Length(2),
+            Constraint::Percentage(28),
+            Constraint::Length(7),
+            Constraint::Min(1),
         ])
-        .margin(2)
+        .margin(3)
         .split(area);
 
-    let sources_n = ctx.db.map(|d| d.sources.len()).unwrap_or(0);
-    let active = ctx
-        .db
-        .and_then(|d| {
-            d.active_source
-                .as_ref()
-                .and_then(|id| d.sources.iter().find(|s| &s.id == id))
-                .map(|s| s.name.as_str())
-        })
-        .unwrap_or("none");
-    let sel = ctx.ui.home_selected;
-
-    let hero = if sources_n == 0 {
-        vec![
-            Line::from(Span::styled(
-                "DB Studio",
-                Style::default()
-                    .fg(theme::text())
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "1  a  add connection   ·   2  Enter open   ·   3  explore",
-                theme::style_muted(),
-            )),
-            Line::from(Span::styled(
-                "Postgres · MySQL · SQLite · DuckDB · SSH jump optional",
-                theme::style_faint(),
-            )),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled(
-                "DB Studio",
-                Style::default()
-                    .fg(theme::text())
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                format!("{sources_n} source(s)  ·  last  {active}"),
-                theme::style_muted(),
-            )),
-            Line::from(Span::styled(
-                "Tab panes · Enter open · ? help",
-                theme::style_faint(),
-            )),
-        ]
-    };
-    frame.render_widget(Paragraph::new(hero), inner[0]);
-
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(inner[1]);
-
-    let sources_active = ctx.ui.home_pane == HomePane::Sources;
-    let sources_title = if sources_active {
-        "▸ SOURCES"
-    } else {
-        "SOURCES"
-    };
-    let mut left: Vec<Line> = vec![
-        Line::from(Span::styled(
-            sources_title,
-            theme::style_muted().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "────────────────────────────",
-            theme::style_faint(),
-        )),
-        Line::from(""),
-    ];
-
-    if let Some(db) = ctx.db {
-        if db.sources.is_empty() {
-            left.push(Line::from(Span::styled(
-                "  1 · press a — add a source",
-                theme::style_muted(),
-            )));
-            left.push(Line::from(Span::styled(
-                "  2 · Enter — open Studio",
-                theme::style_faint(),
-            )));
-            left.push(Line::from(Span::styled(
-                "  3 · Explorer — tables & SQL",
-                theme::style_faint(),
-            )));
+    let row = |selected: bool, key: &str, label: &str| -> Line<'static> {
+        let key_style = if selected {
+            theme::style_selected()
         } else {
-            for (i, src) in db.sources.iter().take(9).enumerate() {
-                let n = (i + 1) as u8;
-                let selected = sources_active && i == sel;
-                let is_active = db.active_source.as_deref() == Some(src.id.as_str());
-                let health = db
-                    .connection_health
-                    .get(&src.id)
-                    .map(|h| h.badge())
-                    .unwrap_or("—");
-                let health_style = match health {
-                    "ok" => theme::style_accent().add_modifier(Modifier::BOLD),
-                    "stale" => theme::style_muted(),
-                    "dead" => theme::style_text().add_modifier(Modifier::BOLD),
-                    _ => theme::style_faint(),
-                };
-                let pin = if src.pinned { "★ " } else { "  " };
-                let cursor = if selected { "› " } else { "  " };
-                let name_style = if selected {
-                    Style::default()
-                        .fg(theme::text())
-                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else {
-                    Style::default()
-                        .fg(theme::text())
-                        .add_modifier(Modifier::BOLD)
-                };
-                left.push(Line::from(vec![
-                    Span::styled(cursor, theme::style_selected()),
-                    Span::styled(format!("[{n}] "), theme::style_faint()),
-                    Span::styled(pin, theme::style_muted()),
-                    Span::styled(src.name.clone(), name_style),
-                    Span::styled("  ", theme::style_faint()),
-                    Span::styled(health, health_style),
-                    if is_active {
-                        Span::styled(" · last", theme::style_muted())
-                    } else {
-                        Span::raw("")
-                    },
-                ]));
-                let detail = match src.driver {
-                    ide_db::DbDriver::Sqlite => {
-                        if src.file.is_empty() {
-                            "sqlite".into()
-                        } else {
-                            src.file.clone()
-                        }
-                    }
-                    _ => {
-                        if src.database.is_empty() {
-                            format!("{}:{}", src.host, src.port)
-                        } else {
-                            format!("{}:{}/{}", src.host, src.port, src.database)
-                        }
-                    }
-                };
-                left.push(Line::from(Span::styled(
-                    format!("      {}  {}", src.driver.label(), detail),
-                    theme::style_faint(),
-                )));
-            }
-        }
-    } else {
-        left.push(Line::from(Span::styled(
-            "(workspace unavailable)",
-            theme::style_faint(),
-        )));
-    }
-    frame.render_widget(Paragraph::new(left), body[0]);
-
-    let recents_active = ctx.ui.home_pane == HomePane::Recents;
-    let recent_title = if recents_active {
-        "▸ RECENT"
-    } else {
-        "RECENT"
-    };
-    let mut right: Vec<Line> = vec![
-        Line::from(Span::styled(
-            recent_title,
-            theme::style_muted().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "────────────────────────────",
-            theme::style_faint(),
-        )),
-        Line::from(""),
-    ];
-    if let Some(db) = ctx.db {
-        if db.history.is_empty() {
-            right.push(Line::from(Span::styled(
-                "(no queries yet)",
-                theme::style_faint(),
-            )));
-        } else {
-            let rsel = ctx.ui.home_recent_selected;
-            for (i, entry) in db.history.iter().rev().take(6).enumerate() {
-                let selected = recents_active && i == rsel;
-                let cursor = if selected { "› " } else { "  " };
-                let style = if selected {
-                    Style::default()
-                        .fg(theme::text())
-                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else {
-                    theme::style_muted()
-                };
-                right.push(Line::from(vec![
-                    Span::styled(cursor, theme::style_selected()),
-                    Span::styled(entry.label(40), style),
-                ]));
-            }
-            if recents_active {
-                right.push(Line::from(""));
-                right.push(Line::from(Span::styled(
-                    "Enter → Studio with SQL",
-                    theme::style_faint(),
-                )));
-            }
-        }
-
-        right.push(Line::from(""));
-        let fav_active = ctx.ui.home_pane == HomePane::Favorites;
-        let fav_title = if fav_active {
-            "▸ FAVORITES"
-        } else {
-            "FAVORITES"
+            theme::style_muted()
         };
-        right.push(Line::from(Span::styled(
-            fav_title,
-            theme::style_muted().add_modifier(Modifier::BOLD),
-        )));
-        right.push(Line::from(Span::styled(
-            "────────────────────────────",
-            theme::style_faint(),
-        )));
-        right.push(Line::from(""));
-
-        let pinned: Vec<&str> = db
-            .sources
-            .iter()
-            .filter(|s| s.pinned)
-            .map(|s| s.name.as_str())
-            .take(6)
-            .collect();
-        if pinned.is_empty() && db.bookmarks.is_empty() {
-            right.push(Line::from(Span::styled(
-                "(p pin source · Tab here · Enter open)",
-                theme::style_faint(),
-            )));
+        let label_style = if selected {
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
-            let fsel = ctx.ui.home_favorite_selected;
-            for (i, name) in pinned.iter().enumerate() {
-                let selected = fav_active && i == fsel;
-                let cursor = if selected { "› " } else { "  " };
-                let style = if selected {
-                    Style::default()
-                        .fg(theme::text())
-                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else {
-                    theme::style_text()
-                };
-                right.push(Line::from(vec![
-                    Span::styled(cursor, theme::style_selected()),
-                    Span::styled("★ ", theme::style_muted()),
-                    Span::styled((*name).to_string(), style),
-                ]));
-            }
-            for bm in db.bookmarks.iter().take(3) {
-                let label = if bm.chars().count() > 40 {
-                    format!("{}…", bm.chars().take(39).collect::<String>())
-                } else {
-                    bm.clone()
-                };
-                right.push(Line::from(Span::styled(label, theme::style_faint())));
-            }
-            if fav_active && !pinned.is_empty() {
-                right.push(Line::from(Span::styled(
-                    "Enter → connect favorite",
-                    theme::style_faint(),
-                )));
-            }
-        }
-    }
-    frame.render_widget(Paragraph::new(right), body[1]);
+            theme::style_text()
+        };
+        Line::from(vec![
+            Span::styled(format!("  {key}  "), key_style),
+            Span::styled(format!(" {label} "), label_style),
+        ])
+    };
 
-    let foot = vec![Line::from(vec![
-        Span::styled("Tab", theme::style_text()),
-        Span::styled(" pane  ·  ", theme::style_faint()),
-        Span::styled("j/k", theme::style_text()),
-        Span::styled("  ·  ", theme::style_faint()),
-        Span::styled("Enter", theme::style_text()),
-        Span::styled(" open  ·  ", theme::style_faint()),
-        Span::styled("1-9", theme::style_text()),
-        Span::styled("  ·  ", theme::style_faint()),
-        Span::styled("a", theme::style_text()),
-        Span::styled(" add  ·  ", theme::style_faint()),
-        Span::styled("p", theme::style_text()),
-        Span::styled(" pin  ·  ", theme::style_faint()),
-        Span::styled("r", theme::style_text()),
-        Span::styled(" health  ·  ", theme::style_faint()),
-        Span::styled("q", theme::style_text()),
-        Span::styled(" quit", theme::style_faint()),
-    ])];
-    frame.render_widget(Paragraph::new(foot), inner[2]);
+    let hero = vec![
+        Line::from(Span::styled(
+            "DB Studio",
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        row(sel == 0, "A", "add"),
+        Line::from(""),
+        row(sel == 1, "W", "workspaces"),
+    ];
+    frame.render_widget(Paragraph::new(hero), col[1]);
 }
 
-fn render_db_home_status(frame: &mut Frame, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(
-            " DB Home ",
-            Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "  Tab  ·  j/k  ·  Enter  ·  a  ·  p  ·  r  ·  ?  ·  q ",
-            theme::style_faint(),
-        ),
-    ]);
+fn render_db_home_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
+    // One footer only — toast then keybinds. Green OK only for Success tone.
+    let line = if let Some(msg) = &ctx.ui.status {
+        let mut spans = Vec::new();
+        match msg.tone {
+            StatusTone::Success => {
+                spans.push(Span::styled(" OK ", theme::style_ok_badge()));
+            }
+            StatusTone::Error => {
+                spans.push(Span::styled(" ERR ", theme::style_err_badge()));
+            }
+            StatusTone::Info => {
+                spans.push(Span::styled(" · ", theme::style_faint()));
+            }
+        }
+        spans.push(Span::styled(
+            format!(" {} ", msg.text),
+            theme::style_text(),
+        ));
+        Line::from(spans)
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " DB Home ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  A add  ·  W workspaces ",
+                theme::style_faint(),
+            ),
+        ])
+    };
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme::bg())),
         area,
     );
+}
+
+/// Approximate Console pane rect inside Studio (for completion popup anchoring).
+fn studio_console_area(size: Rect, ui: &UiState) -> Rect {
+    let body = Rect {
+        x: size.x,
+        y: size.y.saturating_add(1),
+        width: size.width,
+        height: size.height.saturating_sub(2),
+    };
+    if ui.db_fullscreen == Some(Focus::Editor) {
+        return body;
+    }
+    let results_pct = ui.results_pct.clamp(25, 70);
+    let top_pct = 100u16.saturating_sub(results_pct).max(30);
+    let top_h = (body.height as u32 * top_pct as u32 / 100).max(3) as u16;
+    let left_w = ui.studio_left_width.clamp(28, 120).min(body.width.saturating_sub(24));
+    Rect {
+        x: body.x.saturating_add(left_w),
+        y: body.y,
+        width: body.width.saturating_sub(left_w),
+        height: top_h.min(body.height),
+    }
 }
 
 fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
@@ -3185,6 +3106,51 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
         .split(size);
 
     render_host_header(frame, root[0], ctx, false);
+
+    // DataGrip-like tool windows: Git / Search / Hierarchy / Debug overlay Studio.
+    let tool_focus = matches!(
+        ctx.ui.focus,
+        Focus::Git | Focus::Search | Focus::Outline | Focus::Debug
+    );
+    if tool_focus {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Min(20)])
+            .split(root[1]);
+        match ctx.ui.focus {
+            Focus::Git => render_git(frame, body[0], ctx.git, true),
+            Focus::Search => render_search(frame, body[0], ctx.search, true),
+            Focus::Outline => render_outline(frame, body[0], ctx.ui),
+            Focus::Debug => render_debug_side(frame, body[0], ctx),
+            _ => {}
+        }
+        render_results_grid(frame, body[1], ctx);
+        render_studio_footer(frame, root[2], ctx);
+        return;
+    }
+    if ctx.ui.focus == Focus::Terminal {
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(root[1]);
+        // Keep explorer|structure|console on top strip when terminal open.
+        let left_w = ctx.ui.studio_left_width.clamp(28, 120);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(left_w), Constraint::Min(24)])
+            .split(body[0]);
+        let explor_w = ctx.ui.explorer_width.clamp(14, left_w.saturating_sub(12));
+        let left = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(explor_w), Constraint::Min(10)])
+            .split(top[0]);
+        render_db_tree(frame, left[0], ctx.db, ctx.ui.focus == Focus::Database);
+        render_db_structure(frame, left[1], ctx.db, ctx.ui.focus == Focus::Structure);
+        render_sql_editor(frame, top[1], ctx);
+        render_bottom(frame, body[1], ctx);
+        render_studio_footer(frame, root[2], ctx);
+        return;
+    }
 
     if let Some(pane) = ctx.ui.db_fullscreen {
         match pane {
@@ -3205,20 +3171,33 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
             }
         }
     } else {
+        let results_pct = ctx.ui.results_pct.clamp(25, 70);
+        let top_pct = 100u16.saturating_sub(results_pct).max(30);
         let body = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .constraints([
+                Constraint::Percentage(top_pct),
+                Constraint::Percentage(results_pct),
+            ])
             .split(root[1]);
 
+        let left_w = ctx.ui.studio_left_width.clamp(28, 120);
         let top = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(42), Constraint::Min(24)])
+            .constraints([Constraint::Length(left_w), Constraint::Min(24)])
             .split(body[0]);
 
-        // Explorer | Structure side-by-side.
+        // Explorer | Structure — explorer width is user-resizable.
+        let explor_w = ctx
+            .ui
+            .explorer_width
+            .clamp(14, left_w.saturating_sub(12));
         let left = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .constraints([
+                Constraint::Length(explor_w),
+                Constraint::Min(10),
+            ])
             .split(top[0]);
         render_db_tree(frame, left[0], ctx.db, ctx.ui.focus == Focus::Database);
         render_db_structure(frame, left[1], ctx.db, ctx.ui.focus == Focus::Structure);
@@ -3226,155 +3205,94 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
         render_results_grid(frame, body[1], ctx);
     }
 
-    // Footer: status/errors win over keymap (otherwise connect errors were invisible).
+    render_studio_footer(frame, root[2], ctx);
+}
+
+fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
+    // Footer: status wins over keymap. Green OK only for Success (not pane tips).
     if let Some(msg) = &ctx.ui.status {
-        let style = if msg.error {
-            theme::style_text().add_modifier(Modifier::BOLD)
-        } else {
-            theme::style_muted()
-        };
-        let tag = if msg.error { " ERR " } else { " · " };
-        let tag_style = if msg.error {
-            Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            theme::style_faint()
-        };
         let text = if msg.text.chars().count() > 90 {
             format!("{}…", msg.text.chars().take(89).collect::<String>())
         } else {
             msg.text.clone()
         };
+        let mut spans = Vec::new();
+        match msg.tone {
+            StatusTone::Success => {
+                spans.push(Span::styled(" OK ", theme::style_ok_badge()));
+            }
+            StatusTone::Error => {
+                spans.push(Span::styled(" ERR ", theme::style_err_badge()));
+            }
+            StatusTone::Info => {
+                spans.push(Span::styled(" · ", theme::style_faint()));
+            }
+        }
+        spans.push(Span::styled(format!(" {text} "), theme::style_text()));
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(tag, tag_style),
-                Span::styled(format!(" {text} "), style),
-            ]))
-            .style(Style::default().bg(theme::bg())),
-            root[2],
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
+            area,
         );
         return;
     }
 
-    // Zellij-style footer: spaced groups, one modifier prefix, · between keys.
-    let conn = if let Some(db) = ctx.db {
-        let src = db
-            .active_source
-            .as_ref()
-            .and_then(|id| db.sources.iter().find(|s| &s.id == id));
-        src.map(|s| s.name.as_str()).unwrap_or("—")
-    } else {
-        "—"
-    };
-    let meta = if let Some(db) = ctx.db {
-        if db.query_running {
-            "RUNNING… Esc cancel".into()
-        } else if let Some(r) = &db.last_result {
-            format!("{}×{}  {}ms", r.rows.len(), r.columns.len(), r.elapsed_ms)
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
     let pane = match ctx.ui.focus {
-        Focus::Database => "1 explorer",
-        Focus::Structure => "2 structure",
-        Focus::Editor => "3 console",
-        Focus::Results => "4 results",
-        _ => "studio",
+        Focus::Database => "Explorer",
+        Focus::Structure => "Structure",
+        Focus::Editor => match ctx.ui.mode {
+            Mode::Insert => "Console · INSERT",
+            Mode::Normal => "Console · NORMAL",
+            _ => "Console",
+        },
+        Focus::Results => "Results",
+        Focus::Git => "Git",
+        Focus::Search => "Search",
+        Focus::Outline => "Hierarchy",
+        Focus::Debug => "Debug",
+        Focus::Terminal => "Terminal",
+        _ => "Studio",
+    };
+    let hint = match ctx.ui.focus {
+        Focus::Database => "Enter open · d DDL · n New · Super-⇧A search",
+        Focus::Structure => "Ctrl+←→ split  ·  Esc explorer",
+        Focus::Editor if matches!(ctx.ui.mode, Mode::Insert) => {
+            "typing · Alt-b DB · Alt-s schema · Alt-L limit · Esc"
+        }
+        Focus::Editor => {
+            "i insert · b/s DB·schema · Alt-L limit · Ctrl-A all"
+        }
+        Focus::Results if ctx.ui.mode == Mode::EditCell => "Enter save  ·  Esc cancel",
+        Focus::Results if ctx.ui.mode == Mode::EditTableFilter => "Enter apply · Tab field · Esc",
+        Focus::Results if ctx.db.is_some_and(|d| d.active_is_table_tab()) => {
+            "w WHERE · o ORDER BY · x close tab · r refresh"
+        }
+        Focus::Results => "x close · r refresh · ]/[ page · Alt-L limit",
+        Focus::Git => "Esc/q back · s stage · c commit",
+        Focus::Terminal => "q exits pager · Ctrl-` / Esc back",
+        Focus::Search | Focus::Outline | Focus::Debug => "Esc/q back to Studio",
+        _ => "Tab panes  ·  Esc home",
     };
     let zoom = if ctx.ui.db_fullscreen.is_some() {
-        " FULL "
+        " · full"
     } else {
         ""
     };
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        format!(" {pane} "),
-        Style::default()
-            .fg(theme::bg())
-            .bg(theme::accent())
-            .add_modifier(Modifier::BOLD),
-    ));
-    if !zoom.is_empty() {
-        spans.push(Span::styled(
-            zoom,
+    let spans = vec![
+        Span::styled(
+            format!(" {pane} "),
             Style::default()
                 .fg(theme::bg())
                 .bg(theme::text())
                 .add_modifier(Modifier::BOLD),
-        ));
-    }
-    spans.push(Span::raw("  "));
-    // Four studio panes
-    push_zellij_group(&mut spans, "", &["Tab", "1", "2", "3", "4"]);
-    spans.push(Span::styled("  │  ", theme::style_faint()));
-    push_zellij_group(&mut spans, "", &["f"]);
-    spans.push(Span::styled(" fullscreen  │  ", theme::style_faint()));
-
-    match ctx.ui.focus {
-        Focus::Database => {
-            push_zellij_group(&mut spans, "", &["j", "k", "Enter", "x"]);
-            spans.push(Span::styled(" delete  │  ", theme::style_faint()));
-            push_zellij_group(&mut spans, "Ctrl+", &["Tab", "[", "]", "t"]);
-        }
-        Focus::Structure => {
-            push_zellij_group(&mut spans, "", &["j", "k"]);
-            spans.push(Span::styled("  scroll  │  ", theme::style_faint()));
-            push_zellij_group(&mut spans, "", &["f", "Esc"]);
-        }
-        Focus::Editor => {
-            push_zellij_group(&mut spans, "", &["F5", "i"]);
-            spans.push(Span::styled("  │  ", theme::style_faint()));
-            push_zellij_group(&mut spans, "Ctrl+", &["Tab", "E", "S", "↵"]);
-            spans.push(Span::styled("  │  ", theme::style_faint()));
-            push_zellij_group(&mut spans, "", &["[", "]", "t", "x"]);
-        }
-        Focus::Results if ctx.ui.mode == Mode::EditCell => {
-            push_zellij_group(&mut spans, "", &["Enter", "Esc"]);
-            spans.push(Span::styled("  │  ", theme::style_faint()));
-            push_zellij_group(&mut spans, "Ctrl+", &["S"]);
-        }
-        Focus::Results => {
-            push_zellij_group(&mut spans, "", &["h", "j", "k", "l", "i", "y", "[", "]"]);
-            spans.push(Span::styled("  edit/copy/pages  │  ", theme::style_faint()));
-            push_zellij_group(&mut spans, "Ctrl+", &["S", "Tab"]);
-        }
-        _ => {}
-    }
-
-    spans.push(Span::styled("  │  ", theme::style_faint()));
-    spans.push(Span::styled(conn.to_string(), theme::style_muted()));
-    if !meta.is_empty() {
-        spans.push(Span::styled("  ", theme::style_faint()));
-        spans.push(Span::styled(meta, theme::style_faint()));
-    }
+        ),
+        Span::styled(format!("  {hint}{zoom} "), theme::style_faint()),
+    ];
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
-        root[2],
+        area,
     );
-}
-
-/// Zellij-like key cluster: optional prefix + keys joined by middle dots.
-fn push_zellij_group(spans: &mut Vec<Span<'static>>, prefix: &'static str, keys: &[&'static str]) {
-    if !prefix.is_empty() {
-        spans.push(Span::styled(prefix, theme::style_faint()));
-    }
-    for (i, key) in keys.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" · ", theme::style_faint()));
-        }
-        spans.push(Span::styled(
-            *key,
-            theme::style_accent().add_modifier(Modifier::BOLD),
-        ));
-    }
 }
 
 fn render_nvim_grid(frame: &mut Frame, area: Rect, grid: &NvimGrid) {
