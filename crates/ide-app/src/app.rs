@@ -1016,6 +1016,27 @@ impl App {
     async fn db_explorer_moved(&mut self, term_rows: u16) {
         self.db
             .ensure_explorer_visible(Self::explorer_view_h(term_rows));
+        // Surface connect failure when highlighting a dead source (!).
+        if let Some(entry) = self.db.flat.get(self.db.selected) {
+            if matches!(entry.kind, DbNodeKind::Source) {
+                if let Some(msg) = self
+                    .db
+                    .connection_health
+                    .get(&entry.source_id)
+                    .and_then(|h| h.error_message())
+                {
+                    let name = self
+                        .db
+                        .sources
+                        .iter()
+                        .find(|s| s.id == entry.source_id)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("source");
+                    self.set_status(format!("{name} · connect error · {msg}"), true);
+                    return;
+                }
+            }
+        }
         if let Err(e) = self.db.refresh_structure_for_selection().await {
             self.set_status(format!("structure: {e:#}"), true);
         }
@@ -1227,11 +1248,12 @@ impl App {
             }
             Some(_) => {
                 if let Err(e) = self.db.toggle_selected().await {
-                    self.set_status(format!("db: {e:#}"), true);
+                    self.set_status(format!("connect error · {e:#}"), true);
+                } else {
+                    self.db
+                        .ensure_explorer_visible(Self::explorer_view_h(term_rows));
+                    let _ = self.db.refresh_structure_for_selection().await;
                 }
-                self.db
-                    .ensure_explorer_visible(Self::explorer_view_h(term_rows));
-                let _ = self.db.refresh_structure_for_selection().await;
             }
             None => {}
         }
@@ -4264,6 +4286,13 @@ impl App {
             }
             Action::CycleDbSourceNext => self.cycle_db_source(1).await,
             Action::CycleDbSourcePrev => self.cycle_db_source(-1).await,
+            Action::DeleteDataSource => {
+                if let Some(id) = self.selected_connection_id() {
+                    self.start_delete_connection(&id);
+                } else {
+                    self.set_status("select a connection in Explorer", true);
+                }
+            }
             Action::OpenFolder => self.start_open_folder(),
             Action::OpenProjects => self.open_projects_palette(),
             Action::OpenHomeSlot(n) => {
@@ -6865,6 +6894,23 @@ async fn event_loop(
                                         "comfort"
                                     };
                                     app.set_status(format!("results density · {label}"), false);
+                                    continue;
+                                }
+                                KeyCode::Delete
+                                | KeyCode::Char('x')
+                                | KeyCode::Char('X')
+                                    if !ctrl
+                                        && app.ui.mode == Mode::Normal
+                                        && app.ui.focus == Focus::Database =>
+                                {
+                                    if let Some(id) = app.selected_connection_id() {
+                                        app.start_delete_connection(&id);
+                                    } else {
+                                        app.set_status(
+                                            "select a connection in Explorer",
+                                            true,
+                                        );
+                                    }
                                     continue;
                                 }
                                 KeyCode::Char('f') | KeyCode::Char('F')

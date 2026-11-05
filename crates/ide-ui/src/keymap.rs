@@ -195,6 +195,8 @@ pub enum Action {
     ToggleHelp,
     /// Toggle results compact/comfort density.
     ToggleResultsDensity,
+    /// Explorer: delete selected connection (confirm modal).
+    DeleteDataSource,
 }
 
 pub struct Keymap;
@@ -439,6 +441,9 @@ impl Keymap {
                 (false, false, KeyCode::Char('r')) => Some(Action::RefreshTree),
                 (false, false, KeyCode::Char('e')) => Some(Action::EditDataSource),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
+                (false, false, KeyCode::Delete)
+                | (false, false, KeyCode::Char('x'))
+                | (false, false, KeyCode::Char('X')) => Some(Action::DeleteDataSource),
                 (false, false, KeyCode::Tab) => Some(Action::CycleDbPane),
                 (false, false, KeyCode::Esc) => Some(Action::GoHome),
                 (true, false, KeyCode::Char('p')) => Some(Action::OpenDbObjectPalette),

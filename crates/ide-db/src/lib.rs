@@ -1277,6 +1277,14 @@ impl ConnHealth {
             Self::Dead(_) => "dead",
         }
     }
+
+    /// Human error text when Dead; None otherwise.
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Dead(msg) => Some(msg.as_str()),
+            _ => None,
+        }
+    }
 }
 
 fn now_millis() -> u128 {

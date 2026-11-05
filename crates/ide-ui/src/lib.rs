@@ -1127,17 +1127,50 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
                 .collect();
             (title, items)
         }
-        Some(_) => (
-            if focused {
+        Some(ws) => {
+            let title = if focused {
                 " ▸ STRUCTURE ".into()
             } else {
                 " Structure ".into()
-            },
-            vec![ListItem::new(Span::styled(
-                " select a table · columns · indexes · grants · DDL ",
-                theme::style_faint(),
-            ))],
-        ),
+            };
+            let dead_msg = ws.flat.get(ws.selected).and_then(|e| {
+                if matches!(e.kind, DbNodeKind::Source) {
+                    ws.connection_health
+                        .get(&e.source_id)
+                        .and_then(|h| h.error_message())
+                        .map(|m| m.to_string())
+                } else {
+                    None
+                }
+            });
+            let items = if let Some(msg) = dead_msg {
+                let short = if msg.chars().count() > 72 {
+                    format!("{}…", msg.chars().take(71).collect::<String>())
+                } else {
+                    msg
+                };
+                vec![
+                    ListItem::new(Span::styled(
+                        " connection failed ",
+                        theme::style_text().add_modifier(Modifier::BOLD),
+                    )),
+                    ListItem::new(Span::styled(
+                        format!(" {short} "),
+                        theme::style_muted(),
+                    )),
+                    ListItem::new(Span::styled(
+                        " Enter retry · e edit · Delete remove ",
+                        theme::style_faint(),
+                    )),
+                ]
+            } else {
+                vec![ListItem::new(Span::styled(
+                    " select a table · columns · indexes · grants · DDL ",
+                    theme::style_faint(),
+                ))]
+            };
+            (title, items)
+        }
         None => (
             " Structure ".into(),
             vec![ListItem::new(Span::styled(" — ", theme::style_faint()))],
@@ -2650,11 +2683,15 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "F5 / Ctrl-↵ run · D density · y yank cell",
+                "Delete / x · remove connection (confirm)",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Ctrl-⇧E CSV · Ctrl-⇧L SQL export · a edit connection",
+                "F5 run · D density · y yank · ! source = connect error in Structure",
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "Ctrl-⇧E CSV · Ctrl-⇧L SQL · e edit connection",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
