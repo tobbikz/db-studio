@@ -976,8 +976,15 @@ pub fn render_confirm_dialog(
     message: &str,
     action_verb: &str,
 ) {
-    let width = screen.width.min(64).max(44);
-    let height = 10;
+    // Full-screen scrim so chrome cannot bleed through the dialog.
+    frame.render_widget(Clear, screen);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::scrim())),
+        screen,
+    );
+
+    let width = screen.width.min(58).max(42);
+    let height = 12u16;
     let x = screen.x + (screen.width.saturating_sub(width)) / 2;
     let y = screen.y + (screen.height.saturating_sub(height)) / 3;
     let area = Rect {
@@ -986,47 +993,81 @@ pub fn render_confirm_dialog(
         width,
         height,
     };
+
+    // Outer plate (halo) — one cell larger, solid elevated fill.
+    let halo = Rect {
+        x: area.x.saturating_sub(1),
+        y: area.y.saturating_sub(1),
+        width: area.width.saturating_add(2).min(screen.width.saturating_sub(area.x.saturating_sub(1))),
+        height: area
+            .height
+            .saturating_add(2)
+            .min(screen.height.saturating_sub(area.y.saturating_sub(1))),
+    };
+    frame.render_widget(Clear, halo);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::modal())),
+        halo,
+    );
+
     frame.render_widget(Clear, area);
+    let title_style = Style::default()
+        .fg(theme::bg())
+        .bg(theme::text())
+        .add_modifier(Modifier::BOLD);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::border_idle()))
-            .style(Style::default().bg(theme::surface()))
-            .title(format!(" {title} ")),
+            .border_style(
+                Style::default()
+                    .fg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            )
+            .style(Style::default().bg(theme::modal()))
+            .title(Span::styled(format!(" {title} "), title_style)),
         area,
     );
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(2),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
-        .margin(1)
+        .margin(2)
         .split(area);
     frame.render_widget(
-        Paragraph::new(Span::styled(message, theme::style_text())),
+        Paragraph::new(Span::styled(
+            message,
+            theme::style_text().add_modifier(Modifier::BOLD),
+        )),
         inner[0],
     );
     let hint = if action_verb == "apply" {
-        "  Runs the listed UPDATE statements against the active source."
+        "Runs the listed UPDATE statements against the active source."
     } else {
-        "  This removes the entry from datasources.toml."
+        "Removes the entry from datasources.toml."
     };
     frame.render_widget(
         Paragraph::new(Span::styled(hint, theme::style_muted())),
-        inner[1],
+        inner[2],
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("  ", theme::style_faint()),
-            Span::styled("Enter/y", theme::style_pill_off()),
+            Span::styled(
+                " Enter/y ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!(" {action_verb}   "), theme::style_faint()),
-            Span::styled("Esc/n", theme::style_pill_off()),
+            Span::styled(" Esc/n ", theme::style_pill_off()),
             Span::styled(" cancel", theme::style_faint()),
         ])),
-        inner[3],
+        inner[4],
     );
 }
 

@@ -55,6 +55,22 @@ pub fn surface_2() -> Color {
         Color::Rgb(18, 18, 18)
     }
 }
+/// Elevated modal / dialog plate (reads above chrome).
+pub fn modal() -> Color {
+    if white() {
+        Color::Rgb(255, 255, 255)
+    } else {
+        Color::Rgb(32, 32, 32)
+    }
+}
+/// Scrim behind modals (dims the studio chrome).
+pub fn scrim() -> Color {
+    if white() {
+        Color::Rgb(220, 220, 220)
+    } else {
+        Color::Rgb(0, 0, 0)
+    }
+}
 pub fn border_idle() -> Color {
     if white() {
         Color::Rgb(210, 210, 210)
