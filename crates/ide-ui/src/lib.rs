@@ -3226,6 +3226,38 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
         render_results_grid(frame, body[1], ctx);
     }
 
+    // Footer: status/errors win over keymap (otherwise connect errors were invisible).
+    if let Some(msg) = &ctx.ui.status {
+        let style = if msg.error {
+            theme::style_text().add_modifier(Modifier::BOLD)
+        } else {
+            theme::style_muted()
+        };
+        let tag = if msg.error { " ERR " } else { " · " };
+        let tag_style = if msg.error {
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme::style_faint()
+        };
+        let text = if msg.text.chars().count() > 90 {
+            format!("{}…", msg.text.chars().take(89).collect::<String>())
+        } else {
+            msg.text.clone()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(tag, tag_style),
+                Span::styled(format!(" {text} "), style),
+            ]))
+            .style(Style::default().bg(theme::bg())),
+            root[2],
+        );
+        return;
+    }
+
     // Zellij-style footer: spaced groups, one modifier prefix, · between keys.
     let conn = if let Some(db) = ctx.db {
         let src = db
@@ -3287,9 +3319,9 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
 
     match ctx.ui.focus {
         Focus::Database => {
-            push_zellij_group(&mut spans, "", &["j", "k", "Enter"]);
-            spans.push(Span::styled("  │  ", theme::style_faint()));
-            push_zellij_group(&mut spans, "Ctrl+", &["Tab", "[", "]", "t", "x"]);
+            push_zellij_group(&mut spans, "", &["j", "k", "Enter", "x"]);
+            spans.push(Span::styled(" delete  │  ", theme::style_faint()));
+            push_zellij_group(&mut spans, "Ctrl+", &["Tab", "[", "]", "t"]);
         }
         Focus::Structure => {
             push_zellij_group(&mut spans, "", &["j", "k"]);

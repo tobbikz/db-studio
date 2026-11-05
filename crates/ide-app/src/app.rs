@@ -6753,7 +6753,10 @@ async fn event_loop(
                                     }
                                 }
 
+                                // In Explorer, bare `x` deletes the connection (confirm modal).
+                                // Elsewhere `x` / Ctrl-W closes the SQL tab.
                                 let close_tab = (!ctrl
+                                    && app.ui.focus != Focus::Database
                                     && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X')))
                                     || (ctrl
                                         && matches!(
@@ -6897,6 +6900,7 @@ async fn event_loop(
                                     continue;
                                 }
                                 KeyCode::Delete
+                                | KeyCode::Backspace
                                 | KeyCode::Char('x')
                                 | KeyCode::Char('X')
                                     if !ctrl
@@ -6907,7 +6911,7 @@ async fn event_loop(
                                         app.start_delete_connection(&id);
                                     } else {
                                         app.set_status(
-                                            "select a connection in Explorer",
+                                            "select a connection in Explorer (source row)",
                                             true,
                                         );
                                     }

@@ -442,6 +442,7 @@ impl Keymap {
                 (false, false, KeyCode::Char('e')) => Some(Action::EditDataSource),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
                 (false, false, KeyCode::Delete)
+                | (false, false, KeyCode::Backspace)
                 | (false, false, KeyCode::Char('x'))
                 | (false, false, KeyCode::Char('X')) => Some(Action::DeleteDataSource),
                 (false, false, KeyCode::Tab) => Some(Action::CycleDbPane),
