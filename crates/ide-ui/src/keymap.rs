@@ -173,6 +173,8 @@ pub enum Action {
     CommitTransaction,
     RollbackTransaction,
     EditCell,
+    /// Copy focused results cell to host clipboard.
+    YankResultCell,
     FocusResults,
     NextBranch,
     PrevBranch,
@@ -448,6 +450,7 @@ impl Keymap {
                 (false, false, KeyCode::Char('i')) | (false, false, KeyCode::Enter) => {
                     Some(Action::EditCell)
                 }
+                (false, false, KeyCode::Char('y')) => Some(Action::YankResultCell),
                 (false, false, KeyCode::Char('j')) | (false, false, KeyCode::Down) => {
                     Some(Action::MoveDown)
                 }

@@ -681,27 +681,42 @@ impl App {
     }
 
     fn toggle_product_mode(&mut self) {
-        if self.ui.product == ProductMode::Database {
-            self.ui.product = ProductMode::Code;
-            self.ui.code_surface = self.last_code_surface;
-            self.ui.sidebar = Sidebar::Files;
-            self.ui.bottom = BottomPanel::Problems;
-            self.ui.focus = Focus::Editor;
-            // Force a resize on next tick so the grid matches the Code layout.
-            if let Some(nvim) = self.nvim.as_mut() {
-                nvim.force_next_resize();
-            }
-            let surface = match self.last_code_surface {
-                CodeSurface::Home => "Home",
-                CodeSurface::Editor => "Editor",
-            };
-            self.set_status(
-                format!("Code · {surface} — Ctrl-Shift-D Database"),
-                false,
-            );
+        // db-studio is Database-only — toggle between Home and Studio.
+        if self.ui.db_surface == DbSurface::Studio {
+            self.go_db_home();
+            self.set_status("DB Home · a connect · e studio", false);
         } else {
-            self.last_code_surface = self.ui.code_surface;
-            self.enter_database_mode();
+            self.enter_db_studio();
+            self.set_status("Studio · 1–4 panes · a connect", false);
+        }
+    }
+
+    fn yank_result_cell(&mut self) {
+        let Some(result) = self.db.last_result.as_ref() else {
+            self.set_status("copy: no results", true);
+            return;
+        };
+        let Some(row) = result.rows.get(result.cursor_row) else {
+            self.set_status("copy: no row", true);
+            return;
+        };
+        let Some(cell) = row.get(result.cursor_col) else {
+            self.set_status("copy: no cell", true);
+            return;
+        };
+        let text = if cell == "NULL" { "" } else { cell.as_str() };
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
+            Ok(()) => {
+                let preview = if text.is_empty() {
+                    "NULL".into()
+                } else if text.chars().count() > 48 {
+                    format!("{}…", text.chars().take(48).collect::<String>())
+                } else {
+                    text.to_string()
+                };
+                self.set_status(format!("copied · {preview}"), false);
+            }
+            Err(e) => self.set_status(format!("clipboard: {e}"), true),
         }
     }
 
@@ -1936,41 +1951,18 @@ impl App {
         self.ui.mode = Mode::Settings;
     }
 
-    /// Product ribbon: 0 Code · 1 Database · 2 Sessions (Agents nests under Code).
+    /// db-studio: Ctrl-1…4 map to studio panes (not Code/Sessions products).
     async fn goto_product_tab(&mut self, n: u8) -> Result<()> {
+        self.ui.product = ProductMode::Database;
+        if self.ui.db_surface != DbSurface::Studio {
+            self.enter_db_studio();
+        }
         match n {
-            0 => {
-                self.ui.product = ProductMode::Code;
-                self.ui.code_surface = CodeSurface::Editor;
-                self.last_code_surface = CodeSurface::Editor;
-                self.ui.sidebar = Sidebar::Files;
-                self.ui.focus = Focus::Editor;
-                // Astro owns Files/Outline — keep host sidebar off when nvim attached.
-                self.ui.show_sidebar = !self.nvim_active();
-                self.ui.show_outline = false;
-                self.ui.mode = Mode::Normal;
-                self.set_status("Edit · Files/Git/DB in sidebar · Ctrl-⇧A agents", false);
-            }
-            1 => {
-                self.ui.product = ProductMode::Database;
-                self.ui.db_surface = DbSurface::Studio;
-                self.ui.focus = Focus::Database;
-                self.ui.show_sidebar = true;
-                self.ui.mode = Mode::Normal;
-                self.set_status("Database · Ctrl-⇧D toggle · 1–4 panes", false);
-            }
-            2 => {
-                self.ui.product = ProductMode::Code;
-                self.ui.code_surface = CodeSurface::Editor;
-                self.last_code_surface = CodeSurface::Editor;
-                self.ui.sidebar = Sidebar::Sessions;
-                self.ui.focus = Focus::Sessions;
-                self.ui.show_sidebar = true;
-                self.ui.mode = Mode::Normal;
-                let _ = self.sessions.reload();
-                self.set_status("Sessions · Enter connect · a/A add", false);
-            }
-            _ => {}
+            0 => self.focus_db_pane(1),
+            1 => self.focus_db_pane(2),
+            2 => self.focus_db_pane(3),
+            3 => self.focus_db_pane(4),
+            _ => self.set_status("DB Studio · 1–4 panes · a connect · Ctrl-⇧H home", false),
         }
         Ok(())
     }
@@ -4222,6 +4214,7 @@ impl App {
                 self.set_status(self.db.status.clone(), false);
             }
             Action::EditCell => self.start_edit_cell(),
+            Action::YankResultCell => self.yank_result_cell(),
             Action::FocusResults => {
                 self.ui.bottom = BottomPanel::Results;
                 self.ui.focus = Focus::Results;
@@ -5999,6 +5992,7 @@ async fn event_loop(
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
                             {
+                                // db-studio: Home ↔ Studio (not Code).
                                 app.toggle_product_mode();
                                 continue;
                             }
@@ -6024,43 +6018,32 @@ async fn event_loop(
                                     .await?;
                                 continue;
                             }
+                            // Git / Sessions / Agents / Outline are not part of db-studio.
                             if key.modifiers.contains(KeyModifiers::CONTROL)
                                 && key.modifiers.contains(KeyModifiers::SHIFT)
-                                && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
+                                && matches!(
+                                    key.code,
+                                    KeyCode::Char('s')
+                                        | KeyCode::Char('S')
+                                        | KeyCode::Char('a')
+                                        | KeyCode::Char('A')
+                                        | KeyCode::Char('o')
+                                        | KeyCode::Char('O')
+                                        | KeyCode::Char('g')
+                                        | KeyCode::Char('G')
+                                )
                             {
-                                app.handle_action(Action::OpenGit, view_h, term_rows)
-                                    .await?;
-                                continue;
-                            }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && key.modifiers.contains(KeyModifiers::SHIFT)
-                                && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
-                            {
-                                app.handle_action(Action::OpenSessions, view_h, term_rows)
-                                    .await?;
-                                continue;
-                            }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && key.modifiers.contains(KeyModifiers::SHIFT)
-                                && matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A'))
-                            {
-                                app.handle_action(Action::OpenAgents, view_h, term_rows)
-                                    .await?;
-                                continue;
-                            }
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && key.modifiers.contains(KeyModifiers::SHIFT)
-                                && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
-                            {
-                                app.handle_action(Action::OpenOutline, view_h, term_rows)
-                                    .await?;
+                                app.set_status(
+                                    "db-studio · Ctrl-⇧H home · Ctrl-⇧D studio · 1–4 panes",
+                                    false,
+                                );
                                 continue;
                             }
                             if key.modifiers.contains(KeyModifiers::CONTROL)
                                 && !key.modifiers.contains(KeyModifiers::SHIFT)
                             {
                                 if let KeyCode::Char(d) = key.code {
-                                    if matches!(d, '1' | '2' | '3' | '4' | '5') {
+                                    if matches!(d, '1' | '2' | '3' | '4') {
                                         let tab = d as u8 - b'1';
                                         app.handle_action(
                                             Action::ProductTab(tab),

@@ -501,9 +501,9 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
     };
 
     let title = if form.is_edit {
-        " edit connection "
+        " DB Studio · edit connection "
     } else {
-        " new connection "
+        " DB Studio · new connection · Tab fields · Enter save "
     };
 
     frame.render_widget(Clear, area);

@@ -2,7 +2,7 @@
 
 Terminal **Database Studio** — explorer, structure, SQL console, and results.
 
-Spun out of [tui-ide](https://github.com/tobbikz/tui-ide) as a focused product (no code editor / AstroNvim).
+AMOLED mono TUI. No code editor, no Sessions product chrome.
 
 ## Run
 
@@ -11,21 +11,30 @@ cargo run -p ide-app --release
 # binary: target/release/db-studio [workspace]
 ```
 
-## Keys (studio)
+## Surfaces
 
-| Key | Pane |
-|-----|------|
-| `1` | Explorer |
-| `2` | Structure |
-| `3` | Console |
-| `4` | Results |
+| Surface | How |
+|---------|-----|
+| **Home** | `Ctrl-⇧H` — sources + connect |
+| **Studio** | `e` / `Ctrl-⇧D` — explorer · structure · console · results |
+
+## Studio keys
+
+| Key | Action |
+|-----|--------|
+| `1`–`4` | Explorer · Structure · Console · Results |
 | `Tab` | Cycle panes |
 | `f` | Fullscreen pane |
-| `Esc` | Back to explorer |
+| `Esc` | Back to explorer (or cancel query) |
+| `a` | New connection |
+| `F5` / `Ctrl-↵` | Run SQL |
+| `y` | Copy focused result cell |
+| `i` | Edit cell |
+| `/` | Filter results |
 
 ## Config
 
-Uses `~/.config/tui-ide/` connection profiles for now (shared with the parent toolkit).
+Connections live under `~/.config/tui-ide/` for now (shared toolkit path).
 
 ## License
 

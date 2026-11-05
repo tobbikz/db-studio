@@ -123,12 +123,12 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            product: ProductMode::Code,
+            product: ProductMode::Database,
             code_surface: CodeSurface::Home,
             db_surface: DbSurface::Home,
             mode: Mode::Normal,
-            focus: Focus::Editor,
-            sidebar: Sidebar::Files,
+            focus: Focus::Database,
+            sidebar: Sidebar::Database,
             bottom: BottomPanel::Problems,
             show_sidebar: true,
             show_outline: true,
@@ -1003,7 +1003,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
             theme::style_faint(),
         ))],
         None => vec![ListItem::new(Span::styled(
-            " no sources — Ctrl-Shift-D connect ",
+            " no sources — press a to connect ",
             theme::style_faint(),
         ))],
     };
@@ -1177,16 +1177,23 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 
     // Toolbar strip inside console
     if h >= 2 {
+        let run_hint = if ctx.db.map(|d| d.query_running).unwrap_or(false) {
+            Span::styled(" RUNNING… Esc ", theme::style_selected())
+        } else {
+            Span::styled(" F5 / Ctrl-↵ run ", theme::style_text())
+        };
+        let hist_n = ctx.db.map(|d| d.history.len()).unwrap_or(0);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" ▶ ", theme::style_accent()),
-                Span::styled("F5", theme::style_text()),
+                Span::styled(" ▸ ", theme::style_muted()),
+                run_hint,
                 Span::styled(" · ", theme::style_faint()),
-                Span::styled("Ctrl-E Explain", theme::style_muted()),
+                Span::styled("Ctrl-E explain", theme::style_faint()),
                 Span::styled(" · ", theme::style_faint()),
-                Span::styled("CSV", theme::style_muted()),
-                Span::styled(" · ", theme::style_faint()),
-                Span::styled("Apply", theme::style_muted()),
+                Span::styled(
+                    format!("hist {hist_n}"),
+                    theme::style_faint(),
+                ),
             ]))
             .style(Style::default().bg(theme::surface_2())),
             Rect {
@@ -1380,18 +1387,8 @@ fn render_tree(frame: &mut Frame, area: Rect, ws: &Workspace, focused: bool) {
     );
 }
 
-/// Hit-test product ribbon tabs on row 0. Returns ProductTab index.
-pub fn product_tab_at_col(col: u16) -> Option<u8> {
-    // Must match render_host_header: Code · Database · Sessions.
-    let mut x: u16 = 0;
-    let names = ["Code", "Database", "Sessions"];
-    for (i, name) in names.iter().enumerate() {
-        let w = (name.len() as u16) + 2; // spaces around
-        if col >= x && col < x + w {
-            return Some(i as u8);
-        }
-        x = x.saturating_add(w + 1); // trailing spacer
-    }
+/// Hit-test product ribbon tabs on row 0. db-studio has no multi-product ribbon.
+pub fn product_tab_at_col(_col: u16) -> Option<u8> {
     None
 }
 
@@ -2026,12 +2023,13 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         // Keep the pane calm — key chords live in the Zellij-style footer.
         let hint = Paragraph::new(vec![
             Line::from(""),
+            Line::from(Span::styled("  empty", theme::style_muted())),
             Line::from(Span::styled(
-                "  empty",
-                theme::style_muted(),
+                "  F5 / Ctrl+↵  run SQL in Console",
+                theme::style_faint(),
             )),
             Line::from(Span::styled(
-                "  F5 / Ctrl+↵  run from Console",
+                "  y copy cell  ·  i edit  ·  / filter",
                 theme::style_faint(),
             )),
         ])
@@ -2177,6 +2175,8 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                         } else {
                             draft
                         }
+                    } else if is_null {
+                        truncate_chars("∅", max_col_width)
                     } else {
                         truncate_chars(cell, max_col_width)
                     };
@@ -2342,31 +2342,45 @@ fn render_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             None => ("—".into(), "1:1".into(), String::new()),
         }
     };
-    let mut spans = vec![
-        Span::styled(
-            format!(" {product} "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {mode} "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(" {path} {dirty}  {cursor} ")),
-    ];
+    let mut spans = if ctx.ui.product == ProductMode::Database {
+        vec![
+            Span::styled(
+                " DB ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {mode} "), theme::style_muted()),
+            Span::styled(format!(" {cursor} "), theme::style_faint()),
+        ]
+    } else {
+        vec![
+            Span::styled(
+                format!(" {product} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {mode} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {path} {dirty}  {cursor} ")),
+        ]
+    };
     if ctx.ui.product == ProductMode::Database {
         if let Some(db) = ctx.db {
             if db.in_txn {
                 spans.push(Span::styled(
                     " TXN ",
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
+                        .fg(theme::bg())
+                        .bg(theme::text())
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -2468,41 +2482,32 @@ fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
     );
 }
 
-fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, code_active: bool) {
-    let project = ctx
-        .workspace
-        .root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("workspace");
-
-    // Top-level products only. Agents nests under Code (Ctrl-⇧A / AI tab).
-    let active = if !code_active {
-        "Database"
-    } else if ctx.ui.sidebar == Sidebar::Sessions {
-        "Sessions"
-    } else {
-        "Code"
+fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_active: bool) {
+    let conn = ctx
+        .db
+        .and_then(|d| {
+            d.active_source
+                .as_ref()
+                .and_then(|id| d.sources.iter().find(|s| &s.id == id))
+                .map(|s| s.name.as_str())
+        })
+        .unwrap_or("no connection");
+    let surface = match ctx.ui.db_surface {
+        DbSurface::Home => "home",
+        DbSurface::Studio => "studio",
     };
-
-    let mut spans = Vec::new();
-    for name in ["Code", "Database", "Sessions"] {
-        let on = name == active;
-        spans.push(Span::styled(
-            format!(" {name} "),
-            if on {
-                theme::style_selected()
-            } else {
-                theme::style_muted()
-            },
-        ));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled(
-        format!("· IDE  Ctrl-1…3"),
-        theme::style_faint(),
-    ));
-    let _ = project;
+    let spans = vec![
+        Span::styled(
+            " DB Studio ",
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {surface}  "), theme::style_muted()),
+        Span::styled("·  ", theme::style_faint()),
+        Span::styled(conn.to_string(), theme::style_faint()),
+    ];
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
         area,
@@ -2638,10 +2643,8 @@ pub enum HomeRecentSlot {
 fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     frame.render_widget(
         Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::border_idle()))
-            .style(Style::default().bg(theme::surface()))
-            .title(" database home "),
+            .borders(Borders::NONE)
+            .style(Style::default().bg(theme::bg())),
         area,
     );
 
@@ -2652,7 +2655,7 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             Constraint::Min(10),
             Constraint::Length(2),
         ])
-        .margin(1)
+        .margin(2)
         .split(area);
 
     let sources_n = ctx.db.map(|d| d.sources.len()).unwrap_or(0);
@@ -2666,29 +2669,49 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         })
         .unwrap_or("none");
 
-    let hero = vec![
-        Line::from(vec![
-            Span::styled(
-                "  Database studio",
+    let hero = if sources_n == 0 {
+        vec![
+            Line::from(Span::styled(
+                "DB Studio",
                 Style::default()
                     .fg(theme::text())
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  ·  explore · query · export", theme::style_muted()),
-        ]),
-        Line::from(Span::styled(
-            "  ──────────────────────────────────────────────",
-            theme::style_faint(),
-        )),
-        Line::from(Span::styled(
-            format!("  {sources_n} source(s)  ·  active  {active}"),
-            theme::style_muted(),
-        )),
-        Line::from(Span::styled(
-            "  Postgres · MySQL · SQLite",
-            theme::style_faint(),
-        )),
-    ];
+            )),
+            Line::from(Span::styled(
+                "────────────────────────",
+                theme::style_faint(),
+            )),
+            Line::from(Span::styled(
+                "No connections yet. Press  a  to add one.",
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "Postgres · MySQL · SQLite · DuckDB",
+                theme::style_faint(),
+            )),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "DB Studio",
+                Style::default()
+                    .fg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "────────────────────────",
+                theme::style_faint(),
+            )),
+            Line::from(Span::styled(
+                format!("{sources_n} source(s)  ·  active  {active}"),
+                theme::style_muted(),
+            )),
+            Line::from(Span::styled(
+                "explore · query · export",
+                theme::style_faint(),
+            )),
+        ]
+    };
     frame.render_widget(Paragraph::new(hero), inner[0]);
 
     let body = Layout::default()
@@ -2698,78 +2721,41 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 
     let actions = vec![
         Line::from(Span::styled(
-            "  ACTIONS",
-            theme::style_accent().add_modifier(Modifier::BOLD),
+            "ACTIONS",
+            theme::style_muted().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  ────────────────────────────────────",
+            "────────────────────────",
             theme::style_faint(),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Enter studio",
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::BOLD),
-        )),
         Line::from(vec![
-            Span::styled("     ", theme::style_faint()),
-            Span::styled("[ e ]  [ Enter ]", theme::style_pill_off()),
-            Span::styled("  explorer · SQL · results", theme::style_faint()),
+            Span::styled(" 1 ", theme::style_selected()),
+            Span::styled("  Studio", theme::style_text()),
+            Span::styled("   e / Enter", theme::style_faint()),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Add connection",
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::BOLD),
-        )),
         Line::from(vec![
-            Span::styled("     ", theme::style_faint()),
-            Span::styled("[ a ]", theme::style_pill_off()),
-            Span::styled("  postgres:// · mysql:// · path.db", theme::style_faint()),
+            Span::styled(" 2 ", theme::style_selected()),
+            Span::styled("  Connect", theme::style_text()),
+            Span::styled("  a", theme::style_faint()),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Config",
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::BOLD),
-        )),
         Line::from(vec![
-            Span::styled("     ", theme::style_faint()),
-            Span::styled("[ c ]", theme::style_pill_off()),
-            Span::styled("  ~/.config/tui-ide/config.toml", theme::style_faint()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Back to Code",
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("     ", theme::style_faint()),
-            Span::styled("[ Ctrl-⇧-D ]", theme::style_pill_off()),
-            Span::styled("  Home / Editor", theme::style_faint()),
+            Span::styled(" 3 ", theme::style_selected()),
+            Span::styled("  Config", theme::style_text()),
+            Span::styled("   c", theme::style_faint()),
         ]),
     ];
-    frame.render_widget(
-        Paragraph::new(actions).block(
-            Block::default()
-                .borders(Borders::RIGHT)
-                .border_style(Style::default().fg(theme::border_idle())),
-        ),
-        body[0],
-    );
+    frame.render_widget(Paragraph::new(actions), body[0]);
 
     let mut right: Vec<Line> = vec![
         Line::from(Span::styled(
-            "  SOURCES",
-            theme::style_accent().add_modifier(Modifier::BOLD),
+            "SOURCES",
+            theme::style_muted().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  ────────────────────────",
+            "────────────────────────",
             theme::style_faint(),
         )),
         Line::from(""),
@@ -2778,7 +2764,7 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     if let Some(db) = ctx.db {
         if db.sources.is_empty() {
             right.push(Line::from(Span::styled(
-                "  (none — press a to add)",
+                "(none — press a)",
                 theme::style_faint(),
             )));
         } else {
@@ -2790,9 +2776,9 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     ""
                 };
                 right.push(Line::from(vec![
-                    Span::styled(format!("  [{n}] "), theme::style_faint()),
+                    Span::styled(format!("[{n}] "), theme::style_faint()),
                     Span::styled(
-                        &src.name,
+                        src.name.clone(),
                         Style::default()
                             .fg(theme::text())
                             .add_modifier(Modifier::BOLD),
@@ -2816,14 +2802,14 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     }
                 };
                 right.push(Line::from(Span::styled(
-                    format!("      {}  {}", src.driver.label(), detail),
+                    format!("    {}  {}", src.driver.label(), detail),
                     theme::style_faint(),
                 )));
             }
         }
     } else {
         right.push(Line::from(Span::styled(
-            "  (database workspace unavailable)",
+            "(workspace unavailable)",
             theme::style_faint(),
         )));
     }
@@ -2831,7 +2817,6 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     frame.render_widget(Paragraph::new(right), body[1]);
 
     let foot = vec![Line::from(vec![
-        Span::styled("  ", theme::style_faint()),
         Span::styled("1-9", theme::style_text()),
         Span::styled(" source  ·  ", theme::style_faint()),
         Span::styled("e", theme::style_text()),
@@ -2839,20 +2824,23 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         Span::styled("a", theme::style_text()),
         Span::styled(" connect  ·  ", theme::style_faint()),
         Span::styled("c", theme::style_text()),
-        Span::styled(" config", theme::style_faint()),
+        Span::styled(" config  ·  ", theme::style_faint()),
+        Span::styled("q", theme::style_text()),
+        Span::styled(" quit", theme::style_faint()),
     ])];
     frame.render_widget(Paragraph::new(foot), inner[2]);
 }
 
 fn render_db_home_status(frame: &mut Frame, area: Rect) {
     let line = Line::from(vec![
-        Span::styled(" DB HOME ", theme::style_pill_on(theme::db_pill())),
-        Span::styled("  pick a source or enter studio  ", theme::style_muted()),
-        Span::styled("│", theme::style_faint()),
         Span::styled(
-            "  1-9 source  ·  e studio  ·  a connect  ·  c config  ·  Ctrl-⇧D Code  ·  Ctrl-Q ",
-            theme::style_faint(),
+            " DB Studio ",
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("  a connect  ·  e studio  ·  1-9 source  ·  q quit ", theme::style_faint()),
     ]);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme::bg())),
@@ -2995,8 +2983,8 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
             push_zellij_group(&mut spans, "Ctrl+", &["S"]);
         }
         Focus::Results => {
-            push_zellij_group(&mut spans, "", &["h", "j", "k", "l", "i", "[", "]"]);
-            spans.push(Span::styled("  pages  │  ", theme::style_faint()));
+            push_zellij_group(&mut spans, "", &["h", "j", "k", "l", "i", "y", "[", "]"]);
+            spans.push(Span::styled("  edit/copy/pages  │  ", theme::style_faint()));
             push_zellij_group(&mut spans, "Ctrl+", &["S", "Tab"]);
         }
         _ => {}
