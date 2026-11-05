@@ -2483,15 +2483,20 @@ fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
 }
 
 fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_active: bool) {
+    let active_id = ctx.db.and_then(|d| d.active_source.as_deref());
     let conn = ctx
         .db
         .and_then(|d| {
-            d.active_source
-                .as_ref()
-                .and_then(|id| d.sources.iter().find(|s| &s.id == id))
+            active_id
+                .and_then(|id| d.sources.iter().find(|s| s.id == id))
                 .map(|s| s.name.as_str())
         })
         .unwrap_or("no connection");
+    let health = ctx
+        .db
+        .and_then(|d| active_id.and_then(|id| d.connection_health.get(id)))
+        .map(|h| h.badge())
+        .unwrap_or("—");
     let surface = match ctx.ui.db_surface {
         DbSurface::Home => "home",
         DbSurface::Studio => "studio",
@@ -2507,6 +2512,8 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
         Span::styled(format!("  {surface}  "), theme::style_muted()),
         Span::styled("·  ", theme::style_faint()),
         Span::styled(conn.to_string(), theme::style_faint()),
+        Span::styled("  ", theme::style_faint()),
+        Span::styled(health, theme::style_muted()),
     ];
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
@@ -2651,7 +2658,7 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(4),
             Constraint::Min(10),
             Constraint::Length(2),
         ])
@@ -2668,6 +2675,7 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 .map(|s| s.name.as_str())
         })
         .unwrap_or("none");
+    let sel = ctx.ui.home_selected;
 
     let hero = if sources_n == 0 {
         vec![
@@ -2676,10 +2684,6 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 Style::default()
                     .fg(theme::text())
                     .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "────────────────────────",
-                theme::style_faint(),
             )),
             Line::from(Span::styled(
                 "No connections yet. Press  a  to add one.",
@@ -2699,15 +2703,11 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                "────────────────────────",
-                theme::style_faint(),
-            )),
-            Line::from(Span::styled(
-                format!("{sources_n} source(s)  ·  active  {active}"),
+                format!("{sources_n} source(s)  ·  last  {active}"),
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "explore · query · export",
+                "Enter connects · then Studio",
                 theme::style_faint(),
             )),
         ]
@@ -2716,46 +2716,16 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(inner[1]);
 
-    let actions = vec![
-        Line::from(Span::styled(
-            "ACTIONS",
-            theme::style_muted().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "────────────────────────",
-            theme::style_faint(),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" 1 ", theme::style_selected()),
-            Span::styled("  Studio", theme::style_text()),
-            Span::styled("   e / Enter", theme::style_faint()),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" 2 ", theme::style_selected()),
-            Span::styled("  Connect", theme::style_text()),
-            Span::styled("  a", theme::style_faint()),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" 3 ", theme::style_selected()),
-            Span::styled("  Config", theme::style_text()),
-            Span::styled("   c", theme::style_faint()),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(actions), body[0]);
-
-    let mut right: Vec<Line> = vec![
+    let mut left: Vec<Line> = vec![
         Line::from(Span::styled(
             "SOURCES",
             theme::style_muted().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "────────────────────────",
+            "────────────────────────────",
             theme::style_faint(),
         )),
         Line::from(""),
@@ -2763,27 +2733,49 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 
     if let Some(db) = ctx.db {
         if db.sources.is_empty() {
-            right.push(Line::from(Span::styled(
+            left.push(Line::from(Span::styled(
                 "(none — press a)",
                 theme::style_faint(),
             )));
         } else {
             for (i, src) in db.sources.iter().take(9).enumerate() {
                 let n = (i + 1) as u8;
-                let active_mark = if db.active_source.as_deref() == Some(src.id.as_str()) {
-                    " · active"
-                } else {
-                    ""
+                let selected = i == sel;
+                let is_active = db.active_source.as_deref() == Some(src.id.as_str());
+                let health = db
+                    .connection_health
+                    .get(&src.id)
+                    .map(|h| h.badge())
+                    .unwrap_or("—");
+                let health_style = match health {
+                    "ok" => theme::style_accent().add_modifier(Modifier::BOLD),
+                    "stale" => theme::style_muted(),
+                    "dead" => theme::style_text().add_modifier(Modifier::BOLD),
+                    _ => theme::style_faint(),
                 };
-                right.push(Line::from(vec![
+                let pin = if src.pinned { "★ " } else { "  " };
+                let cursor = if selected { "› " } else { "  " };
+                let name_style = if selected {
+                    Style::default()
+                        .fg(theme::text())
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default()
+                        .fg(theme::text())
+                        .add_modifier(Modifier::BOLD)
+                };
+                left.push(Line::from(vec![
+                    Span::styled(cursor, theme::style_selected()),
                     Span::styled(format!("[{n}] "), theme::style_faint()),
-                    Span::styled(
-                        src.name.clone(),
-                        Style::default()
-                            .fg(theme::text())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(active_mark, theme::style_muted()),
+                    Span::styled(pin, theme::style_muted()),
+                    Span::styled(src.name.clone(), name_style),
+                    Span::styled("  ", theme::style_faint()),
+                    Span::styled(health, health_style),
+                    if is_active {
+                        Span::styled(" · last", theme::style_muted())
+                    } else {
+                        Span::raw("")
+                    },
                 ]));
                 let detail = match src.driver {
                     ide_db::DbDriver::Sqlite => {
@@ -2801,28 +2793,101 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                         }
                     }
                 };
-                right.push(Line::from(Span::styled(
-                    format!("    {}  {}", src.driver.label(), detail),
+                left.push(Line::from(Span::styled(
+                    format!("      {}  {}", src.driver.label(), detail),
                     theme::style_faint(),
                 )));
             }
         }
     } else {
-        right.push(Line::from(Span::styled(
+        left.push(Line::from(Span::styled(
             "(workspace unavailable)",
             theme::style_faint(),
         )));
     }
+    frame.render_widget(Paragraph::new(left), body[0]);
 
+    let mut right: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "RECENT",
+            theme::style_muted().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "────────────────────────────",
+            theme::style_faint(),
+        )),
+        Line::from(""),
+    ];
+    if let Some(db) = ctx.db {
+        if db.history.is_empty() {
+            right.push(Line::from(Span::styled(
+                "(no queries yet)",
+                theme::style_faint(),
+            )));
+        } else {
+            for entry in db.history.iter().take(6) {
+                right.push(Line::from(Span::styled(
+                    entry.label(42),
+                    theme::style_muted(),
+                )));
+            }
+        }
+
+        right.push(Line::from(""));
+        right.push(Line::from(Span::styled(
+            "FAVORITES",
+            theme::style_muted().add_modifier(Modifier::BOLD),
+        )));
+        right.push(Line::from(Span::styled(
+            "────────────────────────────",
+            theme::style_faint(),
+        )));
+        right.push(Line::from(""));
+
+        let pinned: Vec<&str> = db
+            .sources
+            .iter()
+            .filter(|s| s.pinned)
+            .map(|s| s.name.as_str())
+            .take(4)
+            .collect();
+        if pinned.is_empty() && db.bookmarks.is_empty() {
+            right.push(Line::from(Span::styled(
+                "(p pin source · bookmarks later)",
+                theme::style_faint(),
+            )));
+        } else {
+            for name in pinned {
+                right.push(Line::from(vec![
+                    Span::styled("★ ", theme::style_muted()),
+                    Span::styled(name.to_string(), theme::style_text()),
+                ]));
+            }
+            for bm in db.bookmarks.iter().take(4) {
+                let label = if bm.chars().count() > 40 {
+                    format!("{}…", bm.chars().take(39).collect::<String>())
+                } else {
+                    bm.clone()
+                };
+                right.push(Line::from(Span::styled(label, theme::style_faint())));
+            }
+        }
+    }
     frame.render_widget(Paragraph::new(right), body[1]);
 
     let foot = vec![Line::from(vec![
+        Span::styled("j/k", theme::style_text()),
+        Span::styled("  ·  ", theme::style_faint()),
+        Span::styled("Enter", theme::style_text()),
+        Span::styled(" open  ·  ", theme::style_faint()),
         Span::styled("1-9", theme::style_text()),
-        Span::styled(" source  ·  ", theme::style_faint()),
-        Span::styled("e", theme::style_text()),
-        Span::styled(" studio  ·  ", theme::style_faint()),
+        Span::styled("  ·  ", theme::style_faint()),
         Span::styled("a", theme::style_text()),
-        Span::styled(" connect  ·  ", theme::style_faint()),
+        Span::styled(" add  ·  ", theme::style_faint()),
+        Span::styled("p", theme::style_text()),
+        Span::styled(" pin  ·  ", theme::style_faint()),
+        Span::styled("r", theme::style_text()),
+        Span::styled(" health  ·  ", theme::style_faint()),
         Span::styled("c", theme::style_text()),
         Span::styled(" config  ·  ", theme::style_faint()),
         Span::styled("q", theme::style_text()),
@@ -2834,13 +2899,16 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
 fn render_db_home_status(frame: &mut Frame, area: Rect) {
     let line = Line::from(vec![
         Span::styled(
-            " DB Studio ",
+            " DB Home ",
             Style::default()
                 .fg(theme::bg())
                 .bg(theme::text())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  a connect  ·  e studio  ·  1-9 source  ·  q quit ", theme::style_faint()),
+        Span::styled(
+            "  j/k  ·  Enter open  ·  a add  ·  p pin  ·  r health  ·  q quit ",
+            theme::style_faint(),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(theme::bg())),

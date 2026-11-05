@@ -661,10 +661,23 @@ impl App {
         self.ui.product = ProductMode::Database;
         self.ui.db_surface = DbSurface::Home;
         self.ui.mode = Mode::Normal;
-        self.set_status("Database Home", false);
+        if let Some(id) = self.db.active_source.clone() {
+            if let Some(i) = self.db.sources.iter().position(|s| s.id == id) {
+                self.ui.home_selected = i.min(8);
+            }
+        }
+        let n = self.db.sources.len();
+        self.set_status(
+            if n == 0 {
+                "DB Home · a add connection".to_string()
+            } else {
+                format!("DB Home · {n} source(s) · Enter open · r health")
+            },
+            false,
+        );
     }
 
-    fn open_db_source_slot(&mut self, slot: u8) {
+    async fn open_db_source_slot(&mut self, slot: u8) {
         if slot == 0 || slot > 9 {
             return;
         }
@@ -673,11 +686,42 @@ impl App {
             self.set_status(format!("no source [{slot}]"), true);
             return;
         };
-        self.db.active_source = Some(src.id.clone());
-        let _ = self.db.save_sources();
-        self.db.rebuild_flat();
-        self.enter_db_studio();
-        self.set_status(format!("connected · {}", src.name), false);
+        self.ui.home_selected = idx;
+        self.set_status(format!("connecting · {}…", src.name), false);
+        match self.db.ensure_connected(&src.id, None).await {
+            Ok(()) => {
+                self.db.active_source = Some(src.id.clone());
+                let _ = self.db.save_sources();
+                self.db
+                    .connection_health
+                    .insert(src.id.clone(), ide_db::ConnHealth::ok_now());
+                self.db.rebuild_flat();
+                self.db.status = format!("connected · {}", src.name);
+                self.enter_db_studio();
+                self.set_status(format!("connected · {}", src.name), false);
+            }
+            Err(e) => {
+                self.db.connection_health.insert(
+                    src.id.clone(),
+                    ide_db::ConnHealth::Dead(format!("{e:#}")),
+                );
+                self.set_status(format!("connect failed · {}: {e:#}", src.name), true);
+            }
+        }
+    }
+
+    /// Home Enter: connect selected/active source, then open Studio.
+    async fn home_enter_studio(&mut self) {
+        if self.db.sources.is_empty() {
+            self.start_add_connection();
+            return;
+        }
+        let idx = self
+            .ui
+            .home_selected
+            .min(self.db.sources.len().saturating_sub(1));
+        let slot = (idx + 1) as u8;
+        self.open_db_source_slot(slot).await;
     }
 
     fn toggle_product_mode(&mut self) {
@@ -4039,7 +4083,7 @@ impl App {
                     self.open_home_slot(n).await?;
                 }
             }
-            Action::OpenDbSourceSlot(n) => self.open_db_source_slot(n),
+            Action::OpenDbSourceSlot(n) => self.open_db_source_slot(n).await,
             Action::OpenDatabase => self.enter_database_mode(),
             Action::RunQuery => self.run_query().await?,
             Action::ResultPageNext => match self.db.next_result_page().await {
@@ -5526,15 +5570,29 @@ pub async fn run(root: PathBuf) -> Result<()> {
         }
         Err(e) => warn!("git: {e:#}"),
     }
-    // db-studio: boot straight into Database Studio (no Code / Neovim).
+    // db-studio: entry Home (not Studio). Restore last source; soft health ping.
     app.ui.product = ProductMode::Database;
-    app.ui.db_surface = DbSurface::Studio;
+    app.ui.db_surface = DbSurface::Home;
     app.ui.focus = Focus::Database;
     app.ui.sidebar = Sidebar::Database;
     app.ui.show_sidebar = true;
     app.ui.show_outline = false;
     app.ui.mode = Mode::Normal;
-    app.set_status("DB Studio · 1 explorer · 2 structure · 3 console · 4 results", false);
+    if let Some(id) = app.db.active_source.clone() {
+        if let Some(i) = app.db.sources.iter().position(|s| s.id == id) {
+            app.ui.home_selected = i.min(8);
+        }
+    }
+    app.db.refresh_stale_health().await;
+    let n = app.db.sources.len();
+    app.set_status(
+        if n == 0 {
+            "DB Studio · a add connection".to_string()
+        } else {
+            format!("DB Home · {n} source(s) · Enter open · a connect · r health")
+        },
+        false,
+    );
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -6273,17 +6331,29 @@ async fn event_loop(
                             }
                         }
 
-                        // Database Home: 1-9 sources, e/Enter studio, a connect, c config
+                        // Database Home: j/k select · Enter/e connect→studio · 1-9 · a · r health · p pin
                         if app.ui.product == ProductMode::Database
                             && app.ui.db_surface == DbSurface::Home
                             && app.ui.mode == Mode::Normal
                             && !key.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.ui.home_selected =
+                                        app.ui.home_selected.saturating_sub(1);
+                                    continue;
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let max = app.db.sources.len().saturating_sub(1).min(8);
+                                    if app.ui.home_selected < max {
+                                        app.ui.home_selected += 1;
+                                    }
+                                    continue;
+                                }
                                 KeyCode::Char('e')
                                 | KeyCode::Char('E')
                                 | KeyCode::Enter => {
-                                    app.enter_db_studio();
+                                    app.home_enter_studio().await;
                                     continue;
                                 }
                                 KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -6294,9 +6364,32 @@ async fn event_loop(
                                     app.open_settings();
                                     continue;
                                 }
+                                KeyCode::Char('r') | KeyCode::Char('R') => {
+                                    app.set_status("refreshing health…", false);
+                                    app.db.mark_stale_health(0);
+                                    app.db.refresh_stale_health().await;
+                                    app.set_status("health refreshed", false);
+                                    continue;
+                                }
+                                KeyCode::Char('p') | KeyCode::Char('P') => {
+                                    let idx = app.ui.home_selected;
+                                    if let Some(id) =
+                                        app.db.sources.get(idx).map(|s| s.id.clone())
+                                    {
+                                        match app.db.toggle_pin_source(&id) {
+                                            Ok(_) => {
+                                                app.set_status(app.db.status.clone(), false)
+                                            }
+                                            Err(e) => {
+                                                app.set_status(format!("pin: {e:#}"), true)
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                                 KeyCode::Char(d) if d.is_ascii_digit() && d != '0' => {
                                     let n = d as u8 - b'0';
-                                    app.open_db_source_slot(n);
+                                    app.open_db_source_slot(n).await;
                                     continue;
                                 }
                                 _ => {}

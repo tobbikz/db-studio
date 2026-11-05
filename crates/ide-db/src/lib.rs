@@ -1268,6 +1268,15 @@ impl ConnHealth {
             checked_at_ms: now_millis(),
         }
     }
+
+    /// Short mono badge for Home / Explorer.
+    pub fn badge(&self) -> &'static str {
+        match self {
+            Self::Ok { .. } => "ok",
+            Self::Stale { .. } => "stale",
+            Self::Dead(_) => "dead",
+        }
+    }
 }
 
 fn now_millis() -> u128 {
@@ -1344,10 +1353,26 @@ impl DbWorkspace {
         if let Some(path) = sources_path() {
             if path.exists() {
                 if let Ok(text) = std::fs::read_to_string(&path) {
-                    if let Ok(sources) = toml::from_str::<SourcesFile>(&text) {
-                        ws.sources = sources.sources;
+                    if let Ok(file) = toml::from_str::<SourcesFile>(&text) {
+                        ws.sources = file.sources;
+                        if let Some(id) = file.active_source {
+                            if ws.sources.iter().any(|s| s.id == id) {
+                                ws.active_source = Some(id);
+                            }
+                        }
                     }
                 }
+            }
+        }
+        // Fallback: pinned first, else first source (name only — connect on Enter).
+        if ws.active_source.is_none() {
+            if let Some(s) = ws
+                .sources
+                .iter()
+                .find(|s| s.pinned)
+                .or_else(|| ws.sources.first())
+            {
+                ws.active_source = Some(s.id.clone());
             }
         }
         ws.history = load_query_history();
@@ -1368,7 +1393,10 @@ impl DbWorkspace {
         for s in &mut sources {
             s.password = secrets::store_password_for_save(&s.id, &s.password)?;
         }
-        let file = SourcesFile { sources };
+        let file = SourcesFile {
+            sources,
+            active_source: self.active_source.clone(),
+        };
         std::fs::write(path, toml::to_string_pretty(&file)?)?;
         Ok(())
     }
@@ -6083,7 +6111,10 @@ impl DbWorkspace {
             }
             sources.push(c);
         }
-        let file = SourcesFile { sources };
+        let file = SourcesFile {
+            sources,
+            active_source: self.active_source.clone(),
+        };
         std::fs::write(path, toml::to_string_pretty(&file)?)?;
         Ok(())
     }
@@ -9626,6 +9657,9 @@ fn row_preview(row: &[String], cols: &[String]) -> String {
 struct SourcesFile {
     #[serde(default)]
     sources: Vec<DataSource>,
+    /// Last active connection id (restored on boot).
+    #[serde(default)]
+    active_source: Option<String>,
 }
 
 pub fn default_brain_source() -> DataSource {
