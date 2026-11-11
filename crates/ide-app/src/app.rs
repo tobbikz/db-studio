@@ -34,8 +34,8 @@ use ide_term::TerminalPane;
 use ide_sessions::{ConnectOutcome, SessionManager};
 use ide_agents::AgentManager;
 use ide_ui::{
-    home_recent_slots, render, Action, DbConnectForm, HomeRecentSlot, Keymap, Palette, PaletteMode,
-    RenderCtx, StatusMessage, UiState,
+    home_recent_slots, render, Action, CreateObjectForm, CreateObjectKind, DbConnectForm,
+    HomeRecentSlot, Keymap, Palette, PaletteMode, RenderCtx, StatusMessage, UiState,
 };
 use lsp_types::{
     AnnotatedTextEdit, CodeActionOrCommand, Diagnostic, DocumentChangeOperation, DocumentChanges,
@@ -650,9 +650,38 @@ impl App {
     }
 
     fn open_create_menu(&mut self) {
+        if self.db.viewer_hides_ddl() {
+            self.set_status(
+                "Create DDL hidden — connection is viewer/read-only (Support: ask Admin)",
+                true,
+            );
+            return;
+        }
+        let driver = self
+            .db
+            .active_source
+            .as_ref()
+            .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
+            .map(|s| s.driver)
+            .or_else(|| {
+                self.db
+                    .flat
+                    .get(self.db.selected)
+                    .and_then(|e| {
+                        self.db
+                            .sources
+                            .iter()
+                            .find(|s| s.id == e.source_id)
+                            .map(|s| s.driver)
+                    })
+            })
+            .unwrap_or_default();
         self.ui.mode = Mode::Palette;
-        self.ui.palette = Palette::open_create();
-        self.set_status("Create · type to filter · Enter", false);
+        self.ui.palette = Palette::open_create_for(driver);
+        self.set_status(
+            format!("Create · {} · type to filter · Enter", driver.label()),
+            false,
+        );
     }
 
     fn open_search_everywhere(&mut self) {
@@ -961,8 +990,8 @@ impl App {
         self.refresh_queries_dir();
         self.db.rebuild_flat();
         self.db.prepare_studio_entry();
-        // Console first after connect — Explorer is one Tab away.
-        self.ui.focus = Focus::Editor;
+        // Explorer first — DataGrip-like: see connection + properties strip; Console is Tab/2/3.
+        self.ui.focus = Focus::Database;
         self.ui.mode = Mode::Normal;
         let conn = self
             .db
@@ -972,7 +1001,7 @@ impl App {
             .map(|s| s.name.as_str())
             .unwrap_or("—");
         self.set_status(
-            format!("Studio · {conn} · F5 run · Tab panes · 1 Explorer"),
+            format!("Studio · {conn} · p props · n New · 3 Console"),
             false,
         );
     }
@@ -1168,6 +1197,16 @@ impl App {
                 self.db.status = format!("connected · {}", src.name);
                 self.ui.busy_label = None;
                 self.enter_db_studio();
+                // Select active source in Explorer + fill Structure properties + gray strip.
+                if let Some(idx) = self
+                    .db
+                    .flat
+                    .iter()
+                    .position(|e| e.source_id == src.id && matches!(e.kind, DbNodeKind::Source))
+                {
+                    self.db.selected = idx;
+                }
+                let _ = self.db.refresh_structure_for_selection().await;
                 self.set_ok(format!("connected · {}", src.name));
             }
             Err(e) => {
@@ -1444,29 +1483,32 @@ impl App {
     async fn db_explorer_moved(&mut self, term_rows: u16) {
         self.db
             .ensure_explorer_visible(Self::explorer_view_h(term_rows));
-        // Surface connect failure when highlighting a dead source (!).
-        if let Some(entry) = self.db.flat.get(self.db.selected) {
-            if matches!(entry.kind, DbNodeKind::Source) {
-                if let Some(msg) = self
+        // Still refresh Structure (properties) even when the source has a connect error.
+        let connect_err: Option<(String, String)> =
+            self.db.flat.get(self.db.selected).and_then(|entry| {
+                if !matches!(entry.kind, DbNodeKind::Source) {
+                    return None;
+                }
+                let msg = self
                     .db
                     .connection_health
                     .get(&entry.source_id)
-                    .and_then(|h| h.error_message())
-                {
-                    let name = self
-                        .db
-                        .sources
-                        .iter()
-                        .find(|s| s.id == entry.source_id)
-                        .map(|s| s.name.as_str())
-                        .unwrap_or("source");
-                    self.set_status(format!("{name} · connect error · {msg}"), true);
-                    return;
-                }
-            }
-        }
+                    .and_then(|h| h.error_message())?
+                    .to_string();
+                let name = self
+                    .db
+                    .sources
+                    .iter()
+                    .find(|s| s.id == entry.source_id)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "source".into());
+                Some((name, msg))
+            });
         if let Err(e) = self.db.refresh_structure_for_selection().await {
             self.set_status(format!("structure: {e:#}"), true);
+        }
+        if let Some((name, msg)) = connect_err {
+            self.set_status(format!("{name} · connect error · {msg}"), true);
         }
     }
 
@@ -3113,7 +3155,141 @@ impl App {
         );
     }
 
+    fn open_create_object_modal(&mut self, id: &str) {
+        let Some(kind) = CreateObjectKind::from_id(id) else {
+            self.set_status(format!("unknown create kind: {id}"), true);
+            return;
+        };
+        let schema = self
+            .db
+            .active_schema
+            .clone()
+            .or_else(|| {
+                self.db
+                    .flat
+                    .get(self.db.selected)
+                    .and_then(|e| e.schema.clone())
+            })
+            .unwrap_or_else(|| "public".into());
+        let (default_owner, driver) = self
+            .db
+            .active_source
+            .as_ref()
+            .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
+            .map(|s| (s.user.clone(), s.driver))
+            .unwrap_or_default();
+        // Prefill schema.table for Index from Explorer table selection.
+        let mut form =
+            CreateObjectForm::fresh_with_owner(kind, &schema, &default_owner, driver);
+        if kind == CreateObjectKind::Index {
+            if let Some(e) = self.db.flat.get(self.db.selected) {
+                if matches!(e.kind, DbNodeKind::Table | DbNodeKind::View) {
+                    let sch = e.schema.as_deref().unwrap_or("public");
+                    let tbl = e.table.as_deref().unwrap_or(e.label.as_str());
+                    form.schema = format!("{sch}.{tbl}");
+                }
+            }
+        }
+        if matches!(
+            kind,
+            CreateObjectKind::Table
+                | CreateObjectKind::View
+                | CreateObjectKind::MaterializedView
+                | CreateObjectKind::Sequence
+        ) {
+            if let Some(e) = self.db.flat.get(self.db.selected) {
+                if let Some(sch) = e.schema.as_deref() {
+                    form.schema = sch.to_string();
+                } else if matches!(e.kind, DbNodeKind::Schema) {
+                    form.schema = e.label.clone();
+                }
+            }
+        }
+        self.ui.create_object_form = form;
+        self.ui.mode = Mode::CreateObject;
+        self.set_status(
+            format!("{} — Tab fields · Enter create · Esc", kind.title()),
+            false,
+        );
+    }
+
+    async fn confirm_create_object(&mut self) -> Result<()> {
+        let form = self.ui.create_object_form.clone();
+        let sql = match form.to_sql() {
+            Ok(s) => s,
+            Err(e) => {
+                self.ui.create_object_form.feedback = Some((e.clone(), true));
+                self.set_status(format!("create: {e}"), true);
+                return Ok(());
+            }
+        };
+        self.ui.create_object_form.feedback = Some(("creating…".into(), false));
+        match self.db.execute_sql_text(&sql).await {
+            Ok(()) => {
+                let kind = form.kind.title();
+                self.ui.mode = Mode::Normal;
+                self.ui.focus = Focus::Database;
+                // Reload catalogs so the new object appears in Explorer.
+                if let Some(sid) = self.db.active_source.clone() {
+                    let _ = self.db.ensure_connected(&sid, None).await;
+                    self.db.rebuild_flat();
+                }
+                self.set_ok(format!("{kind} · created · Explorer refreshed"));
+            }
+            Err(e) => {
+                let text = format!("{e:#}");
+                let shown = Self::human_err(&text);
+                self.ui.create_object_form.feedback = Some((shown.clone(), true));
+                self.set_status(format!("create failed: {text}"), true);
+            }
+        }
+        Ok(())
+    }
+
+    /// `p` / `e` — DataGrip-like properties for the Explorer selection.
+    async fn open_object_properties(&mut self) {
+        let entry = if self.ui.focus == Focus::Database {
+            self.db.flat.get(self.db.selected).cloned()
+        } else {
+            None
+        };
+        let Some(entry) = entry else {
+            if let Some(id) = self.db.active_source.clone() {
+                self.start_edit_connection(&id);
+            } else {
+                self.set_status("select a connection in Explorer · p properties", true);
+            }
+            return;
+        };
+        match entry.kind {
+            DbNodeKind::Source => {
+                self.start_edit_connection(&entry.source_id);
+            }
+            DbNodeKind::Database | DbNodeKind::Schema | DbNodeKind::Table | DbNodeKind::View => {
+                if let Err(e) = self.db.refresh_structure_for_selection().await {
+                    self.set_status(format!("properties: {e:#}"), true);
+                } else {
+                    self.ui.focus = Focus::Structure;
+                    self.set_status(
+                        "properties · Structure · n New to create · Esc Explorer",
+                        false,
+                    );
+                }
+            }
+            _ => {
+                if let Err(e) = self.db.refresh_structure_for_selection().await {
+                    self.set_status(format!("properties: {e:#}"), true);
+                } else {
+                    self.ui.focus = Focus::Structure;
+                    self.set_status("properties · n New create DB/user/table", false);
+                }
+            }
+        }
+    }
+
     fn data_source_from_form(form: &DbConnectForm, edit_id: Option<&str>) -> Result<DataSource> {
+        // Role=admin always wins over Read-only — otherwise CREATE looks broken.
+        let read_only = form.read_only && !form.role.allows_admin();
         let name = if form.name.trim().is_empty() {
             match form.driver {
                 DbDriver::Sqlite => {
@@ -3166,7 +3342,7 @@ impl App {
                     ssl_mode: form.ssl_mode.trim().to_string(),
                     ssl_trust_cert: form.ssl_trust_cert,
                     ssl_ca: form.ssl_ca.trim().into(),
-                    read_only: form.read_only,
+                    read_only,
                     role: form.role,
                     group: form.group.trim().into(),
                     accent: form.accent.trim().into(),
@@ -3202,7 +3378,7 @@ impl App {
                     ssl_mode: form.ssl_mode.trim().to_string(),
                     ssl_trust_cert: form.ssl_trust_cert,
                     ssl_ca: form.ssl_ca.trim().into(),
-                    read_only: form.read_only,
+                    read_only,
                     role: form.role,
                     group: form.group.trim().into(),
                     accent: form.accent.trim().into(),
@@ -3240,7 +3416,7 @@ impl App {
                     ssl_mode: form.ssl_mode.trim().to_string(),
                     ssl_trust_cert: form.ssl_trust_cert,
                     ssl_ca: form.ssl_ca.trim().into(),
-                    read_only: form.read_only,
+                    read_only,
                     role: form.role,
                     group: form.group.trim().into(),
                     accent: form.accent.trim().into(),
@@ -3281,7 +3457,7 @@ impl App {
                     ssl_mode: form.ssl_mode.trim().to_string(),
                     ssl_trust_cert: form.ssl_trust_cert,
                     ssl_ca: form.ssl_ca.trim().into(),
-                    read_only: form.read_only,
+                    read_only,
                     role: form.role,
                     group: form.group.trim().into(),
                     accent: form.accent.trim().into(),
@@ -4302,6 +4478,7 @@ impl App {
                 Mode::Replace => self.confirm_replace().await?,
                 Mode::Commit => self.confirm_git_commit().await?,
                 Mode::DbConnect => self.confirm_db_connect().await?,
+                Mode::CreateObject => self.confirm_create_object().await?,
                 Mode::OpenFolder => self.confirm_open_folder().await?,
                 Mode::ImportCsv => self.confirm_import_csv().await?,
                 Mode::RestoreDump => self.confirm_restore_dump().await?,
@@ -4605,6 +4782,9 @@ impl App {
                 }
                 Mode::DbConnect => {
                     self.ui.db_connect_form.backspace();
+                }
+                Mode::CreateObject => {
+                    self.ui.create_object_form.backspace();
                 }
                 Mode::OpenFolder => {
                     self.ui.open_folder_input.pop();
@@ -5087,21 +5267,8 @@ impl App {
                 self.set_status("cancelling query…", false);
             },
             Action::AddDataSource => self.start_add_connection(),
-            Action::EditDataSource => {
-                if self.ui.focus == Focus::Database {
-                    if let Some(entry) = self.db.flat.get(self.db.selected) {
-                        if matches!(entry.kind, DbNodeKind::Source) {
-                            let source_id = entry.source_id.clone();
-                            self.start_edit_connection(&source_id);
-                        } else {
-                            self.set_status("select a connection (source) in Explorer", true);
-                        }
-                    }
-                } else if let Some(id) = self.db.active_source.clone() {
-                    self.start_edit_connection(&id);
-                } else {
-                    self.set_status("select a connection in Explorer first", true);
-                }
+            Action::EditDataSource | Action::ObjectProperties => {
+                self.open_object_properties().await;
             }
             Action::DbConnectTest => {
                 let form = self.ui.db_connect_form.clone();
@@ -5147,6 +5314,27 @@ impl App {
                     self.cycle_table_filter_field(false);
                 } else {
                     self.ui.db_connect_form.prev_field();
+                }
+            }
+            Action::CreateObjectNextField => {
+                let form = &mut self.ui.create_object_form;
+                if form.on_add_button() {
+                    form.add_column();
+                } else {
+                    form.next_field();
+                }
+            }
+            Action::CreateObjectPrevField => self.ui.create_object_form.prev_field(),
+            Action::CreateObjectToggleFlag => {
+                let form = &mut self.ui.create_object_form;
+                if form.on_flag_like_field() {
+                    form.nudge_flag(true);
+                }
+            }
+            Action::CreateObjectNudgeBack => {
+                let form = &mut self.ui.create_object_form;
+                if form.on_flag_like_field() {
+                    form.nudge_flag(false);
                 }
             }
             Action::DbConnectDriverNext => {
@@ -5274,7 +5462,10 @@ impl App {
                 self.ui.focus = Focus::Results;
                 self.ui.mode = Mode::Normal;
                 if self.ui.product == ProductMode::Database {
-                    self.set_status("Results focused · hjkl cells · i edit · Ctrl-S apply", false);
+                    self.set_status(
+                        "Results focused · ←↑↓→ cells · i edit · Ctrl-S apply",
+                        false,
+                    );
                 }
             }
             Action::NextBranch => {
@@ -6053,19 +6244,45 @@ impl App {
             "console_database" => self.open_console_database_palette().await,
             "console_schema" => self.open_console_schema_palette().await,
             "search_everywhere" => self.open_search_everywhere(),
-            id @ ("create_query"
-            | "create_schema"
-            | "create_table"
-            | "create_view"
-            | "create_index"
-            | "create_role"
-            | "create_database") => match self.db.open_create_stub(id) {
+            "create_query" => match self.db.open_create_stub("create_query") {
                 Ok(()) => {
                     self.ui.focus = Focus::Editor;
-                    self.set_status(self.db.status.clone(), false);
+                    self.ui.mode = Mode::Insert;
+                    self.set_status("new query console", false);
                 }
                 Err(e) => self.set_status(format!("create: {e:#}"), true),
             },
+            id @ ("create_schema"
+            | "create_table"
+            | "create_view"
+            | "create_matview"
+            | "create_index"
+            | "create_sequence"
+            | "create_extension"
+            | "create_role"
+            | "create_policy"
+            | "create_function"
+            | "create_publication"
+            | "create_tablespace"
+            | "create_database") => {
+                let driver = self
+                    .db
+                    .active_source
+                    .as_ref()
+                    .and_then(|sid| self.db.sources.iter().find(|s| s.id == *sid))
+                    .map(|s| s.driver)
+                    .unwrap_or_default();
+                if let Some(kind) = CreateObjectKind::from_id(id) {
+                    if !ide_ui::create_dialect_supports(driver, kind) {
+                        self.set_status(
+                            format!("{} not available on {}", kind.title(), driver.label()),
+                            true,
+                        );
+                        return Ok(());
+                    }
+                }
+                self.open_create_object_modal(id);
+            }
             "pin_connection" => {
                 let Some(id) = self.selected_connection_id() else {
                     self.set_status("select a connection first", true);
@@ -6137,6 +6354,414 @@ impl App {
                 });
                 self.ui.focus = Focus::Results;
                 self.set_status("studio help", false);
+            }
+            "onboarding_tips" => {
+                self.db.show_text_result("tips", ide_db::onboarding_tips());
+                self.ui.focus = Focus::Results;
+            }
+            "recipe_gallery" => {
+                let text = self.db.list_recipes_text();
+                self.db.show_text_result("recipes", &text);
+                self.ui.focus = Focus::Results;
+            }
+            "recipe_top_customers" => {
+                let _ = self.db.insert_recipe("top_customers");
+                self.set_status(self.db.status.clone(), false);
+            }
+            "recipe_revenue_by_day" => {
+                let _ = self.db.insert_recipe("revenue_by_day");
+                self.set_status(self.db.status.clone(), false);
+            }
+            "recipe_stratified_sample" => {
+                let _ = self.db.insert_recipe("stratified_sample");
+                self.set_status(self.db.status.clone(), false);
+            }
+            "recipe_embedding_similarity" => {
+                let _ = self.db.insert_recipe("embedding_similarity");
+                self.set_status(self.db.status.clone(), false);
+            }
+            "recipe_feature_table" => {
+                let _ = self.db.insert_recipe("feature_table");
+                self.set_status(self.db.status.clone(), false);
+            }
+            "recipe_batch_score" => {
+                let _ = self.db.insert_recipe("batch_score");
+                self.set_status(self.db.status.clone(), false);
+            }
+            "chart_bar" | "chart_line" | "chart_pie" => {
+                let kind = item.id.strip_prefix("chart_").unwrap_or("bar");
+                match self.db.chart_last_result_kind(kind) {
+                    Ok(c) => {
+                        self.set_status(format!("chart {kind}"), false);
+                        let _ = c;
+                        self.ui.focus = Focus::Results;
+                    }
+                    Err(e) => self.set_status(format!("chart: {e:#}"), true),
+                }
+            }
+            "export_result_pack" => match self.db.export_explore_pack() {
+                Ok(p) => self.set_status(format!("pack → {}", p.display()), false),
+                Err(e) => self.set_status(format!("pack: {e:#}"), true),
+            },
+            "quality_strip" => match self.db.show_quality_strip() {
+                Ok(()) => self.ui.focus = Focus::Results,
+                Err(e) => self.set_status(format!("quality: {e:#}"), true),
+            },
+            "toggle_mask_pii" => {
+                let on = self.db.toggle_mask_pii();
+                self.set_status(if on { "PII mask ON" } else { "PII mask OFF" }, false);
+            }
+            "privilege_audit" => {
+                let role = self
+                    .db
+                    .active_source
+                    .as_ref()
+                    .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
+                    .map(|s| s.user.clone())
+                    .unwrap_or_else(|| "public".into());
+                let driver = self
+                    .db
+                    .active_source
+                    .as_ref()
+                    .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
+                    .map(|s| s.driver)
+                    .unwrap_or_default();
+                match ide_db::privilege_audit_sql(driver, &role) {
+                    Ok(sql) => {
+                        self.db.sql = sql;
+                        self.set_status(
+                            format!("privilege audit SQL for {role} — F5 to run"),
+                            false,
+                        );
+                    }
+                    Err(e) => self.set_status(format!("audit: {e:#}"), true),
+                }
+            }
+            "export_audit_csv" => {
+                let path = self.workspace.root.join("queries").join("audit_export.csv");
+                match ide_db::audit_export_csv(&path) {
+                    Ok(()) => self.set_status(format!("audit → {}", path.display()), false),
+                    Err(e) => self.set_status(format!("audit csv: {e:#}"), true),
+                }
+            }
+            "diagnose_pack" => {
+                let (schema, table) = self
+                    .db
+                    .last_result
+                    .as_ref()
+                    .map(|r| {
+                        (
+                            r.source_schema.clone().unwrap_or_else(|| "public".into()),
+                            r.source_table.clone().unwrap_or_else(|| "table".into()),
+                        )
+                    })
+                    .unwrap_or_else(|| ("public".into(), "table".into()));
+                let explain = self
+                    .db
+                    .last_explain
+                    .clone()
+                    .unwrap_or_else(|| "(run Ctrl-E EXPLAIN first)".into());
+                let stats = self
+                    .db
+                    .last_result
+                    .as_ref()
+                    .map(ide_db::quality_strip)
+                    .unwrap_or_else(|| "(no results)".into());
+                let pack = ide_db::diagnose_pack_template(&schema, &table, &explain, &stats);
+                let path = self
+                    .workspace
+                    .root
+                    .join("queries")
+                    .join(format!("diagnose-{schema}-{table}.txt"));
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::write(&path, &pack) {
+                    Ok(()) => {
+                        self.db.show_text_result("diagnose", &pack);
+                        self.ui.focus = Focus::Results;
+                        self.set_status(format!("diagnose pack → {}", path.display()), false);
+                    }
+                    Err(e) => self.set_status(format!("diagnose: {e:#}"), true),
+                }
+            }
+            "lineage_sketch" => {
+                let focus = self
+                    .db
+                    .last_result
+                    .as_ref()
+                    .and_then(|r| r.source_table.clone())
+                    .unwrap_or_default();
+                let edges = match self.db.er_sketch_active_schema().await {
+                    Ok(sketch) => ide_db::parse_er_edges(&sketch),
+                    Err(_) => Vec::new(),
+                };
+                let text = ide_db::lineage_from_er(&edges, &focus);
+                self.db.show_text_result("lineage", &text);
+                self.ui.focus = Focus::Results;
+            }
+            "cdc_lag" => {
+                let driver = self
+                    .db
+                    .active_source
+                    .as_ref()
+                    .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
+                    .map(|s| s.driver)
+                    .unwrap_or_default();
+                match ide_db::cdc_lag_sql(driver) {
+                    Ok(sql) => {
+                        self.db.sql = sql.to_string();
+                        self.set_status("CDC lag SQL loaded — F5", false);
+                    }
+                    Err(e) => self.set_status(format!("cdc: {e:#}"), true),
+                }
+            }
+            "dbt_detect" => {
+                match ide_db::detect_dbt_project(&self.workspace.root) {
+                    Some(p) => self.set_status(format!("dbt project: {}", p.display()), false),
+                    None => self.set_status("no dbt_project.yml above workspace root", true),
+                }
+            }
+            "dbt_run" | "dbt_test" | "dbt_compile" => {
+                let sub = item.id.strip_prefix("dbt_").unwrap_or("run");
+                match ide_db::detect_dbt_project(&self.workspace.root) {
+                    Some(p) => {
+                        let cmd = ide_db::dbt_command(&p, sub, None);
+                        self.db.sql = format!("-- Agents / Terminal recipe:\n-- {cmd}\n");
+                        self.set_status(
+                            format!("dbt {sub} recipe ready — Agents → dbt shell or Terminal"),
+                            false,
+                        );
+                    }
+                    None => self.set_status("dbt project not found", true),
+                }
+            }
+            "dbt_schema_stubs" => {
+                let path = ide_db::detect_dbt_project(&self.workspace.root)
+                    .map(|p| p.join("models").join("schema.yml"))
+                    .unwrap_or_else(|| self.workspace.root.join("models/schema.yml"));
+                match ide_db::parse_dbt_schema_yml(&path) {
+                    Ok(text) => {
+                        self.db.show_text_result("dbt_yml", &text);
+                        self.ui.focus = Focus::Results;
+                    }
+                    Err(e) => self.set_status(format!("dbt yml: {e:#}"), true),
+                }
+            }
+            "airflow_link" => match ide_db::airflow_deep_link(&self.db.persona) {
+                Ok(url) => {
+                    self.db.show_text_result("airflow", &format!("Open: {url}\n"));
+                    self.ui.focus = Focus::Results;
+                    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                    self.set_status(url, false);
+                }
+                Err(e) => self.set_status(format!("airflow: {e:#}"), true),
+            },
+            "bi_deeplink" => {
+                let schema = self
+                    .db
+                    .last_result
+                    .as_ref()
+                    .and_then(|r| r.source_schema.clone())
+                    .unwrap_or_else(|| "public".into());
+                let table = self
+                    .db
+                    .last_result
+                    .as_ref()
+                    .and_then(|r| r.source_table.clone())
+                    .unwrap_or_else(|| "table".into());
+                match ide_db::bi_deep_link(&self.db.persona, &schema, &table) {
+                    Ok(url) => {
+                        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                        self.set_status(url, false);
+                    }
+                    Err(e) => self.set_status(format!("bi: {e:#}"), true),
+                }
+            }
+            "bi_export_csv" => {
+                let dir = if self.db.persona.bi_export_dir.is_empty() {
+                    self.workspace.root.join("bi_export")
+                } else {
+                    PathBuf::from(&self.db.persona.bi_export_dir)
+                };
+                match self.db.export_explore_pack() {
+                    Ok(p) => self.set_status(
+                        format!("BI export pack {} (configure bi_export_dir={})", p.display(), dir.display()),
+                        false,
+                    ),
+                    Err(e) => self.set_status(format!("bi export: {e:#}"), true),
+                }
+            }
+            "model_registry_link" => match ide_db::model_registry_link(&self.db.persona) {
+                Ok(url) => {
+                    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                    self.set_status(url, false);
+                }
+                Err(e) => self.set_status(format!("registry: {e:#}"), true),
+            },
+            "codegen_rust" => match self.db.codegen_from_structure("rust") {
+                Ok(code) => {
+                    self.db.show_text_result("codegen", &code);
+                    self.ui.focus = Focus::Results;
+                }
+                Err(e) => self.set_status(format!("codegen: {e:#}"), true),
+            },
+            "codegen_ts" => match self.db.codegen_from_structure("ts") {
+                Ok(code) => {
+                    self.db.show_text_result("codegen", &code);
+                    self.ui.focus = Focus::Results;
+                }
+                Err(e) => self.set_status(format!("codegen: {e:#}"), true),
+            },
+            "seed_fixtures" => {
+                let dir = self.workspace.root.join("testdata");
+                let mut n = 0usize;
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        if p.extension().and_then(|s| s.to_str()) == Some("sql") {
+                            if let Ok(sql) = std::fs::read_to_string(&p) {
+                                self.db.sql = sql;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                if n == 0 {
+                    self.set_status(
+                        format!("no *.sql in {} — add fixtures then re-run", dir.display()),
+                        true,
+                    );
+                } else {
+                    self.set_status(
+                        format!("loaded last of {n} fixture(s) from testdata/ — F5 to apply"),
+                        false,
+                    );
+                }
+            }
+            "golden_diff" => {
+                let golden = self
+                    .workspace
+                    .root
+                    .join("testdata")
+                    .join("golden")
+                    .join("latest.csv");
+                match self.db.last_result.as_ref() {
+                    Some(r) => match ide_db::golden_diff(r, &golden) {
+                        Ok(msg) => {
+                            self.db.show_text_result("golden", &msg);
+                            self.ui.focus = Focus::Results;
+                        }
+                        Err(e) => self.set_status(format!("golden: {e:#}"), true),
+                    },
+                    None => self.set_status("run a query first", true),
+                }
+            }
+            "fanout_assert" => {
+                // Compare last result rowcount to itself as placeholder when multi-pin unavailable.
+                let n = self
+                    .db
+                    .last_result
+                    .as_ref()
+                    .map(|r| r.rows.len())
+                    .unwrap_or(0);
+                let msg = ide_db::fanout_rowcount_assert(&[
+                    ("active".into(), n),
+                    ("pinned-check".into(), n),
+                ]);
+                self.db.show_text_result("fanout", &msg);
+                self.ui.focus = Focus::Results;
+            }
+            "explain_cost" => {
+                let text = self
+                    .db
+                    .last_explain
+                    .as_deref()
+                    .unwrap_or("(no EXPLAIN — Ctrl-E first)");
+                let msg = ide_db::explain_cost_hint(text);
+                self.db.show_text_result("cost", &msg);
+                self.ui.focus = Focus::Results;
+            }
+            "schema_adr_stub" => {
+                let note = format!(
+                    "# Schema ADR stub\n\n## Context\nSchema change in workspace {}\n\n## Decision\nTBD\n\n## Consequences\nTBD\n",
+                    self.workspace.root.display()
+                );
+                let path = self
+                    .workspace
+                    .root
+                    .join("queries")
+                    .join("schema-adr-stub.md");
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, &note);
+                self.db.show_text_result("adr", &note);
+                self.ui.focus = Focus::Results;
+                self.set_status(
+                    format!("ADR stub → {} (or brain decide)", path.display()),
+                    false,
+                );
+            }
+            "naming_hint" => {
+                let driver = self
+                    .db
+                    .active_source
+                    .as_ref()
+                    .and_then(|id| self.db.sources.iter().find(|s| s.id == *id))
+                    .map(|s| s.driver)
+                    .unwrap_or_default();
+                let name = self
+                    .db
+                    .last_result
+                    .as_ref()
+                    .and_then(|r| r.source_table.clone())
+                    .unwrap_or_else(|| "CustomerOrder".into());
+                let hint = ide_db::naming_hint(driver, &name);
+                self.db.show_text_result("naming", &hint);
+                self.ui.focus = Focus::Results;
+            }
+            "health_webhook" => {
+                let url = self.db.persona.health_webhook_url.clone();
+                match ide_db::post_health_webhook(&url, "db-studio health check fail test") {
+                    Ok(()) => self.set_status("webhook POST ok", false),
+                    Err(e) => self.set_status(format!("webhook: {e:#}"), true),
+                }
+            }
+            "signed_conn_pack" => {
+                let path = self
+                    .workspace
+                    .root
+                    .join("queries")
+                    .join("connections.signed.toml");
+                match self.db.export_connection_pack(&path) {
+                    Ok(()) => {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            let signed = path.with_extension("signed.toml");
+                            match ide_db::signed_pack_export(&text, &signed) {
+                                Ok(()) => {
+                                    self.set_status(format!("signed pack → {}", signed.display()), false)
+                                }
+                                Err(e) => self.set_status(format!("sign: {e:#}"), true),
+                            }
+                        }
+                    }
+                    Err(e) => self.set_status(format!("pack: {e:#}"), true),
+                }
+            }
+            "agents_ask_sql" => {
+                if let Some(idx) = self
+                    .agents
+                    .profiles
+                    .iter()
+                    .position(|p| p.name.contains("Ask → SQL"))
+                {
+                    self.agents.selected = idx;
+                }
+                self.set_status(
+                    "Agents: Ask → SQL selected — open Agents tab and launch (confirm before run)",
+                    false,
+                );
             }
             "code_help" => {
                 if self.nvim_active() {
@@ -6365,6 +6990,20 @@ impl App {
                     self.set_status(self.db.status.clone(), false);
                 }
             }
+            "inspect_privileges" => match self.db.inspect_table_privileges().await {
+                Ok(()) => {
+                    self.ui.focus = Focus::Results;
+                    self.set_status(self.db.status.clone(), false);
+                }
+                Err(e) => self.set_status(format!("privileges: {e:#}"), true),
+            },
+            "inspect_policies" => match self.db.inspect_rls_policies().await {
+                Ok(()) => {
+                    self.ui.focus = Focus::Results;
+                    self.set_status(self.db.status.clone(), false);
+                }
+                Err(e) => self.set_status(format!("policies: {e:#}"), true),
+            },
             "timing_histogram" => self.show_timing_histogram(),
             "db_object_search" => self.open_db_object_palette(),
             "add_brain" => {
@@ -7542,7 +8181,7 @@ async fn event_loop(
                             }
                         }
 
-                        // Database Home: A add · W workspaces only
+                        // Database Home: source list · Enter open · A add · W workspaces
                         if app.ui.product == ProductMode::Database
                             && app.ui.db_surface == DbSurface::Home
                             && app.ui.mode == Mode::Normal
@@ -7550,6 +8189,7 @@ async fn event_loop(
                             && !key.modifiers.contains(KeyModifiers::SUPER)
                         {
                             app.ui.home_pane = ide_ui::HomePane::Sources;
+                            let n_sources = app.db.sources.len();
                             match key.code {
                                 KeyCode::Char('?') => {
                                     app.ui.show_help = !app.ui.show_help;
@@ -7564,31 +8204,34 @@ async fn event_loop(
                                     continue;
                                 }
                                 KeyCode::Up | KeyCode::Left => {
-                                    app.ui.home_selected =
-                                        app.ui.home_selected.saturating_sub(1).min(1);
+                                    if n_sources > 0 {
+                                        app.ui.home_selected =
+                                            app.ui.home_selected.saturating_sub(1);
+                                    }
                                     continue;
                                 }
                                 KeyCode::Down | KeyCode::Right => {
-                                    if app.ui.home_selected < 1 {
-                                        app.ui.home_selected = 1;
+                                    if n_sources > 0 {
+                                        let max = n_sources.saturating_sub(1);
+                                        if app.ui.home_selected < max {
+                                            app.ui.home_selected += 1;
+                                        }
                                     }
                                     continue;
                                 }
                                 KeyCode::Enter => {
-                                    if app.ui.home_selected >= 1 {
-                                        app.open_db_workspaces_palette();
-                                    } else {
+                                    if n_sources == 0 {
                                         app.start_add_connection();
+                                    } else {
+                                        app.home_enter_studio().await;
                                     }
                                     continue;
                                 }
                                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                                    app.ui.home_selected = 0;
                                     app.start_add_connection();
                                     continue;
                                 }
                                 KeyCode::Char('w') | KeyCode::Char('W') => {
-                                    app.ui.home_selected = 1;
                                     app.open_db_workspaces_palette();
                                     continue;
                                 }
@@ -7931,7 +8574,7 @@ async fn event_loop(
                                 }
                                 KeyCode::Char('4') if !ctrl && app.ui.mode == Mode::Normal => {
                                     app.focus_db_pane(4);
-                                    app.set_status("4 Results · hjkl · i edit", false);
+                                    app.set_status("4 Results · ←↑↓→ · i edit · D density", false);
                                     continue;
                                 }
                                 _ => {}
@@ -8045,6 +8688,47 @@ async fn event_loop(
                                     } else {
                                         app.ui.db_connect_form.push_char(c);
                                     }
+                                }
+                            }
+                            Mode::CreateObject => {
+                                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                    // reserved
+                                } else if let KeyCode::Char(c) = key.code {
+                                    let form = &mut app.ui.create_object_form;
+                                    let on_add = form.on_add_button();
+                                    let on_flag = form.on_flag_like_field();
+                                    let typing = form.active_mut().is_some();
+                                    if form.kind == CreateObjectKind::Table
+                                        && !typing
+                                        && matches!(c, '+' | 'a' | 'A')
+                                    {
+                                        form.add_column();
+                                    } else if on_add && matches!(c, '+' | 'a' | 'A' | ' ') {
+                                        form.add_column();
+                                    } else if form.kind == CreateObjectKind::Table
+                                        && matches!(c, 'x' | 'X')
+                                        && !typing
+                                    {
+                                        form.remove_column();
+                                    } else if on_flag && (c == ' ' || c == 'y' || c == 'n') {
+                                        if matches!(
+                                            form.kind,
+                                            CreateObjectKind::Table
+                                                | CreateObjectKind::Schema
+                                                | CreateObjectKind::View
+                                                | CreateObjectKind::MaterializedView
+                                        ) {
+                                            form.toggle_flag();
+                                        } else if c == 'y' || c == 'n' {
+                                            form.set_bool_field(c == 'y');
+                                        } else {
+                                            form.toggle_flag();
+                                        }
+                                    } else if typing {
+                                        form.push_char(c);
+                                    }
+                                } else if key.code == KeyCode::Delete {
+                                    app.ui.create_object_form.remove_column();
                                 }
                             }
                             Mode::OpenFolder => {

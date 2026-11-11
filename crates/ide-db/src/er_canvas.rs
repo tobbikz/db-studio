@@ -38,9 +38,10 @@ pub fn render_er_canvas(schema: &str, edges: &[(String, String, String, String)]
         }
         out.push_str(&format!("└{bar}┘\n\n"));
     }
-    out.push_str("Edges:\n");
+    out.push_str("Edges (FK · cardinality N:1 child→parent):\n");
     for (t, c, rt, rc) in edges {
-        out.push_str(&format!("  {t}.{c} ──► {rt}.{rc}\n"));
+        out.push_str(&format!("  {t}.{c} ──N:1──► {rt}.{rc}  (FK)\n"));
+        out.push_str(&format!("    PK side: {rt}.{rc} · FK side: {t}.{c}\n"));
     }
     out
 }

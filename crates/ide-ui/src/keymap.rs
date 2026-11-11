@@ -27,6 +27,7 @@ pub enum KeyContext {
     Replace,
     Commit,
     DbConnect,
+    CreateObject,
     EditCell,
     EditTableFilter,
     Settings,
@@ -149,6 +150,8 @@ pub enum Action {
     RunQuery,
     AddDataSource,
     EditDataSource,
+    /// Explorer `p` — connection/object properties (DataGrip-like).
+    ObjectProperties,
     Find,
     FindNext,
     FindPrev,
@@ -220,6 +223,11 @@ pub enum Action {
     OpenConsoleSchema,
     /// Cycle auto SELECT LIMIT preset (50/100/200/500/off).
     CycleSelectLimit,
+    CreateObjectNextField,
+    CreateObjectPrevField,
+    CreateObjectToggleFlag,
+    /// Left on type/flags: cycle type backward or toggle the same as Right for bools.
+    CreateObjectNudgeBack,
 }
 
 pub struct Keymap;
@@ -236,6 +244,7 @@ impl Keymap {
             Mode::Replace => KeyContext::Replace,
             Mode::Commit => KeyContext::Commit,
             Mode::DbConnect => KeyContext::DbConnect,
+            Mode::CreateObject => KeyContext::CreateObject,
             Mode::EditCell => KeyContext::EditCell,
             Mode::Settings => KeyContext::Settings,
             Mode::OpenFolder => KeyContext::OpenFolder,
@@ -447,6 +456,18 @@ impl Keymap {
                 (_, _, KeyCode::Left) => Some(Action::DbConnectDriverPrev),
                 _ => None,
             },
+            KeyContext::CreateObject => match (ctrl, shift, key.code) {
+                (_, _, KeyCode::Esc) => Some(Action::Cancel),
+                (_, _, KeyCode::Enter) => Some(Action::Confirm),
+                (_, _, KeyCode::Backspace) => Some(Action::Backspace),
+                (_, _, KeyCode::Tab) | (_, _, KeyCode::Down) => Some(Action::CreateObjectNextField),
+                (_, true, KeyCode::BackTab) | (_, _, KeyCode::Up) => {
+                    Some(Action::CreateObjectPrevField)
+                }
+                (_, _, KeyCode::Right) => Some(Action::CreateObjectToggleFlag),
+                (_, _, KeyCode::Left) => Some(Action::CreateObjectNudgeBack),
+                _ => None,
+            },
             KeyContext::Palette | KeyContext::Search => match key.code {
                 KeyCode::Esc => Some(Action::Cancel),
                 KeyCode::Enter => Some(Action::Confirm),
@@ -475,6 +496,7 @@ impl Keymap {
                 (false, false, KeyCode::Char('3')) => Some(Action::FocusResults),
                 (false, false, KeyCode::Char('r')) => Some(Action::RefreshTree),
                 (false, false, KeyCode::Char('e')) => Some(Action::EditDataSource),
+                (false, false, KeyCode::Char('p')) => Some(Action::ObjectProperties),
                 (false, false, KeyCode::Char('d')) => Some(Action::GoToDdl),
                 (false, false, KeyCode::Char('n')) => Some(Action::OpenCreateMenu),
                 (false, false, KeyCode::Char('b')) => Some(Action::OpenConsoleDatabase),

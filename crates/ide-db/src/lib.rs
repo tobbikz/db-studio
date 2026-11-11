@@ -9,6 +9,7 @@ mod er_canvas;
 mod explain_format;
 mod http_engines;
 mod oauth;
+mod persona;
 mod query_params;
 mod query_paging;
 mod result_chart;
@@ -28,6 +29,14 @@ pub use query_params::{query_param_prompt_seed, sql_has_query_params, substitute
 pub use query_paging::{
     has_limit_clause, next_select_limit_preset, paginate_select_sql, MAX_FETCH_ROWS,
     RESULT_PAGE_SIZE,
+};
+pub use persona::{
+    audit_append, audit_export_csv, chart_typed, codegen_struct, cdc_lag_sql, detect_dbt_project,
+    diagnose_pack_template, dbt_command, ensure_recipe_snippets, explain_cost_hint,
+    export_result_pack, fanout_rowcount_assert, golden_diff, is_destructive_ddl, lineage_from_er,
+    mask_pii_cell, mask_result, naming_hint, onboarding_tips, parse_dbt_schema_yml,
+    post_health_webhook, privilege_audit_sql, quality_strip, recipe_gallery, signed_pack_export,
+    studio_help_personas, bi_deep_link, airflow_deep_link, model_registry_link, PersonaConfig,
 };
 pub use result_chart::chart_result;
 pub use schema_cache::{expecting_relation, SchemaNameCache, SqlCompletionItem};
@@ -1325,6 +1334,8 @@ pub struct DbWorkspace {
     pub health_activity_auto_refresh: bool,
     /// Queued DELETE statements from Results row deletes (applied with Ctrl-S).
     pub pending_row_deletes: Vec<String>,
+    /// Persona URLs / PII mask / DDL confirm (persona.toml).
+    pub persona: PersonaConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -1421,6 +1432,7 @@ impl Default for DbWorkspace {
             results_filter: String::new(),
             health_activity_auto_refresh: false,
             pending_row_deletes: Vec::new(),
+            persona: PersonaConfig::load(),
         }
     }
 }
@@ -1465,6 +1477,8 @@ impl DbWorkspace {
         }
         ws.history = load_query_history();
         ws.bookmarks = load_query_bookmarks();
+        let _ = ensure_example_snippet();
+        let _ = ensure_recipe_snippets();
         ws.rebuild_tree_roots();
         ws.rebuild_flat();
         ws
@@ -1654,7 +1668,7 @@ impl DbWorkspace {
             // Admin-only DDL still gated below for editor role.
             if !src.role.allows_admin() && looks_like_ddl(sql) {
                 bail!(
-                    "RBAC editor on \"{}\" — DDL/admin SQL requires admin role",
+                    "RBAC editor on \"{}\" — DDL/admin SQL requires admin role (p → Role)",
                     src.name
                 );
             }
@@ -1665,15 +1679,24 @@ impl DbWorkspace {
                 return Ok(());
             }
             bail!(
-                "read-only/viewer \"{}\" — Redis: GET/SCAN/KEYS/PING only",
+                "{} \"{}\" — Redis: GET/SCAN/KEYS/PING only",
+                if src.read_only { "read-only" } else { "viewer" },
                 src.name
             );
         }
         if is_read_only_sql(sql) {
             return Ok(());
         }
+        // Distinguish connection flag vs RBAC role — both used to say "viewer".
+        if src.read_only {
+            bail!(
+                "read-only \"{}\" — Read-only=yes in connection props (p → set Read-only no). Role={} does not override that flag",
+                src.name,
+                src.role.label()
+            );
+        }
         bail!(
-            "read-only/viewer \"{}\" — only SELECT/SHOW/EXPLAIN/WITH queries allowed",
+            "viewer \"{}\" — only SELECT/SHOW/EXPLAIN/WITH allowed (p → Role editor/admin)",
             src.name
         );
     }
@@ -1704,9 +1727,16 @@ impl DbWorkspace {
         let Some(src) = self.source_cfg(source_id) else {
             return Ok(());
         };
-        if src.read_only || !src.role.allows_write() {
+        if src.read_only {
             bail!(
-                "read-only/viewer \"{}\" — {op} is not allowed",
+                "read-only \"{}\" — {op} blocked (p → Read-only no). Role={} ignored while flag is on",
+                src.name,
+                src.role.label()
+            );
+        }
+        if !src.role.allows_write() {
+            bail!(
+                "viewer \"{}\" — {op} not allowed (p → Role editor/admin)",
                 src.name
             );
         }
@@ -2176,8 +2206,9 @@ impl DbWorkspace {
             .collect()
     }
 
-    pub fn studio_help_text() -> &'static str {
-        "══ Database Studio v1.0 MVP (Waves 3–17) ══\n\
+    pub fn studio_help_text() -> String {
+        let mut s = String::from(
+            "══ Database Studio v1.0 MVP (Waves 3–17) ══\n\
          \n\
          Run / cancel\n\
            F5 / Ctrl-Enter     run SQL\n\
@@ -2191,8 +2222,10 @@ impl DbWorkspace {
            u                   undo cell\n\
            a / Ctrl-S          apply updates (confirms)\n\
            [ ]                 result pages\n\
-           palette Chart       ASCII spark/bars from numeric col\n\
+           palette Chart       bar / line / pie\n\
            Export MD/JSON/CSV  honors /\n\
+           Quality strip       null% · distinct · min/max\n\
+           Mask PII            emails / phones / cards in grid\n\
          \n\
          Tabs\n\
            t / +               new query tab\n\
@@ -2204,6 +2237,7 @@ impl DbWorkspace {
            Ctrl-T / F6         test connection (form)\n\
            palette             Find connection / health / OAuth / snippets\n\
            Fan-out SQL         run console SQL on all ★ pinned sources\n\
+           SourceRole=viewer   hides advanced Create DDL\n\
          \n\
          Health (Admin → Health)\n\
            PG / MySQL / CH / MSSQL   Overview · Activity · (+ engine views)\n\
@@ -2237,7 +2271,7 @@ impl DbWorkspace {
            Snowflake                 SHOW warehouses/databases/schemas/tables\n\
          \n\
          Maintain & visualize (Wave 13)\n\
-           Vacuum / Analyze / Reindex  PG · SQLite VACUUM/ANALYZE\n\
+           Vacuum / Analyze / Reindex  all SQL engines (dialect-aware)\n\
            Timing histogram          recent query durations\n\
            Find table/view           explorer object search\n\
            Structure GRANTS          when engine supports\n\
@@ -2260,12 +2294,14 @@ impl DbWorkspace {
          Cloud close (Wave 21)\n\
            BQ INFORMATION_SCHEMA.TABLES · Snowflake GET_DDL script hint\n\
          \n\
-         ══ Gap slice CLOSED (W18–21) ══\n\
+         ══ Gap slice CLOSED (W18–21) + DBA multi-engine + Personas ══\n\
            DBeaver/DataGrip/Navicat parity stop — not infinite clone.\n\
-           New DB work only for regressions or explicit requests.\n\
          \n\
          Secrets: env:VAR or ~/.config/tui-ide/secrets.toml\n\
-         OAuth tokens: ~/.config/tui-ide/oauth.toml\n"
+         OAuth tokens: ~/.config/tui-ide/oauth.toml\n",
+        );
+        s.push_str(studio_help_personas());
+        s
     }
 
     /// Toggle periodic re-run of Health · Activity (~5s in the UI loop).
@@ -2857,6 +2893,15 @@ impl DbWorkspace {
                 self.load_structure_for(&entry.source_id, db, schema, table)
                     .await?;
             }
+            DbNodeKind::Source => {
+                self.fill_structure_source_properties(&entry.source_id);
+            }
+            DbNodeKind::Database => {
+                self.fill_structure_database_properties(&entry);
+            }
+            DbNodeKind::Schema => {
+                self.fill_structure_schema_properties(&entry);
+            }
             DbNodeKind::Column => {
                 // Keep current structure when walking columns (legacy trees).
             }
@@ -2865,6 +2910,153 @@ impl DbWorkspace {
             }
         }
         Ok(())
+    }
+
+    /// One-line gray strip for Explorer selection (host · db · role).
+    pub fn selection_properties_strip(&self) -> Option<String> {
+        let entry = self.flat.get(self.selected)?;
+        let src = self.sources.iter().find(|s| s.id == entry.source_id)?;
+        match entry.kind {
+            DbNodeKind::Source => {
+                let where_ = if src.driver.uses_file_path() {
+                    if src.file.is_empty() {
+                        src.driver.label().to_string()
+                    } else {
+                        src.file.clone()
+                    }
+                } else {
+                    format!(
+                        "{}:{}{}",
+                        src.host,
+                        src.port,
+                        if src.database.is_empty() {
+                            String::new()
+                        } else {
+                            format!("/{}", src.database)
+                        }
+                    )
+                };
+                Some(format!(
+                    " {} · {} · {} · p props · n New ",
+                    src.driver.label(),
+                    where_,
+                    src.role.label()
+                ))
+            }
+            DbNodeKind::Database => {
+                let name = entry.database.as_deref().unwrap_or(entry.label.as_str());
+                Some(format!(
+                    " database · {name} · {} · p props · n New ",
+                    src.role.label()
+                ))
+            }
+            DbNodeKind::Schema => {
+                let schema = entry.schema.as_deref().unwrap_or(entry.label.as_str());
+                let db = entry.database.as_deref().unwrap_or("—");
+                Some(format!(" schema · {db}.{schema} · n New table "))
+            }
+            DbNodeKind::Table | DbNodeKind::View => {
+                let schema = entry.schema.as_deref().unwrap_or("?");
+                let table = entry.table.as_deref().unwrap_or(entry.label.as_str());
+                let kind = if matches!(entry.kind, DbNodeKind::View) {
+                    "view"
+                } else {
+                    "table"
+                };
+                Some(format!(" {kind} · {schema}.{table} · p props · d DDL "))
+            }
+            _ => Some(format!(" {} · n New · p props ", entry.label)),
+        }
+    }
+
+    fn fill_structure_source_properties(&mut self, source_id: &str) {
+        let Some(src) = self.sources.iter().find(|s| s.id == source_id).cloned() else {
+            return;
+        };
+        self.structure.clear();
+        self.structure_title = format!("{} · properties", src.name);
+        self.structure_scroll = 0;
+        let mut lines = vec![
+            StructureLine::section("CONNECTION"),
+            StructureLine::item(format!("name     {}", src.name)),
+            StructureLine::item(format!("driver   {}", src.driver.label())),
+            StructureLine::item(format!("role     {}", src.role.label())),
+            StructureLine::item(format!(
+                "read-only {}",
+                if src.read_only { "yes ⚠ blocks CREATE" } else { "no" }
+            )),
+        ];
+        if src.driver.uses_file_path() {
+            lines.push(StructureLine::item(format!("file     {}", src.file)));
+        } else {
+            lines.push(StructureLine::item(format!("host     {}", src.host)));
+            lines.push(StructureLine::item(format!("port     {}", src.port)));
+            lines.push(StructureLine::item(format!("user     {}", src.user)));
+            lines.push(StructureLine::item(format!(
+                "database {}",
+                if src.database.is_empty() {
+                    "(default)"
+                } else {
+                    src.database.as_str()
+                }
+            )));
+            if !src.ssl_mode.is_empty() {
+                lines.push(StructureLine::item(format!("ssl      {}", src.ssl_mode)));
+            }
+        }
+        if !src.ssh_host.is_empty() {
+            lines.push(StructureLine::section("SSH TUNNEL"));
+            lines.push(StructureLine::item(format!(
+                "{}@{}:{}",
+                src.ssh_user, src.ssh_host, src.ssh_port
+            )));
+        }
+        lines.push(StructureLine::section("CREATE"));
+        lines.push(StructureLine::ddl(
+            "n New → DB · Schema · Table · View · Matview · Idx · Seq · Ext · Role",
+        ));
+        lines.push(StructureLine::ddl("p / e  edit connection properties"));
+        self.structure_lines = lines;
+    }
+
+    fn fill_structure_database_properties(&mut self, entry: &FlatDbEntry) {
+        let name = entry
+            .database
+            .clone()
+            .unwrap_or_else(|| entry.label.clone());
+        let src_name = self
+            .sources
+            .iter()
+            .find(|s| s.id == entry.source_id)
+            .map(|s| s.name.as_str())
+            .unwrap_or("?");
+        self.structure.clear();
+        self.structure_title = format!("{name} · database");
+        self.structure_scroll = 0;
+        self.structure_lines = vec![
+            StructureLine::section("DATABASE"),
+            StructureLine::item(format!("name   {name}")),
+            StructureLine::item(format!("source {src_name}")),
+            StructureLine::section("CREATE"),
+            StructureLine::ddl("n New → Schema · Ext · Role · Table · Seq"),
+            StructureLine::ddl("p props · expand for schemas"),
+        ];
+    }
+
+    fn fill_structure_schema_properties(&mut self, entry: &FlatDbEntry) {
+        let schema = entry.schema.as_deref().unwrap_or(entry.label.as_str());
+        let db = entry.database.as_deref().unwrap_or("—");
+        self.structure.clear();
+        self.structure_title = format!("{schema} · schema");
+        self.structure_scroll = 0;
+        self.structure_lines = vec![
+            StructureLine::section("SCHEMA"),
+            StructureLine::item(format!("name     {schema}")),
+            StructureLine::item(format!("database {db}")),
+            StructureLine::section("CREATE"),
+            StructureLine::ddl("n New → Table · View · Matview · Index · Seq · Role"),
+            StructureLine::ddl("Enter expand · p props"),
+        ];
     }
 
     /// Refresh Structure from the active SQL tab when it is bound to a table.
@@ -2942,11 +3134,7 @@ impl DbWorkspace {
             .await
         {
             Ok(()) => {
-                if !self.structure_title.is_empty()
-                    && !self.structure_title.starts_with("query ·")
-                {
-                    self.structure_title = format!("query · {}", self.structure_title);
-                }
+                // Keep load_structure_for title (`db · schema.table`) — no "query ·" prefix clutter.
                 Ok(())
             }
             Err(_) => {
@@ -2959,7 +3147,7 @@ impl DbWorkspace {
     fn set_structure_query_hint(&mut self, preview: Option<String>) {
         self.structure.clear();
         self.structure_scroll = 0;
-        self.structure_title = "query".into();
+        self.structure_title = String::new();
         let mut lines = vec![StructureLine::section("CONSOLE QUERY")];
         if let Some(p) = preview.filter(|s| !s.is_empty()) {
             let short = if p.chars().count() > 48 {
@@ -4896,6 +5084,16 @@ impl DbWorkspace {
             last.page = page;
             last.has_more = self.select_limit > 0 && last.rows.len() >= self.select_limit;
             last.elapsed_ms = stmt_start.elapsed().as_millis();
+            if self.persona.mask_pii {
+                last = mask_result(&last);
+            }
+            if !is_read_only_sql(stmt) {
+                let _ = audit_append(
+                    source_id.as_str(),
+                    driver.label(),
+                    stmt,
+                );
+            }
             self.history.push(QueryHistoryEntry {
                 sql: stmt.clone(),
                 elapsed_ms: last.elapsed_ms,
@@ -5484,6 +5682,122 @@ impl DbWorkspace {
         Ok(chart)
     }
 
+    pub fn chart_last_result_kind(&mut self, kind: &str) -> Result<String> {
+        let Some(result) = self.last_result.as_mut() else {
+            bail!("no results to chart");
+        };
+        let chart = chart_typed(result, kind, None, None)?;
+        result.chart = Some(chart.clone());
+        Ok(chart)
+    }
+
+    pub fn toggle_mask_pii(&mut self) -> bool {
+        self.persona.mask_pii = !self.persona.mask_pii;
+        let _ = self.persona.save();
+        if self.persona.mask_pii {
+            if let Some(r) = self.last_result.take() {
+                self.last_result = Some(mask_result(&r));
+            }
+        }
+        self.status = if self.persona.mask_pii {
+            "PII mask ON".into()
+        } else {
+            "PII mask OFF (re-run query to restore)".into()
+        };
+        self.persona.mask_pii
+    }
+
+    pub fn show_quality_strip(&mut self) -> Result<()> {
+        let Some(result) = &self.last_result else {
+            bail!("run a query first");
+        };
+        let text = quality_strip(result);
+        self.show_text_result("quality", &text);
+        Ok(())
+    }
+
+    pub fn export_explore_pack(&mut self) -> Result<PathBuf> {
+        let Some(result) = &self.last_result else {
+            bail!("no results to export");
+        };
+        let dir = self.queries_dir.join("explore_packs");
+        let path = export_result_pack(result, &self.sql, &dir)?;
+        self.status = format!("result pack → {}", path.display());
+        Ok(path)
+    }
+
+    pub fn show_text_result(&mut self, title: &str, text: &str) {
+        let mut qr = QueryResult::empty();
+        qr.columns = vec![title.into()];
+        for line in text.lines() {
+            qr.rows.push(vec![line.to_string()]);
+        }
+        qr.source_table = Some(title.into());
+        self.last_result = Some(qr);
+        self.status = title.into();
+    }
+
+    pub fn reload_persona_config(&mut self) {
+        self.persona = PersonaConfig::load();
+        let _ = ensure_recipe_snippets();
+    }
+
+    pub fn insert_recipe(&mut self, id: &str) -> Result<()> {
+        let Some((_, body)) = recipe_gallery().into_iter().find(|(n, _)| *n == id) else {
+            bail!("unknown recipe {id}");
+        };
+        self.sql = body.to_string();
+        self.status = format!("recipe {id} loaded");
+        Ok(())
+    }
+
+    pub fn list_recipes_text(&self) -> String {
+        let mut s = String::from("══ Recipe gallery ══\n");
+        for (n, _) in recipe_gallery() {
+            s.push_str(&format!("  · {n}\n"));
+        }
+        s.push_str("\nPalette → Recipe: <name> or snippets/recipe_*.sql\n");
+        if self.persona.onboarding_tips {
+            s.push('\n');
+            s.push_str(onboarding_tips());
+        }
+        s
+    }
+
+    pub fn codegen_from_structure(&self, lang: &str) -> Result<String> {
+        let table = self
+            .structure_title
+            .split_whitespace()
+            .last()
+            .unwrap_or("Table");
+        if self.structure.is_empty() {
+            bail!("open a table Structure pane first");
+        }
+        let cols: Vec<(String, String)> = self
+            .structure
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone()))
+            .collect();
+        let driver = self
+            .active_source
+            .as_ref()
+            .and_then(|id| self.source_cfg(id).map(|s| s.driver))
+            .unwrap_or_default();
+        Ok(codegen_struct(driver, lang, table, &cols))
+    }
+
+    pub fn should_confirm_destructive(&self, sql: &str) -> bool {
+        self.persona.confirm_destructive_ddl && is_destructive_ddl(sql)
+    }
+
+    pub fn viewer_hides_ddl(&self) -> bool {
+        self.active_source
+            .as_ref()
+            .and_then(|id| self.source_cfg(id))
+            .map(|s| s.role == SourceRole::Viewer || s.read_only)
+            .unwrap_or(false)
+    }
+
     pub async fn materialize_last_select(
         &mut self,
         name: &str,
@@ -5745,7 +6059,7 @@ impl DbWorkspace {
         }
     }
 
-    /// Run `VACUUM` / `ANALYZE` / `REINDEX` on the selected table (Postgres · SQLite).
+    /// Table maintenance equivalents per engine (VACUUM / OPTIMIZE / REBUILD / …).
     pub async fn run_postgres_maintenance(&mut self, op: PostgresMaintenance) -> Result<()> {
         if self.in_txn {
             bail!("maintenance cannot run inside a transaction — commit or rollback first");
@@ -5757,69 +6071,130 @@ impl DbWorkspace {
             .source_cfg(&source_id)
             .map(|s| s.driver)
             .unwrap_or_default();
-        if !matches!(driver, DbDriver::Postgres | DbDriver::Sqlite) {
-            bail!("VACUUM/ANALYZE/REINDEX supported for Postgres and SQLite");
-        }
         self.guard_writable_op(&source_id, "maintenance")?;
         self.ensure_connected(&source_id, database.as_deref())
             .await?;
-        let key = Self::pool_key(&source_id, database.as_deref());
-        let pool = self.pools.get(&key).context("not connected")?;
-        let (label, sql) = match (driver, op) {
-            (DbDriver::Postgres, PostgresMaintenance::VacuumAnalyze) => (
-                "VACUUM (ANALYZE)",
-                format!(
-                    "VACUUM (ANALYZE) {}.{}",
-                    pg_quote_ident(&schema),
-                    pg_quote_ident(&table)
-                ),
-            ),
-            (DbDriver::Postgres, PostgresMaintenance::Analyze) => (
-                "ANALYZE",
-                format!(
-                    "ANALYZE {}.{}",
-                    pg_quote_ident(&schema),
-                    pg_quote_ident(&table)
-                ),
-            ),
-            (DbDriver::Postgres, PostgresMaintenance::Reindex) => (
-                "REINDEX TABLE",
-                format!(
-                    "REINDEX TABLE {}.{}",
-                    pg_quote_ident(&schema),
-                    pg_quote_ident(&table)
-                ),
-            ),
-            (DbDriver::Sqlite, PostgresMaintenance::VacuumAnalyze) => {
-                ("VACUUM", "VACUUM;".into())
-            }
-            (DbDriver::Sqlite, PostgresMaintenance::Analyze) => {
-                ("ANALYZE", format!("ANALYZE \"{}\";", table.replace('"', "\"\"")))
-            }
-            (DbDriver::Sqlite, PostgresMaintenance::Reindex) => {
-                ("REINDEX", format!("REINDEX \"{}\";", table.replace('"', "\"\"")))
-            }
-            _ => bail!("maintenance not supported for {}", driver.label()),
-        };
+        let (label, sql) = maintenance_sql(driver, op, &schema, &table)?;
         let start = std::time::Instant::now();
-        let result = match pool {
-            LivePool::Pg(p) => exec_pg(p, &sql).await?,
-            LivePool::Sqlite(p) => exec_sqlite(p, &sql).await?,
-            _ => bail!("unexpected pool for maintenance"),
-        };
+        let suggest_only = label.starts_with("SUGGEST");
+        if !suggest_only {
+            self.execute_sql_text(&sql).await?;
+        }
         let elapsed_ms = start.elapsed().as_millis();
-        self.status = format!(
-            "{label} {schema}.{table} · {elapsed_ms} ms · affected {}",
-            result.affected.unwrap_or(0)
-        );
+        self.status = if suggest_only {
+            format!("{label} · {schema}.{table} · {driver:?} (not executed)")
+        } else {
+            format!("{label} {schema}.{table} · {elapsed_ms} ms · {driver:?}")
+        };
         let mut qr = QueryResult::empty();
-        qr.columns = vec!["maintenance".into(), "status".into()];
-        qr.rows = vec![vec![label.into(), self.status.clone()]];
-        qr.affected = result.affected;
+        qr.columns = vec!["maintenance".into(), "engine".into(), "sql".into()];
+        qr.rows = vec![vec![
+            label.into(),
+            driver.label().into(),
+            sql.clone(),
+        ]];
         qr.elapsed_ms = elapsed_ms;
         qr.source_schema = Some(schema);
         qr.source_table = Some(table);
         self.last_result = Some(qr);
+        Ok(())
+    }
+
+    /// DBA: show grants for the selected table (Results grid).
+    pub async fn inspect_table_privileges(&mut self) -> Result<()> {
+        let (source_id, database, schema, table) = self
+            .selected_table_context()
+            .context("select a table/view in Explorer")?;
+        let driver = self
+            .source_cfg(&source_id)
+            .map(|s| s.driver)
+            .unwrap_or_default();
+        self.ensure_connected(&source_id, database.as_deref())
+            .await?;
+        let sql = match driver {
+            DbDriver::Postgres => format!(
+                "SELECT grantee, privilege_type, is_grantable\n\
+                 FROM information_schema.role_table_grants\n\
+                 WHERE table_schema = '{schema}' AND table_name = '{table}'\n\
+                 ORDER BY grantee, privilege_type;"
+            ),
+            DbDriver::Mysql => format!(
+                "SELECT * FROM ( \
+                   SELECT GRANTEE, PRIVILEGE_TYPE, IS_GRANTABLE \
+                   FROM information_schema.SCHEMA_PRIVILEGES \
+                   WHERE TABLE_SCHEMA = '{schema}' \
+                   UNION ALL \
+                   SELECT GRANTEE, PRIVILEGE_TYPE, IS_GRANTABLE \
+                   FROM information_schema.TABLE_PRIVILEGES \
+                   WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}' \
+                 ) AS grants_u ORDER BY 1, 2"
+            ),
+            DbDriver::Mssql => format!(
+                "SELECT dp.name AS principal, permission_name, state_desc \
+                 FROM sys.database_permissions p \
+                 JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id \
+                 JOIN sys.objects o ON p.major_id = o.object_id \
+                 JOIN sys.schemas s ON o.schema_id = s.schema_id \
+                 WHERE s.name = N'{schema}' AND o.name = N'{table}'"
+            ),
+            DbDriver::Sqlite | DbDriver::Duckdb => {
+                // No GRANT catalog — surface table ownership metadata.
+                format!(
+                    "SELECT 'local-file-engine' AS note, '{schema}' AS schema, '{table}' AS table_name, \
+                     'SQLite/DuckDB use file OS permissions; SQL GRANT is limited' AS detail"
+                )
+            }
+            DbDriver::Clickhouse => format!(
+                "SELECT access_type, user_name, role_name, database, table \
+                 FROM system.grants \
+                 WHERE database = '{schema}' AND (table = '{table}' OR table = '') \
+                 ORDER BY access_type"
+            ),
+            DbDriver::Snowflake | DbDriver::Bigquery | DbDriver::Trino => format!(
+                "SELECT 'use warehouse IAM / GRANT catalog in Console' AS note, \
+                 '{schema}' AS schema_name, '{table}' AS table_name"
+            ),
+            _ => bail!(
+                "privilege inspect not applicable for {}",
+                driver.label()
+            ),
+        };
+        // Escape single quotes already in ident_ok names from explorer.
+        let sql = sql.replace('\n', " ");
+        self.execute_sql_text(&sql).await?;
+        self.status = format!("privileges · {schema}.{table}");
+        Ok(())
+    }
+
+    /// DBA: list RLS policies on selected table (Postgres).
+    pub async fn inspect_rls_policies(&mut self) -> Result<()> {
+        let (source_id, database, schema, table) = self
+            .selected_table_context()
+            .context("select a table in Explorer")?;
+        let driver = self
+            .source_cfg(&source_id)
+            .map(|s| s.driver)
+            .unwrap_or_default();
+        if driver != DbDriver::Postgres {
+            bail!("RLS policies are PostgreSQL-only");
+        }
+        self.ensure_connected(&source_id, database.as_deref())
+            .await?;
+        let sql = format!(
+            "SELECT pol.polname AS policy, \
+                    CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT' \
+                         WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE' ELSE 'ALL' END AS cmd, \
+                    pg_get_expr(pol.polqual, pol.polrelid) AS using_expr, \
+                    pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check, \
+                    pol.polpermissive AS permissive \
+             FROM pg_policy pol \
+             JOIN pg_class c ON c.oid = pol.polrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{schema}' AND c.relname = '{table}' \
+             ORDER BY 1;"
+        );
+        self.execute_sql_text(&sql).await?;
+        self.status = format!("RLS policies · {schema}.{table}");
         Ok(())
     }
 
@@ -8786,6 +9161,81 @@ impl DbWorkspace {
         Ok(out)
     }
 
+    async fn dump_duckdb(
+        &mut self,
+        src: &DataSource,
+        source_id: &str,
+        out_dir: &Path,
+        stamp: &str,
+    ) -> Result<PathBuf> {
+        let label = if src.file.is_empty() || src.file == ":memory:" {
+            "memory"
+        } else {
+            Path::new(&src.file)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("duckdb")
+        };
+        let out = out_dir.join(format!("{label}-{stamp}.sql"));
+        self.ensure_connected(source_id, None).await?;
+        let key = Self::pool_key(source_id, None);
+        let pool = self.pools.get(&key).context("not connected")?;
+        let LivePool::Duckdb(d) = pool else {
+            bail!("expected DuckDB pool");
+        };
+        let mut body = format!(
+            "-- tui-ide DuckDB export\n-- source: {}\n\n",
+            if src.file.is_empty() {
+                ":memory:"
+            } else {
+                src.file.as_str()
+            }
+        );
+        let tables = alt_engines::duckdb_tables(d, source_id).await?;
+        for t in tables {
+            let Some(schema) = t.schema.as_deref() else {
+                continue;
+            };
+            let Some(table) = t.table.as_deref() else {
+                continue;
+            };
+            if t.kind == DbNodeKind::View {
+                let def = alt_engines::exec_duckdb(
+                    d,
+                    &format!(
+                        "SELECT sql FROM duckdb_views() WHERE schema_name = '{}' AND view_name = '{}'",
+                        schema.replace('\'', "''"),
+                        table.replace('\'', "''")
+                    ),
+                )
+                .await;
+                if let Ok(qr) = def {
+                    if let Some(row) = qr.rows.first() {
+                        if let Some(sql) = row.first() {
+                            if !sql.is_empty() {
+                                body.push_str(&format!("-- view {schema}.{table}\n{sql};\n\n"));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            let cols = alt_engines::duckdb_columns(d, schema, table).await?;
+            body.push_str(&format!(
+                "-- table {schema}.{table}\n{}\n\n",
+                ddl_create_table(DbDriver::Duckdb, schema, table, &cols)
+            ));
+            let qual = table_qual(DbDriver::Duckdb, schema, table);
+            let qr = alt_engines::exec_duckdb(d, &format!("SELECT * FROM {qual}")).await?;
+            if !qr.rows.is_empty() {
+                body.push_str(&duckdb_inserts_from_result(&qr, schema, table));
+                body.push('\n');
+            }
+        }
+        std::fs::write(&out, body)?;
+        Ok(out)
+    }
+
     async fn dump_clickhouse(
         &mut self,
         src: &DataSource,
@@ -8954,8 +9404,12 @@ impl DbWorkspace {
                 self.dump_clickhouse(&src, &source_id, out_dir, &stamp.to_string())
                     .await
             }
-            DbDriver::Duckdb | DbDriver::Redis | DbDriver::Mongo | DbDriver::Elasticsearch | DbDriver::Trino => {
-                bail!("dump not supported for {} yet", src.driver.label());
+            DbDriver::Duckdb => {
+                self.dump_duckdb(&src, &source_id, out_dir, &stamp.to_string())
+                    .await
+            }
+            DbDriver::Redis | DbDriver::Mongo | DbDriver::Elasticsearch | DbDriver::Trino => {
+                bail!("dump not supported for {}", src.driver.label());
             }
             DbDriver::Snowflake | DbDriver::Bigquery => {
                 bail!("{}", alt_engines::cloud_not_configured_message(src.driver));
@@ -9090,8 +9544,24 @@ impl DbWorkspace {
                 }
                 Ok(())
             }
-            DbDriver::Duckdb | DbDriver::Redis | DbDriver::Mongo | DbDriver::Elasticsearch | DbDriver::Trino => {
-                bail!("restore not supported for {} yet", src.driver.label());
+            DbDriver::Duckdb => {
+                let source_id = source_id.clone();
+                let active_db = self.active_database.clone();
+                self.ensure_connected(&source_id, active_db.as_deref())
+                    .await?;
+                let key = Self::pool_key(&source_id, active_db.as_deref());
+                let pool = self.pools.get(&key).context("not connected")?;
+                let LivePool::Duckdb(d) = pool else {
+                    bail!("expected DuckDB pool");
+                };
+                let text = std::fs::read_to_string(dump_path).context("read dump")?;
+                for stmt in split_sql_script(&text, false) {
+                    let _ = alt_engines::exec_duckdb(d, &stmt).await?;
+                }
+                Ok(())
+            }
+            DbDriver::Redis | DbDriver::Mongo | DbDriver::Elasticsearch | DbDriver::Trino => {
+                bail!("restore not supported for {}", src.driver.label());
             }
             DbDriver::Snowflake | DbDriver::Bigquery => {
                 bail!("{}", alt_engines::cloud_not_configured_message(src.driver));
@@ -9995,6 +10465,22 @@ fn mssql_inserts_from_result(qr: &QueryResult, schema: &str, table: &str) -> Str
     out
 }
 
+fn duckdb_inserts_from_result(qr: &QueryResult, schema: &str, table: &str) -> String {
+    let qual = table_qual(DbDriver::Duckdb, schema, table);
+    let cols = qr
+        .columns
+        .iter()
+        .map(|c| ident_quote(DbDriver::Duckdb, c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = String::new();
+    for row in &qr.rows {
+        let vals = row.iter().map(|v| sql_literal(v)).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!("INSERT INTO {qual} ({cols}) VALUES ({vals});\n"));
+    }
+    out
+}
+
 fn ident_quote(driver: DbDriver, id: &str) -> String {
     match driver {
         DbDriver::Mysql | DbDriver::Clickhouse => format!("`{}`", id.replace('`', "``")),
@@ -10015,6 +10501,164 @@ fn table_qual(driver: DbDriver, schema: &str, table: &str) -> String {
             ident_quote(driver, table)
         )
     }
+}
+
+/// Dialect-aware maintenance SQL for the Create/palette DBA actions.
+fn maintenance_sql(
+    driver: DbDriver,
+    op: PostgresMaintenance,
+    schema: &str,
+    table: &str,
+) -> Result<(String, String)> {
+    let pg_q = |s: &str| pg_quote_ident(s);
+    let mysql_q = |s: &str| format!("`{}`", s.replace('`', "``"));
+    let mssql_q = |s: &str| format!("[{}]", s.replace(']', "]]"));
+    let fq_pg = format!("{}.{}", pg_q(schema), pg_q(table));
+    let fq_mysql = if schema.is_empty() {
+        mysql_q(table)
+    } else {
+        format!("{}.{}", mysql_q(schema), mysql_q(table))
+    };
+    let fq_mssql = format!("{}.{}", mssql_q(schema), mssql_q(table));
+    let fq_ch = if schema.is_empty() {
+        mysql_q(table)
+    } else {
+        format!("{}.{}", mysql_q(schema), mysql_q(table))
+    };
+    Ok(match (driver, op) {
+        (DbDriver::Postgres, PostgresMaintenance::VacuumAnalyze) => (
+            "VACUUM (ANALYZE)".into(),
+            format!("VACUUM (ANALYZE) {fq_pg}"),
+        ),
+        (DbDriver::Postgres, PostgresMaintenance::Analyze) => {
+            ("ANALYZE".into(), format!("ANALYZE {fq_pg}"))
+        }
+        (DbDriver::Postgres, PostgresMaintenance::Reindex) => (
+            "REINDEX TABLE".into(),
+            format!("REINDEX TABLE {fq_pg}"),
+        ),
+        (DbDriver::Sqlite, PostgresMaintenance::VacuumAnalyze) => {
+            ("VACUUM".into(), "VACUUM".into())
+        }
+        (DbDriver::Sqlite, PostgresMaintenance::Analyze) => (
+            "ANALYZE".into(),
+            format!("ANALYZE \"{}\"", table.replace('"', "\"\"")),
+        ),
+        (DbDriver::Sqlite, PostgresMaintenance::Reindex) => (
+            "REINDEX".into(),
+            format!("REINDEX \"{}\"", table.replace('"', "\"\"")),
+        ),
+        (DbDriver::Mysql, PostgresMaintenance::VacuumAnalyze) => (
+            "OPTIMIZE TABLE".into(),
+            format!("OPTIMIZE TABLE {fq_mysql}"),
+        ),
+        (DbDriver::Mysql, PostgresMaintenance::Analyze) => (
+            "ANALYZE TABLE".into(),
+            format!("ANALYZE TABLE {fq_mysql}"),
+        ),
+        (DbDriver::Mysql, PostgresMaintenance::Reindex) => (
+            "OPTIMIZE TABLE (reindex)".into(),
+            format!("OPTIMIZE TABLE {fq_mysql}"),
+        ),
+        (DbDriver::Mssql, PostgresMaintenance::VacuumAnalyze) => (
+            "UPDATE STATISTICS + REBUILD".into(),
+            format!(
+                "UPDATE STATISTICS {fq_mssql} WITH FULLSCAN; \
+                 ALTER INDEX ALL ON {fq_mssql} REBUILD"
+            ),
+        ),
+        (DbDriver::Mssql, PostgresMaintenance::Analyze) => (
+            "UPDATE STATISTICS".into(),
+            format!("UPDATE STATISTICS {fq_mssql} WITH FULLSCAN"),
+        ),
+        (DbDriver::Mssql, PostgresMaintenance::Reindex) => (
+            "ALTER INDEX ALL REBUILD".into(),
+            format!("ALTER INDEX ALL ON {fq_mssql} REBUILD"),
+        ),
+        (DbDriver::Duckdb, PostgresMaintenance::VacuumAnalyze) => {
+            ("CHECKPOINT".into(), "CHECKPOINT".into())
+        }
+        (DbDriver::Duckdb, PostgresMaintenance::Analyze) => (
+            "ANALYZE".into(),
+            if schema.is_empty() || schema == "main" {
+                format!("ANALYZE \"{}\"", table.replace('"', "\"\""))
+            } else {
+                format!(
+                    "ANALYZE \"{}\".\"{}\"",
+                    schema.replace('"', "\"\""),
+                    table.replace('"', "\"\"")
+                )
+            },
+        ),
+        (DbDriver::Duckdb, PostgresMaintenance::Reindex) => (
+            "FORCE CHECKPOINT".into(),
+            "FORCE CHECKPOINT".into(),
+        ),
+        (DbDriver::Clickhouse, PostgresMaintenance::VacuumAnalyze) => (
+            "OPTIMIZE TABLE FINAL".into(),
+            format!("OPTIMIZE TABLE {fq_ch} FINAL"),
+        ),
+        (DbDriver::Clickhouse, PostgresMaintenance::Analyze) => (
+            "SYSTEM FLUSH LOGS".into(),
+            "SYSTEM FLUSH LOGS".into(),
+        ),
+        (DbDriver::Clickhouse, PostgresMaintenance::Reindex) => (
+            "OPTIMIZE TABLE FINAL".into(),
+            format!("OPTIMIZE TABLE {fq_ch} FINAL"),
+        ),
+        (DbDriver::Snowflake, PostgresMaintenance::VacuumAnalyze) => (
+            "SUGGEST recluster".into(),
+            format!(
+                "-- Snowflake: ALTER TABLE \"{schema}\".\"{table}\" RECLUSTER;\n\
+                 -- or SELECT SYSTEM$CLUSTERING_INFORMATION('{schema}.{table}');"
+            ),
+        ),
+        (DbDriver::Snowflake, PostgresMaintenance::Analyze) => (
+            "SUGGEST clustering info".into(),
+            format!("SELECT SYSTEM$CLUSTERING_INFORMATION('{schema}.{table}');"),
+        ),
+        (DbDriver::Snowflake, PostgresMaintenance::Reindex) => (
+            "SUGGEST recluster".into(),
+            format!("-- Snowflake has no REINDEX; use ALTER TABLE \"{schema}\".\"{table}\" RECLUSTER;"),
+        ),
+        (DbDriver::Bigquery, PostgresMaintenance::VacuumAnalyze) => (
+            "SUGGEST BQ optimize".into(),
+            format!(
+                "-- BigQuery: CREATE OR REPLACE TABLE `{schema}.{table}` AS SELECT * FROM `{schema}.{table}`;\n\
+                 -- or schedule table expiration / clustering in Console"
+            ),
+        ),
+        (DbDriver::Bigquery, PostgresMaintenance::Analyze) => (
+            "SUGGEST BQ INFORMATION_SCHEMA".into(),
+            format!(
+                "SELECT * FROM `{schema}.INFORMATION_SCHEMA.TABLE_STORAGE` \
+                 WHERE table_name = '{table}'"
+            ),
+        ),
+        (DbDriver::Bigquery, PostgresMaintenance::Reindex) => (
+            "SUGGEST BQ clustering".into(),
+            format!("-- BigQuery: set clustering/partitioning on `{schema}.{table}` in Console"),
+        ),
+        (DbDriver::Trino, PostgresMaintenance::VacuumAnalyze) => (
+            "SUGGEST Trino ANALYZE".into(),
+            format!("ANALYZE {schema}.{table}"),
+        ),
+        (DbDriver::Trino, PostgresMaintenance::Analyze) => (
+            "SUGGEST Trino ANALYZE".into(),
+            format!("ANALYZE {schema}.{table}"),
+        ),
+        (DbDriver::Trino, PostgresMaintenance::Reindex) => (
+            "SUGGEST connector OPTIMIZE".into(),
+            format!(
+                "-- Trino: ALTER TABLE {schema}.{table} EXECUTE optimize; \
+                 (Iceberg/Delta connectors)"
+            ),
+        ),
+        (DbDriver::Redis | DbDriver::Mongo | DbDriver::Elasticsearch, _) => bail!(
+            "maintenance not applicable for {}",
+            driver.label()
+        ),
+    })
 }
 
 fn ddl_create_table(driver: DbDriver, schema: &str, table: &str, cols: &[ColumnInfo]) -> String {
@@ -10304,4 +10948,65 @@ fn strip_sql_comments(sql: &str) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod dba_engines_tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_sql_covers_sql_engines() {
+        let engines = [
+            DbDriver::Postgres,
+            DbDriver::Mysql,
+            DbDriver::Sqlite,
+            DbDriver::Mssql,
+            DbDriver::Duckdb,
+            DbDriver::Clickhouse,
+        ];
+        for d in engines {
+            for op in [
+                PostgresMaintenance::VacuumAnalyze,
+                PostgresMaintenance::Analyze,
+                PostgresMaintenance::Reindex,
+            ] {
+                let (label, sql) = maintenance_sql(d, op, "public", "t").expect("sql");
+                assert!(!label.is_empty(), "{d:?}");
+                assert!(!sql.is_empty(), "{d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_sql_cloud_is_suggest_only() {
+        for d in [DbDriver::Snowflake, DbDriver::Bigquery, DbDriver::Trino] {
+            let (label, sql) =
+                maintenance_sql(d, PostgresMaintenance::VacuumAnalyze, "s", "t").unwrap();
+            assert!(label.starts_with("SUGGEST"), "{d:?} {label}");
+            assert!(!sql.is_empty());
+        }
+    }
+
+    #[test]
+    fn maintenance_sql_rejects_kv() {
+        assert!(maintenance_sql(
+            DbDriver::Redis,
+            PostgresMaintenance::Analyze,
+            "",
+            "k"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn duckdb_inserts_quote_idents() {
+        let qr = QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![vec!["1".into(), "a".into()]],
+            ..QueryResult::empty()
+        };
+        let s = duckdb_inserts_from_result(&qr, "main", "t");
+        assert!(s.contains("INSERT INTO"));
+        assert!(s.contains("\"id\""));
+    }
 }

@@ -1,11 +1,15 @@
 //! TUI layouts, keymap, and command palette.
 
+pub mod create_dialect;
+mod create_object_form;
 mod db_connect_form;
 mod keymap;
 mod palette;
 pub mod theme;
 mod widgets;
 
+pub use create_object_form::{CreateObjectForm, CreateObjectKind};
+pub use create_dialect::supports_kind as create_dialect_supports;
 pub use db_connect_form::DbConnectForm;
 pub use keymap::{Action, KeyContext, Keymap};
 pub use palette::{Palette, PaletteMode};
@@ -79,6 +83,8 @@ pub struct UiState {
     pub db_connect_form: DbConnectForm,
     /// When set, connect form updates this source id instead of creating one.
     pub db_connect_edit_id: Option<String>,
+    /// `n New` object create modal (not Console SQL stubs).
+    pub create_object_form: CreateObjectForm,
     pub open_folder_input: String,
     pub import_csv_input: String,
     pub db_cursor: Cursor,
@@ -190,6 +196,7 @@ impl Default for UiState {
             db_connect_input: String::new(),
             db_connect_form: DbConnectForm::default(),
             db_connect_edit_id: None,
+            create_object_form: CreateObjectForm::fresh(CreateObjectKind::Table, "public"),
             open_folder_input: String::new(),
             import_csv_input: String::new(),
             db_cursor: Cursor::default(),
@@ -221,7 +228,7 @@ impl Default for UiState {
             save_materialize_temp: true,
             results_compact: true,
             explorer_width: 28,
-            studio_left_width: 48,
+            studio_left_width: 56,
             results_pct: 40,
             results_pinned_cols: 1,
             oauth_paste_pending: false,
@@ -604,6 +611,13 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
         if ctx.ui.mode == Mode::DbConnect {
             db_connect_form::render_db_connect_form(frame, size, &ctx.ui.db_connect_form);
         }
+        if ctx.ui.mode == Mode::CreateObject {
+            create_object_form::render_create_object_form(
+                frame,
+                size,
+                &ctx.ui.create_object_form,
+            );
+        }
         if ctx.ui.mode == Mode::Settings {
             palette::render_settings_modal(frame, size, &ctx.ui.settings_draft);
         }
@@ -800,6 +814,9 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
     }
     if ctx.ui.mode == Mode::DbConnect {
         db_connect_form::render_db_connect_form(frame, size, &ctx.ui.db_connect_form);
+    }
+    if ctx.ui.mode == Mode::CreateObject {
+        create_object_form::render_create_object_form(frame, size, &ctx.ui.create_object_form);
     }
     if ctx.ui.mode == Mode::OpenFolder {
         palette::render_open_folder(frame, size, &ctx.ui.open_folder_input);
@@ -1014,16 +1031,20 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 let inner_w = area.width.saturating_sub(2) as usize;
                 let used = tree.chars().count();
                 let label_max = inner_w.saturating_sub(used).max(4);
-                let role_tag = if matches!(e.kind, DbNodeKind::Source) {
+                let role = if matches!(e.kind, DbNodeKind::Source) {
                     ws.sources
                         .iter()
                         .find(|s| s.id == e.source_id)
-                        .map(|s| format!(" [{}]", s.role.label()))
-                        .unwrap_or_default()
+                        .map(|s| s.role.label())
                 } else {
-                    String::new()
+                    None
                 };
-                let mut label = truncate_chars(&format!("{}{role_tag}", e.label), label_max);
+                // Drop whole tokens (driver, then role) before ellipsizing — never "[ad…]".
+                let mut label = if matches!(e.kind, DbNodeKind::Source) {
+                    fit_explorer_source_label(&e.label, role, label_max)
+                } else {
+                    truncate_chars(&e.label, label_max)
+                };
                 let pad = inner_w.saturating_sub(used + label.chars().count());
                 if pad > 0 {
                     label.push_str(&" ".repeat(pad));
@@ -1086,13 +1107,33 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
 
 fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focused: bool) {
     let border = theme::border(focused);
+    // Gray properties strip (requested franja) — keyed off Explorer selection.
+    let strip = db.and_then(|w| w.selection_properties_strip());
+    let (list_area, strip_area) = if strip.is_some() && area.height >= 5 {
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(area);
+        (parts[0], Some(parts[1]))
+    } else {
+        (area, None)
+    };
+    let area = list_area;
     let inner_h = area.height.saturating_sub(2) as usize;
     let (title, items) = match db {
         Some(ws) if !ws.structure_lines.is_empty() => {
+            let title_budget = area.width.saturating_sub(14).max(6) as usize;
+            let fitted = fit_dot_title(&ws.structure_title, title_budget);
             let title = if focused {
-                format!(" Structure · {} ", truncate_chars(&ws.structure_title, 28))
+                if fitted.is_empty() {
+                    " Structure ".into()
+                } else {
+                    format!(" Structure · {fitted} ")
+                }
+            } else if fitted.is_empty() {
+                " structure ".into()
             } else {
-                format!(" structure · {} ", truncate_chars(&ws.structure_title, 28))
+                format!(" structure · {fitted} ")
             };
             let scroll = ws.structure_scroll.min(ws.structure_lines.len().saturating_sub(1));
             let inner_w = area.width.saturating_sub(2) as usize;
@@ -1137,38 +1178,56 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
                     None
                 }
             });
+            let inner_w = area.width.saturating_sub(2) as usize;
             let items = if let Some(msg) = dead_msg {
-                let short = if msg.chars().count() > 72 {
-                    format!("{}…", msg.chars().take(71).collect::<String>())
+                let short = if msg.chars().count() > inner_w.saturating_sub(2).max(12) {
+                    format!(
+                        "{}…",
+                        msg.chars()
+                            .take(inner_w.saturating_sub(3).max(8))
+                            .collect::<String>()
+                    )
                 } else {
                     msg
                 };
                 vec![
                     ListItem::new(Span::styled(
-                        " connection failed ",
+                        truncate_chars(" connection failed ", inner_w),
                         theme::style_text().add_modifier(Modifier::BOLD),
                     )),
                     ListItem::new(Span::styled(
-                        format!(" {short} "),
+                        truncate_chars(&format!(" {short} "), inner_w),
                         theme::style_muted(),
                     )),
                     ListItem::new(Span::styled(
-                        " Enter retry · e edit · Delete remove ",
+                        truncate_chars(" Enter · e · Del ", inner_w),
                         theme::style_faint(),
                     )),
                 ]
             } else {
+                // Width-aware empty state — avoid "Structure follo…" / "FROM s…" clips.
+                let (h1, h2, h3) = if inner_w < 18 {
+                    (" Follows SQL ", " FROM→cols ", " Enter table ")
+                } else if inner_w < 28 {
+                    (" Follows query ", " FROM → columns ", " Enter a table ")
+                } else {
+                    (
+                        " Structure follows the query ",
+                        " Console: FROM schema.table → columns ",
+                        " Or Enter a table in Explorer ",
+                    )
+                };
                 vec![
                     ListItem::new(Span::styled(
-                        " Structure follows the query ",
+                        truncate_chars(h1, inner_w),
                         theme::style_text().add_modifier(Modifier::BOLD),
                     )),
                     ListItem::new(Span::styled(
-                        " Console: FROM schema.table → columns here ",
+                        truncate_chars(h2, inner_w),
                         theme::style_muted(),
                     )),
                     ListItem::new(Span::styled(
-                        " Or Enter a table in Explorer ",
+                        truncate_chars(h3, inner_w),
                         theme::style_faint(),
                     )),
                 ]
@@ -1190,6 +1249,14 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
         ),
         area,
     );
+    if let (Some(strip_area), Some(text)) = (strip_area, strip) {
+        let shown = truncate_chars(&text, strip_area.width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(shown, theme::style_muted())))
+                .style(Style::default().bg(theme::surface_2())),
+            strip_area,
+        );
+    }
 }
 
 fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
@@ -1243,15 +1310,10 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         }
     }
 
-    // Quiet toolbar — run + DataGrip-style DB / schema selectors
+    // Quiet toolbar — drop whole tokens when narrow (never mid-word like "publi").
     if h >= 2 {
-        let run_hint = if ctx.db.map(|d| d.query_running).unwrap_or(false)
-            || ctx.ui.busy_label.as_deref() == Some("RUNNING…")
-        {
-            Span::styled(" RUNNING… Esc ", theme::style_selected())
-        } else {
-            Span::styled(" F5 run ", theme::style_faint())
-        };
+        let running = ctx.db.map(|d| d.query_running).unwrap_or(false)
+            || ctx.ui.busy_label.as_deref() == Some("RUNNING…");
         let db_label = ctx
             .db
             .map(|d| d.console_database_label())
@@ -1260,41 +1322,13 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             .db
             .map(|d| d.console_schema_label())
             .unwrap_or_else(|| "schema".into());
+        let lim = match ctx.db.map(|d| d.select_limit).unwrap_or(50) {
+            0 => "lim off".into(),
+            n => format!("lim {n}"),
+        };
+        let spans = console_toolbar_spans(running, &db_label, &schema_label, &lim, inner.width);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" ", theme::style_faint()),
-                run_hint,
-                Span::styled(" │ ", theme::style_faint()),
-                Span::styled(
-                    if focused && matches!(ctx.ui.mode, Mode::Insert) {
-                        "Alt-b "
-                    } else {
-                        "b "
-                    },
-                    theme::style_faint(),
-                ),
-                Span::styled(format!("{db_label} ▾"), theme::style_muted()),
-                Span::styled(" │ ", theme::style_faint()),
-                Span::styled(
-                    if focused && matches!(ctx.ui.mode, Mode::Insert) {
-                        "Alt-s "
-                    } else {
-                        "s "
-                    },
-                    theme::style_faint(),
-                ),
-                Span::styled(format!("{schema_label} ▾"), theme::style_muted()),
-                Span::styled(" │ ", theme::style_faint()),
-                Span::styled("Alt-L ", theme::style_faint()),
-                Span::styled(
-                    match ctx.db.map(|d| d.select_limit).unwrap_or(50) {
-                        0 => "lim off".into(),
-                        n => format!("lim {n}"),
-                    },
-                    theme::style_muted(),
-                ),
-            ]))
-            .style(Style::default().bg(theme::bg())),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
             Rect {
                 x: inner.x,
                 y,
@@ -1379,6 +1413,8 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         }
         out_lines.push(Line::from(spans));
     }
+    // Idle plane stays empty — shortcuts live on the toolbar (and footer on focus).
+    // No faint duplicate strip at the bottom of Console.
     frame.render_widget(Paragraph::new(out_lines), inner);
 
     if focused
@@ -1542,7 +1578,7 @@ fn render_git(frame: &mut Frame, area: Rect, git: Option<&GitState>, focused: bo
                 items.extend(g.files.iter().enumerate().map(|(i, f)| {
                     let mark = if f.staged { "S" } else { " " };
                     let style = if i == g.selected {
-                        Style::default().bg(Color::Rgb(40, 40, 50))
+                        theme::style_selected()
                     } else {
                         Style::default()
                     };
@@ -1586,7 +1622,7 @@ fn render_sessions(
             )));
             for (i, p) in s.profiles.iter().enumerate() {
                 let style = if i == s.selected {
-                    Style::default().bg(Color::Rgb(40, 40, 50))
+                    theme::style_selected()
                 } else {
                     Style::default()
                 };
@@ -1644,10 +1680,7 @@ fn render_agents(
             for (i, p) in a.profiles.iter().enumerate() {
                 let live = a.live.iter().any(|l| l.profile_id == p.id);
                 let style = if i == a.selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 40, 50))
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
+                    theme::style_selected()
                 } else {
                     Style::default().fg(Color::Gray).bg(Color::Black)
                 };
@@ -1763,7 +1796,7 @@ fn render_search(frame: &mut Frame, area: Rect, search: Option<&SearchState>, fo
             .enumerate()
             .map(|(i, h)| {
                 let style = if i == s.selected {
-                    Style::default().bg(Color::Rgb(40, 40, 50))
+                    theme::style_selected()
                 } else {
                     Style::default().fg(Color::Gray)
                 };
@@ -1855,7 +1888,7 @@ fn render_debug_side(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 .and_then(|p| p.rsplit('/').next())
                 .unwrap_or("?");
             let style = if i == ctx.ui.debug_frame_selected {
-                Style::default().bg(Color::Rgb(40, 40, 50)).fg(Color::White)
+                theme::style_selected()
             } else {
                 Style::default().fg(Color::Gray)
             };
@@ -2225,32 +2258,41 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let ncols = result.columns.len();
     let compact = ctx.ui.results_compact;
     let density_tag = if compact { "compact" } else { "comfort" };
-    let filter_tag = if db.results_filter.trim().is_empty() {
-        String::new()
+    // Border title: short label only. All metrics live on the meta line.
+    let title = if focused {
+        " Results ".to_string()
     } else {
-        format!(" · /{}", db.results_filter.trim())
+        " results ".to_string()
     };
-    let title = format!(
-        " {}{nrows}×{ncols} · {} ms{}{}{}{}{}{} · {density_tag} ",
-        if focused { "Results · " } else { "results · " },
-        result.elapsed_ms,
-        if table_label.is_empty() {
-            String::new()
-        } else {
-            format!(" · {table_label}")
-        },
-        pk_label,
-        if result.truncated { " · truncated" } else { "" },
-        if result.has_more {
-            format!(" · page {}+", result.page + 1)
-        } else if result.page > 0 {
-            format!(" · page {}", result.page + 1)
-        } else {
-            String::new()
-        },
-        dirty_label,
-        filter_tag,
-    );
+    let mut meta_bits: Vec<String> = vec![
+        format!("{nrows}×{ncols}"),
+        density_tag.to_string(),
+        format!("{} ms", result.elapsed_ms),
+    ];
+    if !table_label.is_empty() {
+        meta_bits.push(table_label);
+    }
+    if !pk_label.trim().is_empty() {
+        meta_bits.push(pk_label.trim().to_string());
+    }
+    if result.truncated {
+        meta_bits.push("truncated".into());
+    }
+    if result.has_more {
+        meta_bits.push(format!("page {}+", result.page + 1));
+    } else if result.page > 0 {
+        meta_bits.push(format!("page {}", result.page + 1));
+    }
+    if db.select_limit > 0 {
+        meta_bits.push(format!("lim {}", db.select_limit));
+    }
+    if !dirty_label.trim().is_empty() {
+        meta_bits.push(dirty_label.trim().to_string());
+    }
+    if !db.results_filter.trim().is_empty() {
+        meta_bits.push(format!("/{}", db.results_filter.trim()));
+    }
+    let meta_line = format!(" {} ", meta_bits.join(" · "));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2259,6 +2301,25 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         .style(Style::default().bg(theme::bg()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // Meta strip under the border title (always when we have height).
+    let inner = if inner.height >= 3 {
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(2)])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_chars(&meta_line, parts[0].width as usize),
+                theme::style_faint(),
+            )))
+            .style(Style::default().bg(theme::bg())),
+            parts[0],
+        );
+        parts[1]
+    } else {
+        inner
+    };
 
     let inner = if table_tab && inner.height >= 3 {
         let chunks = Layout::default()
@@ -2271,10 +2332,14 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         inner
     };
 
-    let max_col_width = if compact { 14usize } else { 22usize };
+    // Full cell value lives in a Hover card (not a permanent bottom strip).
+    let grid_area = inner;
+
+    // compact = scan density; comfort = readable text (body/json) without leaving the grid.
+    let max_col_width = if compact { 14usize } else { 30usize };
     let row_stride = if compact { 1usize } else { 2usize };
     let cell_stride = max_col_width + 2; // leading/trailing space
-    let vis_cols = (inner.width as usize / cell_stride).max(1);
+    let vis_cols = (grid_area.width as usize / cell_stride).max(1);
     let pinned = ctx.ui.results_pinned_cols.min(ncols).min(vis_cols.saturating_sub(1));
     let scroll_budget = vis_cols.saturating_sub(pinned).max(1);
     // Horizontal window follows the cursor column; pinned cols stay visible.
@@ -2318,7 +2383,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         .filter(|(_, row)| ide_db::row_matches_filter(row, &filter))
         .map(|(i, _)| i)
         .collect();
-    let body_h = inner.height.saturating_sub(2) as usize;
+    let body_h = grid_area.height.saturating_sub(2) as usize;
     let visible_rows = (body_h / row_stride).max(1);
     let cursor_in_filtered = filtered_idx
         .iter()
@@ -2370,7 +2435,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     } else if ci < pinned {
                         Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
                     } else if is_null {
-                        theme::style_faint()
+                        theme::style_faint().add_modifier(Modifier::ITALIC)
                     } else {
                         theme::style_text()
                     };
@@ -2383,7 +2448,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         ));
         if !compact {
             rows.push(Line::from(Span::styled(
-                " ".repeat(inner.width as usize),
+                " ".repeat(grid_area.width as usize),
                 theme::style_faint(),
             )));
         }
@@ -2393,7 +2458,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     } else {
         String::new()
     };
-    let rule_w = (inner.width as usize).saturating_sub(h_hint.chars().count());
+    let rule_w = (grid_area.width as usize).saturating_sub(h_hint.chars().count());
     let rule = Line::from(Span::styled(
         format!("{}{}", "─".repeat(rule_w), h_hint),
         theme::style_faint(),
@@ -2408,7 +2473,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     lines.extend(rows);
     if let Some(chart) = &result.chart {
         lines.push(Line::from(Span::styled(
-            "─".repeat(inner.width as usize),
+            "─".repeat(grid_area.width as usize),
             theme::style_faint(),
         )));
         for cl in chart.lines().take(8) {
@@ -2419,11 +2484,37 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         }
     } else if let Some(ex) = &result.explain {
         lines.push(Line::from(Span::styled(
-            truncate_chars(ex, inner.width as usize),
+            truncate_chars(ex, grid_area.width as usize),
             theme::style_faint(),
         )));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), grid_area);
+
+    if focused {
+        let col_name = result
+            .columns
+            .get(result.cursor_col)
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let raw = if editing {
+            ctx.ui.cell_edit_input.as_str()
+        } else {
+            result
+                .rows
+                .get(result.cursor_row)
+                .and_then(|r| r.get(result.cursor_col))
+                .map(|s| s.as_str())
+                .unwrap_or("")
+        };
+        // Only float when the grid cell is truncated or the value is long / NULL.
+        let cell_shown_w = max_col_width;
+        let needs_hover = raw == "NULL"
+            || raw.chars().count() > cell_shown_w
+            || editing;
+        if needs_hover {
+            render_cell_hover(frame, grid_area, col_name, raw);
+        }
+    }
 }
 
 fn render_diagnostics(frame: &mut Frame, area: Rect, diags: &[DiagnosticItem], ui: &UiState) {
@@ -2458,7 +2549,7 @@ fn render_diagnostics(frame: &mut Frame, area: Rect, diags: &[DiagnosticItem], u
                     d.message
                 );
                 let style = if i == ui.diag_selected && focused {
-                    Style::default().bg(Color::Rgb(40, 40, 50))
+                    theme::style_selected()
                 } else if sev == "E" {
                     Style::default().fg(Color::Red)
                 } else if sev == "W" {
@@ -2581,7 +2672,7 @@ fn render_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         spans.push(Span::styled(format!(" | {} ", msg.text), style));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 30, 30))),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
         area,
     );
 }
@@ -2640,14 +2731,18 @@ fn render_completion_popup(
     let right = editor_area.x.saturating_add(editor_area.width);
 
     // Prefer BELOW the caret so typed text stays visible; flip ABOVE if needed.
-    let y = if caret_y.saturating_add(1).saturating_add(height) <= bottom {
+    // Never sit on the Console toolbar strip (first chrome rows inside the pane).
+    let toolbar_floor = editor_area.y.saturating_add(3);
+    let mut y = if caret_y.saturating_add(1).saturating_add(height) <= bottom {
         caret_y.saturating_add(1)
-    } else if caret_y.saturating_sub(top) >= height {
+    } else if caret_y.saturating_sub(toolbar_floor.max(top)) >= height {
         caret_y.saturating_sub(height)
     } else {
-        // Squeeze into remaining pane — pin to bottom edge of Console.
-        bottom.saturating_sub(height).max(top)
+        bottom.saturating_sub(height).max(toolbar_floor.min(bottom.saturating_sub(height)))
     };
+    if y < toolbar_floor && toolbar_floor.saturating_add(height) <= bottom {
+        y = toolbar_floor;
+    }
 
     // Prefer to the RIGHT of the caret (prefix stays readable); else left; else clamp.
     let x = if caret_x.saturating_add(2).saturating_add(width) <= right {
@@ -2671,12 +2766,21 @@ fn render_completion_popup(
         .take(10)
         .map(|(i, c)| {
             let detail = c.detail.as_deref().unwrap_or("");
-            let style = if i == ui.completion_idx {
-                Style::default().bg(Color::Blue).fg(Color::White)
+            let selected = i == ui.completion_idx;
+            let label_style = if selected {
+                theme::style_selected()
             } else {
-                Style::default()
+                theme::style_text()
             };
-            ListItem::new(Span::styled(format!(" {}  {}", c.label, detail), style))
+            let detail_style = if selected {
+                theme::style_selected()
+            } else {
+                theme::style_faint()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {} ", c.label), label_style),
+                Span::styled(format!("{detail} "), detail_style),
+            ]))
         })
         .collect();
     frame.render_widget(Clear, area);
@@ -2686,16 +2790,22 @@ fn render_completion_popup(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::border_idle()))
                 .style(Style::default().bg(theme::bg()))
-                .title(" Completions "),
+                .title(Span::styled(
+                    " Completions ",
+                    Style::default()
+                        .fg(theme::bg())
+                        .bg(theme::text())
+                        .add_modifier(Modifier::BOLD),
+                )),
         ),
         area,
     );
 }
 
 fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
-    let width = editor_area.width.saturating_sub(4).min(70);
-    let lines: Vec<&str> = hover.lines().take(10).collect();
-    let height = (lines.len() as u16).saturating_add(2).min(14);
+    let width = editor_area.width.saturating_sub(4).min(70).max(24);
+    let wrapped = hover_wrap_lines(hover, (width as usize).saturating_sub(4).max(12));
+    let height = (wrapped.len() as u16).saturating_add(2).min(14);
     let area = Rect {
         x: editor_area.x + 2,
         y: editor_area.y + 1,
@@ -2703,12 +2813,102 @@ fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
         height,
     };
     frame.render_widget(Clear, area);
+    let body: Vec<Line> = wrapped
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, theme::style_text())))
+        .collect();
     frame.render_widget(
-        Paragraph::new(hover.to_string())
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" Hover ")),
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::border_idle()))
+                .style(Style::default().bg(theme::bg()))
+                .title(Span::styled(
+                    " Hover ",
+                    Style::default()
+                        .fg(theme::bg())
+                        .bg(theme::text())
+                        .add_modifier(Modifier::BOLD),
+                )),
+        ),
         area,
     );
+}
+
+/// Results cell full-value card — replaces the old bottom gray preview strip.
+fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &str) {
+    if grid_area.width < 16 || grid_area.height < 4 {
+        return;
+    }
+    let width = grid_area.width.saturating_sub(4).min(72).max(28);
+    let inner_w = (width as usize).saturating_sub(4).max(12);
+    let body_lines = hover_wrap_lines(raw, inner_w);
+    let height = (body_lines.len() as u16)
+        .saturating_add(2)
+        .min(10)
+        .min(grid_area.height.saturating_sub(1));
+    // Prefer upper-right of the Results pane so the cursor row stays visible.
+    let x = grid_area
+        .x
+        .saturating_add(grid_area.width.saturating_sub(width).saturating_sub(1));
+    let y = grid_area.y.saturating_add(1);
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    let title = format!(" {} ", truncate_chars(col_name, 24));
+    let body: Vec<Line> = body_lines
+        .into_iter()
+        .map(|l| {
+            let style = if raw == "NULL" {
+                theme::style_faint().add_modifier(Modifier::ITALIC)
+            } else {
+                theme::style_text()
+            };
+            Line::from(Span::styled(l, style))
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::border_idle()))
+                .style(Style::default().bg(theme::bg()))
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(theme::bg())
+                        .bg(theme::text())
+                        .add_modifier(Modifier::BOLD),
+                )),
+        ),
+        area,
+    );
+}
+
+fn hover_wrap_lines(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut out = Vec::new();
+    for para in s.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let chars: Vec<char> = para.chars().collect();
+        for chunk in chars.chunks(width) {
+            out.push(chunk.iter().collect());
+            if out.len() >= 8 {
+                return out;
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_active: bool) {
@@ -2985,50 +3185,76 @@ fn render_db_home(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         area,
     );
 
-    // Home is actions-only: A add · W workspaces (no source list).
-    let sel = ctx.ui.home_selected.min(1);
-    let col = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(28),
-            Constraint::Length(7),
-            Constraint::Min(1),
-        ])
-        .margin(3)
-        .split(area);
-
-    let row = |selected: bool, key: &str, label: &str| -> Line<'static> {
-        let key_style = if selected {
-            theme::style_selected()
-        } else {
-            theme::style_muted()
-        };
-        let label_style = if selected {
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            theme::style_text()
-        };
-        Line::from(vec![
-            Span::styled(format!("  {key}  "), key_style),
-            Span::styled(format!(" {label} "), label_style),
-        ])
+    // Brand lives in the header — body shows connections (DataGrip-like) + A/W tips.
+    let sources = ctx.db.map(|d| d.sources.as_slice()).unwrap_or(&[]);
+    let active = ctx.db.and_then(|d| d.active_source.as_deref());
+    let n = sources.len();
+    let sel = if n == 0 {
+        0
+    } else {
+        ctx.ui.home_selected.min(n.saturating_sub(1))
     };
 
-    let hero = vec![
+    // Tips live only in the footer — avoid duplicating Enter/A/W in the body.
+    let col = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(4)])
+        .margin(2)
+        .split(area);
+
+    let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled(
-            "DB Studio",
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::BOLD),
+            "Connections",
+            theme::style_muted().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        row(sel == 0, "A", "add"),
-        Line::from(""),
-        row(sel == 1, "W", "workspaces"),
     ];
-    frame.render_widget(Paragraph::new(hero), col[1]);
+
+    if sources.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No connections yet — A to add",
+            theme::style_faint(),
+        )));
+    } else {
+        for (i, src) in sources.iter().enumerate() {
+            let is_sel = i == sel;
+            let is_active = active == Some(src.id.as_str());
+            let mark = if is_active { "●" } else { "○" };
+            let where_ = match src.driver {
+                ide_db::DbDriver::Sqlite => {
+                    if src.file.is_empty() {
+                        "sqlite".into()
+                    } else {
+                        truncate_chars(&src.file, 36)
+                    }
+                }
+                _ => {
+                    if src.database.is_empty() {
+                        format!("{}:{}", src.host, src.port)
+                    } else {
+                        format!("{}:{}/{}", src.host, src.port, src.database)
+                    }
+                }
+            };
+            let label = format!(
+                " {mark} {} · {} · {where_}",
+                src.name,
+                src.driver.label()
+            );
+            let style = if is_sel {
+                Style::default()
+                    .fg(theme::text())
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else if is_active {
+                theme::style_text().add_modifier(Modifier::BOLD)
+            } else {
+                theme::style_text()
+            };
+            lines.push(Line::from(Span::styled(label, style)));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), col[1]);
 }
 
 fn render_db_home_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
@@ -3061,7 +3287,7 @@ fn render_db_home_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  A add  ·  W workspaces ",
+                "  Enter open  ·  A add  ·  W workspaces ",
                 theme::style_faint(),
             ),
         ])
@@ -3086,7 +3312,7 @@ fn studio_console_area(size: Rect, ui: &UiState) -> Rect {
     let results_pct = ui.results_pct.clamp(25, 70);
     let top_pct = 100u16.saturating_sub(results_pct).max(30);
     let top_h = (body.height as u32 * top_pct as u32 / 100).max(3) as u16;
-    let left_w = ui.studio_left_width.clamp(28, 120).min(body.width.saturating_sub(24));
+    let left_w = studio_left_stack_width(body.width, ui.studio_left_width);
     Rect {
         x: body.x.saturating_add(left_w),
         y: body.y,
@@ -3134,12 +3360,12 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(root[1]);
         // Keep explorer|structure|console on top strip when terminal open.
-        let left_w = ctx.ui.studio_left_width.clamp(28, 120);
+        let left_w = studio_left_stack_width(body[0].width, ctx.ui.studio_left_width);
         let top = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(left_w), Constraint::Min(24)])
             .split(body[0]);
-        let explor_w = ctx.ui.explorer_width.clamp(14, left_w.saturating_sub(12));
+        let explor_w = studio_explorer_width(left_w, ctx.ui.explorer_width);
         let left = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(explor_w), Constraint::Min(10)])
@@ -3181,17 +3407,14 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
             ])
             .split(root[1]);
 
-        let left_w = ctx.ui.studio_left_width.clamp(28, 120);
+        let left_w = studio_left_stack_width(body[0].width, ctx.ui.studio_left_width);
         let top = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(left_w), Constraint::Min(24)])
             .split(body[0]);
 
-        // Explorer | Structure — explorer width is user-resizable.
-        let explor_w = ctx
-            .ui
-            .explorer_width
-            .clamp(14, left_w.saturating_sub(12));
+        // Explorer | Structure — keep Structure ≥24 cols so empty-state copy stays readable.
+        let explor_w = studio_explorer_width(left_w, ctx.ui.explorer_width);
         let left = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -3253,7 +3476,7 @@ fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         _ => "Studio",
     };
     let hint = match ctx.ui.focus {
-        Focus::Database => "Enter open · d DDL · n New · Super-⇧A search",
+        Focus::Database => "Enter open · p props · e edit · n New · d DDL",
         Focus::Structure => "Ctrl+←→ split  ·  Esc explorer",
         Focus::Editor if matches!(ctx.ui.mode, Mode::Insert) => {
             "typing · Alt-b DB · Alt-s schema · Alt-L limit · Esc"
@@ -3266,7 +3489,7 @@ fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         Focus::Results if ctx.db.is_some_and(|d| d.active_is_table_tab()) => {
             "w WHERE · o ORDER BY · x close tab · r refresh"
         }
-        Focus::Results => "x close · r refresh · ]/[ page · Alt-L limit",
+        Focus::Results => "D density · cell hover · ]/[ page · Alt-L limit",
         Focus::Git => "Esc/q back · s stage · c commit",
         Focus::Terminal => "q exits pager · Ctrl-` / Esc back",
         Focus::Search | Focus::Outline | Focus::Debug => "Esc/q back to Studio",
@@ -3441,6 +3664,18 @@ fn render_nvim_host_status(
 }
 
 /// Truncate on Unicode char boundaries (byte slices panic on multi-byte glyphs like —).
+/// Studio left stack (Explorer+Structure): prefer enough room for Structure copy.
+fn studio_left_stack_width(body_width: u16, configured: u16) -> u16 {
+    let max = body_width.saturating_sub(24).max(40);
+    configured.clamp(40, 120).min(max)
+}
+
+/// Cap Explorer so Structure keeps ≥24 cols (readable empty state / titles).
+fn studio_explorer_width(left_w: u16, configured: u16) -> u16 {
+    let max_explor = left_w.saturating_sub(24).max(14);
+    configured.clamp(14, max_explor)
+}
+
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -3453,4 +3688,172 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(keep).collect();
     out.push('…');
     out
+}
+
+/// Build Console toolbar spans; drop schema then database as whole chips when narrow.
+fn console_toolbar_spans(
+    running: bool,
+    db_label: &str,
+    schema_label: &str,
+    lim: &str,
+    width: u16,
+) -> Vec<Span<'static>> {
+    let run = if running {
+        Span::styled(" RUNNING… Esc ", theme::style_selected())
+    } else {
+        Span::styled(" F5 run ", theme::style_faint())
+    };
+    let lim_span = Span::styled(format!("Alt-L {lim}"), theme::style_muted());
+    let db_chip = format!("Alt-b {db_label} ▾");
+    let schema_chip = format!("Alt-s {schema_label} ▾");
+
+    // Candidates from richest → sparsest; pick first that fits.
+    let candidates: Vec<Vec<Span<'static>>> = vec![
+        vec![
+            Span::styled(" ", theme::style_faint()),
+            run.clone(),
+            Span::styled(" │ ", theme::style_faint()),
+            Span::styled(db_chip.clone(), theme::style_muted()),
+            Span::styled(" │ ", theme::style_faint()),
+            Span::styled(schema_chip.clone(), theme::style_muted()),
+            Span::styled(" │ ", theme::style_faint()),
+            lim_span.clone(),
+        ],
+        vec![
+            Span::styled(" ", theme::style_faint()),
+            run.clone(),
+            Span::styled(" │ ", theme::style_faint()),
+            Span::styled(db_chip.clone(), theme::style_muted()),
+            Span::styled(" │ ", theme::style_faint()),
+            lim_span.clone(),
+        ],
+        vec![
+            Span::styled(" ", theme::style_faint()),
+            run.clone(),
+            Span::styled(" │ ", theme::style_faint()),
+            lim_span.clone(),
+        ],
+        vec![Span::styled(" ", theme::style_faint()), run, Span::raw(" "), lim_span],
+    ];
+
+    let max = width as usize;
+    for c in candidates {
+        let len: usize = c.iter().map(|s| s.content.chars().count()).sum();
+        if len <= max {
+            return c;
+        }
+    }
+    vec![
+        Span::styled(" F5 ", theme::style_faint()),
+        Span::styled(lim.to_string(), theme::style_muted()),
+    ]
+}
+
+/// Drop whole ` · `-separated tokens from the right before mid-glyph ellipsis.
+fn fit_dot_title(title: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if title.chars().count() <= max {
+        return title.to_string();
+    }
+    let parts: Vec<&str> = title.split(" · ").collect();
+    if parts.len() <= 1 {
+        return truncate_chars(title, max);
+    }
+    for keep in (1..parts.len()).rev() {
+        let candidate = parts[..keep].join(" · ");
+        if candidate.chars().count() <= max {
+            return candidate;
+        }
+    }
+    truncate_chars(parts[0], max)
+}
+
+/// Source row label: prefer `Name (Driver) [role]`, then drop driver, then role,
+/// then ellipsize only the name — never mid-token clips like `[ad…]`.
+fn fit_explorer_source_label(base_label: &str, role: Option<&str>, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let role_tag = role
+        .filter(|r| !r.is_empty())
+        .map(|r| format!(" [{r}]"))
+        .unwrap_or_default();
+
+    // base is typically "★ Name (PostgreSQL)" from source_tree_node.
+    let (prefix_name, driver) = match base_label.rfind(" (") {
+        Some(i) if base_label.ends_with(')') => {
+            let name = &base_label[..i];
+            let drv = &base_label[i + 2..base_label.len() - 1];
+            (name, Some(drv))
+        }
+        _ => (base_label, None),
+    };
+
+    let with_driver = match driver {
+        Some(d) => format!("{prefix_name} ({d}){role_tag}"),
+        None => format!("{prefix_name}{role_tag}"),
+    };
+    if with_driver.chars().count() <= max {
+        return with_driver;
+    }
+
+    let name_role = format!("{prefix_name}{role_tag}");
+    if name_role.chars().count() <= max {
+        return name_role;
+    }
+
+    if prefix_name.chars().count() <= max {
+        return prefix_name.to_string();
+    }
+
+    truncate_chars(prefix_name, max)
+}
+
+#[cfg(test)]
+mod explorer_label_tests {
+    use super::{fit_dot_title, fit_explorer_source_label};
+
+    #[test]
+    fn keeps_full_when_room() {
+        let s = fit_explorer_source_label("DataLake (PostgreSQL)", Some("admin"), 40);
+        assert_eq!(s, "DataLake (PostgreSQL) [admin]");
+    }
+
+    #[test]
+    fn structure_title_drops_right_tokens() {
+        let s = fit_dot_title("query · rag · public.session_notes", 18);
+        assert_eq!(s, "query · rag");
+        assert!(!s.ends_with('·'));
+        assert!(!s.contains("session"));
+    }
+
+    #[test]
+    fn structure_title_keeps_short() {
+        assert_eq!(fit_dot_title("public.users", 40), "public.users");
+    }
+
+    #[test]
+    fn drops_driver_before_role() {
+        let s = fit_explorer_source_label("DataLake (PostgreSQL)", Some("admin"), 22);
+        assert_eq!(s, "DataLake [admin]");
+        assert!(!s.contains('…'));
+    }
+
+    #[test]
+    fn drops_role_whole_never_mid_bracket() {
+        let s = fit_explorer_source_label("DataLake (PostgreSQL)", Some("admin"), 10);
+        assert_eq!(s, "DataLake");
+        assert!(!s.contains('['));
+        assert!(!s.contains("ad…"));
+    }
+
+    #[test]
+    fn ellipsizes_name_only_when_forced() {
+        let s = fit_explorer_source_label("VeryLongConnectionName (PostgreSQL)", Some("admin"), 8);
+        assert!(s.ends_with('…'));
+        assert!(!s.contains('['));
+        assert!(!s.contains('('));
+    }
 }

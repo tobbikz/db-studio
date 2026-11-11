@@ -451,6 +451,10 @@ impl DbConnectForm {
 
     pub fn cycle_role(&mut self, forward: bool) {
         self.role = self.role.cycle(forward);
+        // Admin implies writable — clear the separate read_only flag so they don't fight.
+        if self.role.allows_admin() {
+            self.read_only = false;
+        }
     }
 
     pub fn cycle_ssl_mode(&mut self, forward: bool) {
@@ -638,12 +642,18 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
         if matches!(field, ConnField::SslMode | ConnField::SslTrustCert) && !saw_ssl {
             saw_ssl = true;
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("tls", theme::style_faint())));
+            lines.push(Line::from(Span::styled(
+                "TLS",
+                theme::style_muted().add_modifier(Modifier::BOLD),
+            )));
         }
         if matches!(field, ConnField::SshHost) && !saw_ssh {
             saw_ssh = true;
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("ssh", theme::style_faint())));
+            lines.push(Line::from(Span::styled(
+                "SSH",
+                theme::style_muted().add_modifier(Modifier::BOLD),
+            )));
         }
 
         let focused = form.focus == field;
@@ -709,10 +719,15 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
             value
         };
 
-        let value_style = if focused {
+        // Placeholders stay italic+faint so they never look like filled values.
+        let value_style = if focused && !empty {
             theme::style_text().add_modifier(Modifier::BOLD)
+        } else if focused && empty && !cycle {
+            theme::style_faint().add_modifier(Modifier::ITALIC | Modifier::BOLD)
         } else if empty && !cycle {
-            theme::style_faint()
+            theme::style_faint().add_modifier(Modifier::ITALIC)
+        } else if focused {
+            theme::style_text().add_modifier(Modifier::BOLD)
         } else {
             theme::style_muted()
         };
@@ -743,18 +758,23 @@ pub fn render_db_connect_form(frame: &mut Frame, screen: Rect, form: &DbConnectF
         1
     };
 
-    // One key per action (F6 still works; not advertised).
+    // Primary CTA elevated; secondary actions stay quiet.
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Tab", theme::style_faint()),
-            Span::styled(" · ", theme::style_faint()),
-            Span::styled("←→", theme::style_faint()),
+            Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if form.is_edit { " save " } else { " create " },
+                theme::style_faint(),
+            ),
             Span::styled(" · ", theme::style_faint()),
             Span::styled("^T", theme::style_faint()),
-            Span::styled(" test · ", theme::style_faint()),
-            Span::styled("Enter", theme::style_faint()),
-            Span::styled(" · ", theme::style_faint()),
-            Span::styled("Esc", theme::style_faint()),
+            Span::styled(" test · Tab · ←→ · Esc", theme::style_faint()),
         ])),
         inner[foot_idx],
     );

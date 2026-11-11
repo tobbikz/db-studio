@@ -102,6 +102,45 @@ impl Palette {
             item("Set console database…", "console_database"),
             item("Set console schema…", "console_schema"),
             item("Studio help", "studio_help"),
+            item("Onboarding tips", "onboarding_tips"),
+            item("Recipe gallery", "recipe_gallery"),
+            item("Recipe: top customers", "recipe_top_customers"),
+            item("Recipe: revenue by day", "recipe_revenue_by_day"),
+            item("Recipe: stratified sample", "recipe_stratified_sample"),
+            item("Recipe: embedding similarity", "recipe_embedding_similarity"),
+            item("Recipe: feature table", "recipe_feature_table"),
+            item("Recipe: batch score", "recipe_batch_score"),
+            item("Chart results (bar)", "chart_bar"),
+            item("Chart results (line)", "chart_line"),
+            item("Chart results (pie)", "chart_pie"),
+            item("Export result pack (SQL+CSV)", "export_result_pack"),
+            item("Quality strip (null%/stats)", "quality_strip"),
+            item("Toggle mask PII", "toggle_mask_pii"),
+            item("Privilege audit (role…)", "privilege_audit"),
+            item("Export audit log CSV", "export_audit_csv"),
+            item("Diagnose pack (support)", "diagnose_pack"),
+            item("Column lineage sketch", "lineage_sketch"),
+            item("CDC / replication lag", "cdc_lag"),
+            item("dbt detect project", "dbt_detect"),
+            item("dbt run (Agents recipe)", "dbt_run"),
+            item("dbt test (Agents recipe)", "dbt_test"),
+            item("dbt compile (Agents recipe)", "dbt_compile"),
+            item("dbt schema.yml stubs", "dbt_schema_stubs"),
+            item("Airflow DAGs deep-link", "airflow_link"),
+            item("BI deep-link (Superset/Metabase)", "bi_deeplink"),
+            item("BI export CSV path", "bi_export_csv"),
+            item("Model registry deep-link", "model_registry_link"),
+            item("Codegen Rust struct", "codegen_rust"),
+            item("Codegen TypeScript interface", "codegen_ts"),
+            item("Seed fixtures from testdata/", "seed_fixtures"),
+            item("Golden CSV diff vs results", "golden_diff"),
+            item("Fan-out rowcount assert", "fanout_assert"),
+            item("EXPLAIN cost / bytes", "explain_cost"),
+            item("Schema ADR stub note", "schema_adr_stub"),
+            item("Naming hint (logical→physical)", "naming_hint"),
+            item("Health webhook test", "health_webhook"),
+            item("Signed connection pack export", "signed_conn_pack"),
+            item("Agents: ask→SQL preset seed", "agents_ask_sql"),
             item("Code help", "code_help"),
             item("Yank Neovim → host clipboard", "yank_clipboard"),
             item("Paste host clipboard → editor", "paste_clipboard"),
@@ -159,9 +198,11 @@ impl Palette {
             item("Edit connection", "edit_connection"),
             item("Duplicate connection", "duplicate_connection"),
             item("Delete connection", "delete_connection"),
-            item("Vacuum (analyze) table", "vacuum_analyze"),
-            item("Analyze table", "analyze_table"),
-            item("Reindex table", "reindex_table"),
+            item("Maintain: vacuum/optimize/rebuild", "vacuum_analyze"),
+            item("Maintain: analyze/statistics", "analyze_table"),
+            item("Maintain: reindex/rebuild", "reindex_table"),
+            item("Inspect table privileges", "inspect_privileges"),
+            item("List RLS policies (Postgres)", "inspect_policies"),
             item("Timing histogram", "timing_histogram"),
             item("Find table/view (explorer)", "db_object_search"),
             item("Add Brain (Postgres)", "add_brain"),
@@ -325,16 +366,16 @@ impl Palette {
     }
 
     pub fn open_create() -> Self {
-        let items = vec![
-            item("Query Console", "create_query"),
-            item("Schema", "create_schema"),
-            item("Table", "create_table"),
-            item("View", "create_view"),
-            item("Index", "create_index"),
-            item("Role / User", "create_role"),
-            item("Database", "create_database"),
-            item("Data Source…", "add_datasource"),
-        ];
+        Self::open_create_for(ide_db::DbDriver::Postgres)
+    }
+
+    /// Create menu filtered by what the active driver supports.
+    pub fn open_create_for(driver: ide_db::DbDriver) -> Self {
+        let mut items = vec![item("Query Console", "create_query")];
+        for (label, id) in crate::create_dialect::create_menu_ids(driver) {
+            items.push(item(label, id));
+        }
+        items.push(item("Data Source…", "add_datasource"));
         let mut p = Self {
             mode: PaletteMode::Create,
             query: String::new(),
@@ -539,16 +580,16 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
     frame.render_widget(Clear, area);
 
     let title = match palette.mode {
-        PaletteMode::Commands => " commands ",
-        PaletteMode::Files => " open file ",
-        PaletteMode::CodeActions => " actions ",
-        PaletteMode::Projects => " projects ",
-        PaletteMode::Workspaces => " workspaces ",
-        PaletteMode::DbObjects => " find object ",
-        PaletteMode::Create => " new ",
-        PaletteMode::SearchEverywhere => " search everywhere ",
-        PaletteMode::ConsoleDatabase => " database ",
-        PaletteMode::ConsoleSchema => " schema ",
+        PaletteMode::Commands => " Commands ",
+        PaletteMode::Files => " Open file ",
+        PaletteMode::CodeActions => " Actions ",
+        PaletteMode::Projects => " Projects ",
+        PaletteMode::Workspaces => " Workspaces ",
+        PaletteMode::DbObjects => " Find object ",
+        PaletteMode::Create => " New ",
+        PaletteMode::SearchEverywhere => " Search everywhere ",
+        PaletteMode::ConsoleDatabase => " Database ",
+        PaletteMode::ConsoleSchema => " Schema ",
     };
 
     frame.render_widget(
@@ -622,15 +663,22 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            " no matches ",
-            theme::style_faint(),
+            " No matches — clear filter or Esc ",
+            theme::style_faint().add_modifier(Modifier::ITALIC),
         )));
     }
     frame.render_widget(Paragraph::new(lines), inner[2]);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" Enter open  ·  Esc close ", theme::style_faint()),
+            Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" open  ·  Esc close ", theme::style_faint()),
         ])),
         inner[4],
     );
@@ -807,7 +855,7 @@ pub fn render_brain_ask(frame: &mut Frame, screen: Rect, input: &str) {
     render_path_prompt(
         frame,
         screen,
-        " brain ask ",
+        " Brain ask ",
         "  natural-language question",
         "  uses brain/rag CLI or BRAIN_DSN · brain.consult",
         input,
@@ -822,7 +870,7 @@ pub fn render_import_csv(frame: &mut Frame, screen: Rect, input: &str) {
         render_path_prompt(
             frame,
             screen,
-            " import JSON ",
+            " Import JSON ",
             "  path to JSON array / NDJSON of objects",
             "  target = open table result or explorer selection",
             input,
@@ -831,7 +879,7 @@ pub fn render_import_csv(frame: &mut Frame, screen: Rect, input: &str) {
         render_path_prompt(
             frame,
             screen,
-            " import CSV ",
+            " Import CSV ",
             "  path to CSV (header row required)",
             "  target = open table result or explorer selection",
             input,
@@ -920,7 +968,7 @@ pub fn render_open_folder(frame: &mut Frame, screen: Rect, input: &str) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::border_idle()))
             .style(Style::default().bg(theme::surface()))
-            .title(" open folder "),
+            .title(" Open folder "),
         area,
     );
     let inner = Layout::default()
@@ -1001,7 +1049,7 @@ pub fn render_settings_modal(frame: &mut Frame, screen: Rect, draft: &str) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::border_idle()))
             .style(Style::default().bg(theme::surface()))
-            .title(" settings "),
+            .title(" Settings "),
         area,
     );
     let inner = Layout::default()
@@ -1122,13 +1170,14 @@ pub fn render_error_dialog(frame: &mut Frame, screen: Rect, title: &str, message
             ),
             Span::styled(" / ", theme::style_faint()),
             Span::styled(" Esc ", theme::style_pill_off()),
-            Span::styled(" dismiss · fix SQL in Console", theme::style_faint()),
+            Span::styled(" dismiss", theme::style_faint()),
         ])),
         inner[3],
     );
 }
 
 fn textwrap_lines(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
     let mut out = Vec::new();
     for para in s.split('\n') {
         if para.is_empty() {
@@ -1137,14 +1186,26 @@ fn textwrap_lines(s: &str, width: usize) -> Vec<String> {
         }
         let mut line = String::new();
         for word in para.split_whitespace() {
-            if line.is_empty() {
-                line = word.to_string();
-            } else if line.chars().count() + 1 + word.chars().count() <= width {
-                line.push(' ');
-                line.push_str(word);
+            // Hard-break overlong tokens so 100-col modals never blow the frame.
+            let chunks = if word.chars().count() > width {
+                let chars: Vec<char> = word.chars().collect();
+                chars
+                    .chunks(width)
+                    .map(|c| c.iter().collect::<String>())
+                    .collect::<Vec<_>>()
             } else {
-                out.push(std::mem::take(&mut line));
-                line = word.to_string();
+                vec![word.to_string()]
+            };
+            for chunk in chunks {
+                if line.is_empty() {
+                    line = chunk;
+                } else if line.chars().count() + 1 + chunk.chars().count() <= width {
+                    line.push(' ');
+                    line.push_str(&chunk);
+                } else {
+                    out.push(std::mem::take(&mut line));
+                    line = chunk;
+                }
             }
         }
         if !line.is_empty() {
@@ -1206,15 +1267,21 @@ pub fn render_confirm_dialog(
         ])
         .margin(2)
         .split(area);
+    let msg_w = (width as usize).saturating_sub(6).max(20);
+    let msg_lines = textwrap_lines(message, msg_w);
     frame.render_widget(
-        Paragraph::new(Span::styled(
-            message,
-            theme::style_text().add_modifier(Modifier::BOLD),
-        )),
+        Paragraph::new(
+            msg_lines
+                .into_iter()
+                .map(|l| Line::from(Span::styled(l, theme::style_text().add_modifier(Modifier::BOLD))))
+                .collect::<Vec<_>>(),
+        ),
         inner[0],
     );
     let hint = if action_verb == "apply" {
         "Runs the listed UPDATE statements against the active source."
+    } else if action_verb.contains("save") {
+        "Unsaved buffers will be handled as chosen."
     } else {
         "Removes the entry from datasources.toml."
     };

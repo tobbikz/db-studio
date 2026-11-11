@@ -385,10 +385,43 @@ pub fn agents_path() -> Option<PathBuf> {
 }
 
 pub fn default_profiles() -> Vec<AgentProfile> {
+    let mut ask = AgentProfile::new("Ask → SQL (confirm)", AgentKind::Cursor);
+    ask.seed_prompt = "Write a SELECT for this schema. Show SQL only; I will confirm before run.\n".into();
+
+    let mut jupyter = AgentProfile::new("Python / Jupyter REPL", AgentKind::Custom);
+    jupyter.binary = "python3".into();
+    jupyter.seed_prompt = "import pandas as pd\n# load Studio CSV exports from explore_packs/\n".into();
+
+    let mut marimo = AgentProfile::new("Marimo notebook", AgentKind::Custom);
+    marimo.binary = "marimo".into();
+    marimo.args = vec!["edit".into()];
+
+    let mut dbt = AgentProfile::new("dbt shell", AgentKind::Custom);
+    dbt.binary = "bash".into();
+    dbt.args = vec!["-lc".into(), "dbt --help; exec bash".into()];
+
+    let mut mlflow = AgentProfile::new("MLOps mlflow", AgentKind::Custom);
+    mlflow.binary = "bash".into();
+    mlflow.args = vec!["-lc".into(), "mlflow --help || echo install mlflow; exec bash".into()];
+    mlflow.seed_prompt = "# Model registry / scoring — no secrets in seed\n".into();
+
+    let mut infer = AgentProfile::new("Inference health curl", AgentKind::Custom);
+    infer.binary = "bash".into();
+    infer.args = vec![
+        "-lc".into(),
+        "echo 'curl -sf $INFERENCE_URL/health || echo set INFERENCE_URL'; bash".into(),
+    ];
+
     vec![
         AgentProfile::new("Cursor Agent", AgentKind::Cursor),
         AgentProfile::new("Claude Code", AgentKind::Claude),
         AgentProfile::new("OpenCode", AgentKind::Opencode),
+        ask,
+        jupyter,
+        marimo,
+        dbt,
+        mlflow,
+        infer,
     ]
 }
 

@@ -63,6 +63,8 @@ pub enum Mode {
     AgentForm,
     /// Table data tab: edit WHERE or ORDER BY bar (DataGrip-style).
     EditTableFilter,
+    /// `n New` object create modal (table/schema/db/role/…) — not Console stubs.
+    CreateObject,
 }
 
 impl Mode {
@@ -93,6 +95,7 @@ impl Mode {
             Self::SessionForm => "SESSION",
             Self::AgentForm => "AGENT",
             Self::EditTableFilter => "TABLE-FILTER",
+            Self::CreateObject => "CREATE",
         }
     }
 }

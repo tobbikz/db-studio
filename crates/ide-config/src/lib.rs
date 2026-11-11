@@ -89,7 +89,8 @@ fn default_explorer_width() -> u16 {
     28
 }
 fn default_studio_left_width() -> u16 {
-    48
+    // Explorer (≤28) + Structure (≥24) needs ~52+; prefer readable Structure empty state.
+    56
 }
 fn default_results_pct() -> u16 {
     40

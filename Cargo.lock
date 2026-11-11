@@ -1840,6 +1840,7 @@ dependencies = [
  "futures-util",
  "mongodb",
  "redis",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
