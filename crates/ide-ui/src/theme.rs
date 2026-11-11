@@ -1,10 +1,21 @@
 //! tui-ide visual tokens — AMOLED black / white mono (host chrome).
 
 use ratatui::style::{Color, Modifier, Style};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// 0 = AMOLED black (default), 1 = white mono.
 static MODE: AtomicU8 = AtomicU8::new(0);
+
+/// Nerd Font glyphs in the Database studio (default on; ASCII fallback when off).
+static ICONS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_icons(on: bool) {
+    ICONS.store(on, Ordering::Relaxed);
+}
+
+pub fn icons_on() -> bool {
+    ICONS.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeMode {
@@ -53,6 +64,14 @@ pub fn surface_2() -> Color {
         Color::Rgb(235, 235, 235)
     } else {
         Color::Rgb(18, 18, 18)
+    }
+}
+/// Zebra / cursor-row plate for Results grid.
+pub fn surface_3() -> Color {
+    if white() {
+        Color::Rgb(225, 225, 225)
+    } else {
+        Color::Rgb(26, 26, 26)
     }
 }
 /// Elevated modal / dialog plate (reads above chrome).
@@ -160,6 +179,18 @@ pub fn style_faint() -> Style {
 }
 pub fn style_accent() -> Style {
     Style::default().fg(accent())
+}
+pub fn style_warn() -> Style {
+    Style::default().fg(warn()).add_modifier(Modifier::BOLD)
+}
+pub fn style_title(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(text())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(muted())
+    }
 }
 pub fn style_selected() -> Style {
     if white() {

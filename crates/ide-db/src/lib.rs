@@ -38,7 +38,8 @@ pub use persona::{
     post_health_webhook, privilege_audit_sql, quality_strip, recipe_gallery, signed_pack_export,
     studio_help_personas, bi_deep_link, airflow_deep_link, model_registry_link, PersonaConfig,
 };
-pub use result_chart::chart_result;
+pub use explain_format::{explain_visual_ascii, postgres_explain_grid};
+pub use result_chart::{chart_kind, chart_result, latency_sparkline, selection_stats};
 pub use schema_cache::{expecting_relation, SchemaNameCache, SqlCompletionItem};
 
 use anyhow::{Context, Result, bail};
@@ -1290,6 +1291,8 @@ pub struct DbWorkspace {
     pub active_schema: Option<String>,
     pub sql: String,
     pub history: Vec<QueryHistoryEntry>,
+    /// Recent query latencies (ms, oldest first) for the footer sparkline.
+    pub latency_history: Vec<u128>,
     pub bookmarks: Vec<String>,
     /// Workspace (or config) directory for saved `.sql` query files.
     pub queries_dir: PathBuf,
@@ -1402,6 +1405,7 @@ impl Default for DbWorkspace {
             active_schema: None,
             sql: "SELECT 1;\n".into(),
             history: Vec::new(),
+            latency_history: Vec::new(),
             bookmarks: Vec::new(),
             queries_dir: default_queries_dir(),
             last_result: None,
@@ -5158,6 +5162,11 @@ impl DbWorkspace {
             limit_tag,
             txn_tag
         );
+        self.latency_history.push(elapsed_ms);
+        if self.latency_history.len() > 64 {
+            let drop_n = self.latency_history.len() - 64;
+            self.latency_history.drain(0..drop_n);
+        }
         self.last_result = Some(last);
         self.pending_row_deletes.clear();
         self.flush_active_tab();

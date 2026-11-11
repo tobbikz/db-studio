@@ -177,6 +177,8 @@ pub enum Action {
     CommitTransaction,
     RollbackTransaction,
     EditCell,
+    /// Enter on Results: open Cell/Row/Plan/Chart inspector modal.
+    OpenCellModal,
     /// Copy focused results cell to host clipboard.
     YankResultCell,
     FocusResults,
@@ -564,17 +566,16 @@ impl Keymap {
                 (false, false, KeyCode::Char('s')) => Some(Action::OpenConsoleSchema),
                 (false, false, KeyCode::Char('D')) => Some(Action::ToggleResultsDensity),
                 (false, false, KeyCode::Char('?')) => Some(Action::ToggleHelp),
-                (false, false, KeyCode::Char('i')) | (false, false, KeyCode::Enter) => {
-                    Some(Action::EditCell)
-                }
+                (false, false, KeyCode::Enter) => Some(Action::OpenCellModal),
+                (false, false, KeyCode::Char('i')) => Some(Action::EditCell),
                 (false, false, KeyCode::Char('y')) => Some(Action::YankResultCell),
                 (false, false, KeyCode::Down) => Some(Action::MoveDown),
                 (false, false, KeyCode::Up) => Some(Action::MoveUp),
                 (false, false, KeyCode::Left) => Some(Action::MoveLeft),
                 (false, false, KeyCode::Right) => Some(Action::MoveRight),
-                (false, false, KeyCode::Char('2')) | (false, false, KeyCode::Esc) => {
-                    Some(Action::FocusEditor)
-                }
+                (false, false, KeyCode::Char('2')) => Some(Action::FocusEditor),
+                // Esc closes inspector when open; otherwise leaves Results → Console.
+                (false, false, KeyCode::Esc) => Some(Action::Cancel),
                 (false, false, KeyCode::Char('/')) => Some(Action::Find),
                 (false, false, KeyCode::Char('q')) => Some(Action::Quit),
                 _ => None,
@@ -706,6 +707,10 @@ mod tests {
         assert_eq!(
             Keymap::map(ctx, key(KeyCode::Char('i'))),
             Some(Action::EditCell)
+        );
+        assert_eq!(
+            Keymap::map(ctx, key(KeyCode::Enter)),
+            Some(Action::OpenCellModal)
         );
     }
 

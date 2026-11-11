@@ -1995,6 +1995,7 @@ dependencies = [
  "lsp-types",
  "nucleo-matcher",
  "ratatui",
+ "serde_json",
  "unicode-width 0.2.0",
 ]
 

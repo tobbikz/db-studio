@@ -977,6 +977,8 @@ impl App {
         self.ui.show_sidebar = true;
         self.ui.focus = Focus::Editor;
         self.ui.mode = Mode::Normal;
+        self.ui.cell_modal = false;
+        self.ui.db_monitor = false;
         self.db.rebuild_flat();
         self.set_status("Database Home", false);
     }
@@ -1573,13 +1575,35 @@ impl App {
                 Err(e) => self.set_status(format!("script: {e:#}"), true),
             },
             Some(DbNodeKind::AdminQuery) => {
+                let meta = self.db.flat.get(self.db.selected).map(|e| {
+                    (
+                        e.label.clone(),
+                        e.table.clone().unwrap_or_else(|| e.label.clone()),
+                    )
+                });
                 match self.db.open_admin_query_tab().await {
                     Ok(true) => {
                         self.ui.db_cursor = Cursor::default();
                         self.ui.db_scroll_row = 0;
-                        self.ui.focus = Focus::Results;
                         self.ui.bottom = BottomPanel::Results;
                         self.ui.mode = Mode::Normal;
+                        self.ui.cell_modal = false;
+                        self.ui.cell_modal_drill = false;
+                        if let Some((label, slug)) = meta {
+                            self.ui.admin_modal = true;
+                            self.ui.admin_modal_title = label;
+                            self.ui.admin_modal_view = slug;
+                            self.ui.admin_modal_row = 0;
+                        }
+                        // Keep Explorer focus under the modal so Esc isn't stolen by Results.
+                        self.ui.focus = Focus::Database;
+                        self.set_status(
+                            format!(
+                                "admin · {} · r refresh · Esc",
+                                self.ui.admin_modal_title
+                            ),
+                            false,
+                        );
                         self.run_query().await?;
                     }
                     Ok(false) => {}
@@ -2102,6 +2126,9 @@ impl App {
     fn finish_query_ui(&mut self) {
         self.db.query_running = false;
         self.ui.busy_label = None;
+        self.ui.results_col_window = 0;
+        self.ui.cell_modal = false;
+        self.ui.cell_modal_drill = false;
     }
 
     fn show_query_error(&mut self, msg: String) {
@@ -2982,6 +3009,73 @@ impl App {
         self.lsp = LspManager::new(self.workspace.root.clone(), self.config.clone());
         self.set_status("config saved and reloaded", false);
         Ok(())
+    }
+
+    /// Enter on a Results cell: open inspector on Row (Cell is Enter drill-in).
+    fn open_cell_modal(&mut self) {
+        if self.try_er_navigate() {
+            return;
+        }
+        let Some(result) = self.db.last_result.as_ref() else {
+            self.set_status("no result cell", true);
+            return;
+        };
+        if result.rows.get(result.cursor_row).is_none() {
+            return;
+        }
+        self.ui.focus = Focus::Results;
+        self.ui.bottom = BottomPanel::Results;
+        self.ui.cell_modal = true;
+        self.ui.cell_modal_tab = 0; // Row
+        self.ui.cell_modal_drill = false;
+        self.ui.mode = Mode::Normal;
+        self.set_status(
+            "inspector · Row|JSON|Meta · Enter cell · Esc",
+            false,
+        );
+    }
+
+    /// Keep Results H-scroll sticky: only slide when the cursor nears a window edge.
+    fn nudge_results_h_scroll(&mut self) {
+        let Some(result) = self.db.last_result.as_ref() else {
+            return;
+        };
+        let ncols = result.columns.len();
+        if ncols == 0 {
+            return;
+        }
+        let pinned = self.ui.results_pinned_cols.min(ncols.saturating_sub(1));
+        // Match render's typical unpinned budget (~6–8); render still clamps to fit.
+        let budget = 6usize.max(1);
+        let max_start = ncols.saturating_sub(budget).max(pinned);
+        let cursor = result.cursor_col;
+        let mut start = self.ui.results_col_window.clamp(pinned, max_start);
+        if cursor >= pinned {
+            let margin = (budget / 4).max(1);
+            if cursor < start + margin {
+                start = cursor.saturating_sub(budget / 3);
+            } else if cursor + margin >= start + budget {
+                start = (cursor + 1 + margin).saturating_sub(budget);
+            }
+        }
+        self.ui.results_col_window = start.clamp(pinned, max_start);
+    }
+
+    /// Start editing the selected cell inside the open modal.
+    fn start_cell_modal_edit(&mut self) {
+        let Some(result) = self.db.last_result.as_ref() else {
+            return;
+        };
+        let Some(cell) = result
+            .rows
+            .get(result.cursor_row)
+            .and_then(|r| r.get(result.cursor_col))
+        else {
+            return;
+        };
+        self.ui.cell_edit_input = cell.clone();
+        self.ui.mode = Mode::EditCell;
+        self.set_status("editing cell · Enter apply · Esc cancel", false);
     }
 
     fn start_edit_cell(&mut self) {
@@ -4439,7 +4533,26 @@ impl App {
                     self.ui.show_completions = false;
                     self.ui.hover = None;
                     self.ui.pending_code_actions.clear();
-                    if was_edit_cell || was_table_filter {
+                    if self.ui.cell_modal && was_edit_cell {
+                        self.ui.mode = Mode::Normal;
+                        self.ui.focus = Focus::Results;
+                        self.ui.cell_modal_drill = true;
+                        self.ui.status = None;
+                    } else if self.ui.cell_modal && !was_edit_cell {
+                        if self.ui.cell_modal_drill {
+                            self.ui.cell_modal_drill = false;
+                            self.ui.cell_modal_tab = 0;
+                            self.ui.mode = Mode::Normal;
+                            self.ui.focus = Focus::Results;
+                            self.ui.status = None;
+                        } else {
+                            self.ui.cell_modal = false;
+                            self.ui.cell_modal_drill = false;
+                            self.ui.mode = Mode::Normal;
+                            self.ui.focus = Focus::Results;
+                            self.ui.status = None;
+                        }
+                    } else if was_edit_cell || was_table_filter {
                         self.ui.focus = Focus::Results;
                         self.set_status(
                             if was_table_filter {
@@ -4449,6 +4562,13 @@ impl App {
                             },
                             false,
                         );
+                    } else if self.ui.focus == Focus::Results
+                        && self.ui.product == ProductMode::Database
+                    {
+                        // Results Esc (no modal) → Console, same as old FocusEditor binding.
+                        self.ui.focus = Focus::Editor;
+                        self.ui.mode = Mode::Normal;
+                        self.set_status("Console focused · i insert SQL · Ctrl-Enter run", false);
                     }
                 }
             }
@@ -4688,6 +4808,7 @@ impl App {
                     if let Some(result) = self.db.last_result.as_mut() {
                         result.move_cell(0, -1);
                     }
+                    self.nudge_results_h_scroll();
                 } else if self.editing_db_sql() {
                     self.db_move_left();
                 } else if let Some(b) = self.active_buffer_mut() {
@@ -4699,6 +4820,7 @@ impl App {
                     if let Some(result) = self.db.last_result.as_mut() {
                         result.move_cell(0, 1);
                     }
+                    self.nudge_results_h_scroll();
                 } else if self.editing_db_sql() {
                     self.db_move_right();
                 } else if let Some(b) = self.active_buffer_mut() {
@@ -4873,7 +4995,19 @@ impl App {
                 }
             }
             Action::FocusEditor => {
-                if self.ui.product == ProductMode::Database
+                // Never leave a stuck inspector behind when Esc is remapped here.
+                if self.ui.cell_modal {
+                    if self.ui.cell_modal_drill {
+                        self.ui.cell_modal_drill = false;
+                        self.ui.cell_modal_tab = 0;
+                    } else {
+                        self.ui.cell_modal = false;
+                        self.ui.cell_modal_drill = false;
+                    }
+                    self.ui.focus = Focus::Results;
+                    self.ui.mode = Mode::Normal;
+                    self.ui.status = None;
+                } else if self.ui.product == ProductMode::Database
                     && self.ui.db_surface == DbSurface::Studio
                 {
                     // Leaving a tool window overlay → back to Console.
@@ -5453,6 +5587,7 @@ impl App {
                 self.set_status(self.db.status.clone(), false);
             }
             Action::EditCell => self.start_edit_cell(),
+            Action::OpenCellModal => self.open_cell_modal(),
             Action::YankResultCell => self.yank_result_cell(),
             Action::SelectAll => self.select_all_sql_or_editor(),
             Action::ClipboardCopy => self.clipboard_copy_sql_or_editor(),
@@ -7871,6 +8006,62 @@ async fn event_loop(
                                 }
                             }
                         }
+                        // Admin ops modal owns Esc/q/r/arrows while open.
+                        if app.ui.admin_modal
+                            && app.ui.mode == Mode::Normal
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::SUPER)
+                        {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    app.ui.admin_modal = false;
+                                    app.ui.focus = Focus::Database;
+                                    app.ui.status = None;
+                                    continue;
+                                }
+                                KeyCode::Char('r') | KeyCode::Char('R') => {
+                                    app.set_status("admin · refreshing…", false);
+                                    app.run_query().await?;
+                                    continue;
+                                }
+                                KeyCode::Up => {
+                                    app.ui.admin_modal_row =
+                                        app.ui.admin_modal_row.saturating_sub(1);
+                                    continue;
+                                }
+                                KeyCode::Down => {
+                                    let max = app
+                                        .db
+                                        .last_result
+                                        .as_ref()
+                                        .map(|r| r.rows.len().saturating_sub(1))
+                                        .unwrap_or(0);
+                                    if app.ui.admin_modal_row < max {
+                                        app.ui.admin_modal_row += 1;
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Inspector owns Esc/q while open — before FocusEditor / status / fullscreen.
+                        if app.ui.cell_modal
+                            && app.ui.mode == Mode::Normal
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::SUPER)
+                            && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                        {
+                            if app.ui.cell_modal_drill {
+                                app.ui.cell_modal_drill = false;
+                                app.ui.cell_modal_tab = 0;
+                            } else {
+                                app.ui.cell_modal = false;
+                                app.ui.cell_modal_drill = false;
+                            }
+                            app.ui.focus = Focus::Results;
+                            app.ui.status = None;
+                            continue;
+                        }
                         // Host chords: Super preferred, Control fallback (WM often eats Super).
                         let modk = key.modifiers.contains(KeyModifiers::CONTROL)
                             || key.modifiers.contains(KeyModifiers::SUPER);
@@ -8244,6 +8435,132 @@ async fn event_loop(
                             && app.ui.db_surface == DbSurface::Studio
                             && matches!(app.ui.mode, Mode::Normal | Mode::Insert)
                         {
+                            // Results inspector owns Enter/i/Tab/1-3/arrows while open (Esc handled above).
+                            if app.ui.cell_modal
+                                && app.ui.focus == Focus::Results
+                                && app.ui.mode == Mode::Normal
+                            {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        if app.ui.cell_modal_drill {
+                                            app.start_cell_modal_edit();
+                                        } else if app.ui.cell_modal_tab == 0
+                                            || app.ui.cell_modal_tab == 2
+                                        {
+                                            // Row / Meta → full Cell for the selected field.
+                                            app.ui.cell_modal_drill = true;
+                                            app.set_status(
+                                                "cell · Enter/i edit · Esc → Row",
+                                                false,
+                                            );
+                                        } else {
+                                            app.start_cell_modal_edit();
+                                        }
+                                        continue;
+                                    }
+                                    KeyCode::Char('i') => {
+                                        if !app.ui.cell_modal_drill {
+                                            app.ui.cell_modal_drill = true;
+                                        }
+                                        app.start_cell_modal_edit();
+                                        continue;
+                                    }
+                                    KeyCode::Tab => {
+                                        app.ui.cell_modal_drill = false;
+                                        app.ui.cell_modal_tab =
+                                            (app.ui.cell_modal_tab + 1) % 3;
+                                        continue;
+                                    }
+                                    KeyCode::BackTab => {
+                                        app.ui.cell_modal_drill = false;
+                                        app.ui.cell_modal_tab = app
+                                            .ui
+                                            .cell_modal_tab
+                                            .checked_sub(1)
+                                            .unwrap_or(2);
+                                        continue;
+                                    }
+                                    KeyCode::Char('1') => {
+                                        app.ui.cell_modal_drill = false;
+                                        app.ui.cell_modal_tab = 0;
+                                        continue;
+                                    }
+                                    KeyCode::Char('2') => {
+                                        app.ui.cell_modal_drill = false;
+                                        app.ui.cell_modal_tab = 1;
+                                        continue;
+                                    }
+                                    KeyCode::Char('3') => {
+                                        app.ui.cell_modal_drill = false;
+                                        app.ui.cell_modal_tab = 2;
+                                        continue;
+                                    }
+                                    KeyCode::Up => {
+                                        if let Some(r) = app.db.last_result.as_mut() {
+                                            if app.ui.cell_modal_drill {
+                                                r.move_cell(-1, 0);
+                                            } else {
+                                                r.move_cell(0, -1);
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    KeyCode::Down => {
+                                        if let Some(r) = app.db.last_result.as_mut() {
+                                            if app.ui.cell_modal_drill {
+                                                r.move_cell(1, 0);
+                                            } else {
+                                                r.move_cell(0, 1);
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    KeyCode::Left => {
+                                        if let Some(r) = app.db.last_result.as_mut() {
+                                            r.move_cell(0, -1);
+                                        }
+                                        continue;
+                                    }
+                                    KeyCode::Right => {
+                                        if let Some(r) = app.db.last_result.as_mut() {
+                                            r.move_cell(0, 1);
+                                        }
+                                        continue;
+                                    }
+                                    KeyCode::Char('m') => {
+                                        app.ui.db_monitor = !app.ui.db_monitor;
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !app.ui.cell_modal
+                                && app.ui.mode == Mode::Normal
+                                && matches!(key.code, KeyCode::Char('m'))
+                                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && app.ui.focus == Focus::Results
+                            {
+                                app.ui.db_monitor = !app.ui.db_monitor;
+                                app.set_status(
+                                    if app.ui.db_monitor {
+                                        "monitor on · m close"
+                                    } else {
+                                        "monitor off"
+                                    },
+                                    false,
+                                );
+                                continue;
+                            }
+                            if app.ui.db_monitor
+                                && app.ui.mode == Mode::Normal
+                                && matches!(
+                                    key.code,
+                                    KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('q')
+                                )
+                            {
+                                app.ui.db_monitor = false;
+                                continue;
+                            }
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
                                 || key.modifiers.contains(KeyModifiers::SUPER);
                             if is_run_query_key(key) {

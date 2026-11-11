@@ -3,6 +3,7 @@
 pub mod create_dialect;
 mod create_object_form;
 mod db_connect_form;
+pub mod icons;
 mod keymap;
 mod palette;
 pub mod theme;
@@ -32,7 +33,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTone {
@@ -107,6 +108,24 @@ pub struct UiState {
     pub split: SplitState,
     pub pending_code_actions: Vec<(String, String)>,
     pub cell_edit_input: String,
+    /// Results: row/cell detail modal is open (Enter on a cell).
+    pub cell_modal: bool,
+    /// Modal tab: 0 Row · 1 JSON · 2 Meta. Cell is a drill-in (`cell_modal_drill`), not a landing tab.
+    pub cell_modal_tab: usize,
+    /// Enter on a Row field → full Cell view; Esc returns to the active tab.
+    pub cell_modal_drill: bool,
+    /// Sticky H-scroll start for unpinned Results columns (updated on ←/→).
+    pub results_col_window: usize,
+    /// Sparkline/latency monitor overlay.
+    pub db_monitor: bool,
+    /// Admin · Health (and other AdminQuery) ops modal — not the Results grid dump.
+    pub admin_modal: bool,
+    /// Short title shown in the plate (e.g. Blocking).
+    pub admin_modal_title: String,
+    /// View slug from the tree node (`health-overview`, `health-blocking`, …).
+    pub admin_modal_view: String,
+    /// Selected row inside the admin table body.
+    pub admin_modal_row: usize,
     pub stack_frames: Vec<StackFrameView>,
     pub debug_frame_selected: usize,
     pub variables: Vec<VariableView>,
@@ -218,6 +237,15 @@ impl Default for UiState {
             split: SplitState::default(),
             pending_code_actions: Vec::new(),
             cell_edit_input: String::new(),
+            cell_modal: false,
+            cell_modal_tab: 0,
+            cell_modal_drill: false,
+            results_col_window: 0,
+            db_monitor: false,
+            admin_modal: false,
+            admin_modal_title: String::new(),
+            admin_modal_view: String::new(),
+            admin_modal_row: 0,
             stack_frames: Vec::new(),
             debug_frame_selected: 0,
             variables: Vec::new(),
@@ -575,6 +603,15 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
             }
             DbSurface::Studio => {
                 render_database_studio(frame, size, &ctx);
+                if ctx.ui.db_monitor {
+                    render_db_monitor(frame, size, &ctx);
+                }
+                if ctx.ui.admin_modal {
+                    render_admin_modal(frame, size, &ctx);
+                }
+                if ctx.ui.cell_modal {
+                    render_cell_modal(frame, size, &ctx);
+                }
             }
         }
         if ctx.ui.mode == Mode::Palette {
@@ -967,40 +1004,13 @@ fn render_sidebar(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
 }
 
-/// Whether a later flat sibling exists at `depth` before climbing above it.
-fn explorer_has_following_sibling(flat: &[ide_db::FlatDbEntry], idx: usize, depth: usize) -> bool {
-    for e in flat.iter().skip(idx + 1) {
-        if e.depth < depth {
-            return false;
-        }
-        if e.depth == depth {
-            return true;
-        }
-    }
-    false
-}
-
-/// Box-drawing indent: `│  ├─ └─` (pack E). Width-1 only.
+/// Soft space indent only — no `│ ├ └` guides (clean list, icons carry hierarchy).
 fn explorer_tree_prefix(flat: &[ide_db::FlatDbEntry], idx: usize) -> String {
     let depth = flat[idx].depth;
     if depth == 0 {
         return String::new();
     }
-    let mut out = String::with_capacity(depth * 3);
-    for d in 0..depth {
-        if d + 1 < depth {
-            if explorer_has_following_sibling(flat, idx, d + 1) {
-                out.push_str("│  ");
-            } else {
-                out.push_str("   ");
-            }
-        } else if explorer_has_following_sibling(flat, idx, depth) {
-            out.push_str("├─ ");
-        } else {
-            out.push_str("└─ ");
-        }
-    }
-    out
+    "  ".repeat(depth)
 }
 
 fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focused: bool) {
@@ -1015,13 +1025,55 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
             .skip(scroll)
             .take(inner_h.max(1))
             .map(|(i, e)| {
-                // Pack E only: box-drawing tree + label. No kind/health glyphs.
+                // Soft indent + DataRig Nerd Font glyphs (icons::*).
                 let tree = explorer_tree_prefix(&ws.flat, i);
+                let source_accent = |source_id: &str| -> Color {
+                    ws.sources
+                        .iter()
+                        .find(|s| s.id == source_id)
+                        .map(|s| parse_accent_color(&s.accent))
+                        .unwrap_or(theme::accent())
+                };
+                let color = match e.kind {
+                    DbNodeKind::Group => theme::muted(),
+                    DbNodeKind::Source => {
+                        let health = ws.connection_health.get(&e.source_id);
+                        match health {
+                            Some(ide_db::ConnHealth::Dead(_)) => theme::warn(),
+                            Some(ide_db::ConnHealth::Ok { .. }) => Color::Green,
+                            Some(ide_db::ConnHealth::Stale { .. }) => theme::warn(),
+                            None => source_accent(&e.source_id),
+                        }
+                    }
+                    DbNodeKind::Database => theme::accent(),
+                    DbNodeKind::Schema => theme::muted(),
+                    DbNodeKind::Table => theme::text(),
+                    DbNodeKind::View => theme::muted(),
+                    DbNodeKind::Column => theme::faint(),
+                    DbNodeKind::Admin => theme::accent(),
+                    DbNodeKind::AdminQuery => theme::muted(),
+                    DbNodeKind::AdminAction => theme::accent(),
+                    DbNodeKind::Routine => theme::muted(),
+                };
+                let glyph = if matches!(e.kind, DbNodeKind::Source) {
+                    ws.sources
+                        .iter()
+                        .find(|s| s.id == e.source_id)
+                        .map(|s| icons::driver(s.driver))
+                        .unwrap_or(icons::DATABASE)
+                } else {
+                    icons::node(&e.kind)
+                };
                 let selected = i == ws.selected;
                 let row_style = if selected {
                     theme::style_selected()
                 } else {
                     Style::default()
+                };
+                let glyph_style = if selected {
+                    theme::style_selected()
+                } else {
+                    Style::default().fg(color)
                 };
                 let label_style = if selected {
                     theme::style_selected()
@@ -1029,7 +1081,8 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     Style::default().fg(theme::text())
                 };
                 let inner_w = area.width.saturating_sub(2) as usize;
-                let used = tree.chars().count();
+                let glyph_part = format!("{glyph} ");
+                let used = tree.chars().count() + glyph_part.chars().count();
                 let label_max = inner_w.saturating_sub(used).max(4);
                 let role = if matches!(e.kind, DbNodeKind::Source) {
                     ws.sources
@@ -1058,6 +1111,7 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                             theme::style_faint()
                         },
                     ),
+                    Span::styled(glyph_part, glyph_style),
                     Span::styled(label, label_style),
                 ]))
             })
@@ -1143,13 +1197,21 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
                 .skip(scroll)
                 .take(inner_h.max(1))
                 .map(|line| {
+                    let icon = match line.kind {
+                        StructureLineKind::Section => icons::structure_section(&line.text),
+                        _ => "",
+                    };
                     let (prefix, style) = match line.kind {
                         StructureLineKind::Section => (
-                            "",
+                            if icon.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{icon} ")
+                            },
                             theme::style_text().add_modifier(Modifier::BOLD),
                         ),
-                        StructureLineKind::Item => ("  ", theme::style_text()),
-                        StructureLineKind::Ddl => ("  ", theme::style_muted()),
+                        StructureLineKind::Item => ("  ".into(), theme::style_text()),
+                        StructureLineKind::Ddl => ("  ".into(), theme::style_muted()),
                     };
                     let max = inner_w.saturating_sub(prefix.chars().count()).max(4);
                     let mut text = format!("{prefix}{}", truncate_chars(&line.text, max));
@@ -1274,7 +1336,7 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let mut y = inner.y;
     let mut h = inner.height;
 
-    // SQL tabs (Query / table data tabs) — numbered for Alt-1..9 / Ctrl-Tab
+    // SQL tabs (Query / table data tabs) — powerline-ish · Alt-1..9 / Ctrl-Tab
     if let Some(db) = ctx.db {
         if !db.tabs.is_empty() && h >= 1 {
             let mut spans = Vec::new();
@@ -1283,7 +1345,7 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 let style = if active {
                     Style::default()
                         .fg(theme::bg())
-                        .bg(theme::accent())
+                        .bg(theme::text())
                         .add_modifier(Modifier::BOLD)
                 } else {
                     theme::style_muted()
@@ -1295,6 +1357,11 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                     format!(" {} ", title)
                 };
                 spans.push(Span::styled(label, style));
+                if active {
+                    spans.push(Span::styled("", Style::default().fg(theme::text()).bg(theme::bg())));
+                } else if i + 1 != db.tabs.len() {
+                    spans.push(Span::styled("│", theme::style_faint()));
+                }
             }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
@@ -2246,7 +2313,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let pk_label = if result.primary_keys.is_empty() {
         String::new()
     } else {
-        format!(" PK:{} ", result.primary_keys.join("+"))
+        format!(" {}{} ", icons::key(), result.primary_keys.join("+"))
     };
     let dirty_n = result.dirty_rows().len();
     let dirty_label = if dirty_n > 0 {
@@ -2292,8 +2359,6 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     if !db.results_filter.trim().is_empty() {
         meta_bits.push(format!("/{}", db.results_filter.trim()));
     }
-    let meta_line = format!(" {} ", meta_bits.join(" · "));
-
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -2302,18 +2367,24 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Meta strip under the border title (always when we have height).
+    // Meta chips under the border title.
     let inner = if inner.height >= 3 {
         let parts = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(2)])
             .split(inner);
+        let mut chips: Vec<Span> = Vec::new();
+        for (i, bit) in meta_bits.iter().enumerate() {
+            if i > 0 {
+                chips.push(Span::raw(" "));
+            }
+            chips.push(Span::styled(
+                format!(" {bit} "),
+                Style::default().fg(theme::muted()).bg(theme::surface_2()),
+            ));
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_chars(&meta_line, parts[0].width as usize),
-                theme::style_faint(),
-            )))
-            .style(Style::default().bg(theme::bg())),
+            Paragraph::new(Line::from(chips)).style(Style::default().bg(theme::bg())),
             parts[0],
         );
         parts[1]
@@ -2336,44 +2407,62 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let grid_area = inner;
 
     // compact = scan density; comfort = readable text (body/json) without leaving the grid.
-    let max_col_width = if compact { 14usize } else { 30usize };
     let row_stride = if compact { 1usize } else { 2usize };
-    let cell_stride = max_col_width + 2; // leading/trailing space
-    let vis_cols = (grid_area.width as usize / cell_stride).max(1);
+    let gutter_w = nrows.max(1).to_string().len().max(2);
+    let grid_w = (grid_area.width as usize).saturating_sub(gutter_w + 1);
+    // Rough first pass so we know how many columns fit, then size them by content.
+    let avg = if compact { 12usize } else { 18usize };
+    let vis_cols = (grid_w / (avg + 3)).max(1);
     let pinned = ctx.ui.results_pinned_cols.min(ncols).min(vis_cols.saturating_sub(1));
     let scroll_budget = vis_cols.saturating_sub(pinned).max(1);
-    // Horizontal window follows the cursor column; pinned cols stay visible.
-    let scroll_start = if result.cursor_col >= pinned + scroll_budget {
-        result.cursor_col + 1 - scroll_budget
-    } else {
-        pinned
-    };
-    let col_start = scroll_start.max(pinned);
+    // Sticky H-window (updated on ←/→). Only force-include cursor if it left the window.
+    let max_start = ncols.saturating_sub(scroll_budget).max(pinned);
+    let mut col_start = ctx.ui.results_col_window.clamp(pinned, max_start);
+    if result.cursor_col >= pinned {
+        if result.cursor_col < col_start {
+            col_start = result.cursor_col.clamp(pinned, max_start);
+        } else if result.cursor_col >= col_start + scroll_budget {
+            col_start = (result.cursor_col + 1 - scroll_budget).clamp(pinned, max_start);
+        }
+    }
     let col_end = (col_start + scroll_budget).min(ncols);
     let editing = focused && ctx.ui.mode == Mode::EditCell;
+    let h_scrolled = col_start > pinned || col_end < ncols;
 
     let col_indices: Vec<usize> = (0..pinned).chain(col_start..col_end).collect();
+    let col_widths = results_col_widths(result, &col_indices, grid_w, compact);
 
-    let header: Line = Line::from(
-        col_indices
-            .iter()
-            .map(|&ci| {
-                let c = &result.columns[ci];
-                let t = truncate_chars(c, max_col_width);
-                let style = if ci == result.cursor_col {
-                    Style::default()
-                        .fg(theme::text())
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                } else {
-                    Style::default().fg(theme::muted()).add_modifier(Modifier::BOLD)
-                };
-                Span::styled(
-                    format!(" {t:<max_col_width$} ", max_col_width = max_col_width),
-                    style,
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
+    let mut header_spans = vec![Span::styled(
+        format!("{:>gutter_w$}│", ""),
+        theme::style_faint(),
+    )];
+    for (pos, &ci) in col_indices.iter().enumerate() {
+        if pos > 0 {
+            header_spans.push(Span::styled("│", theme::style_faint()));
+        }
+        let w = col_widths[pos];
+        let c = &result.columns[ci];
+        let is_pk = result.primary_keys.iter().any(|pk| pk == c);
+        let label = if is_pk {
+            format!("{} {c}", icons::key())
+        } else {
+            c.clone()
+        };
+        let t = pad_display(&label, w);
+        let style = if ci == result.cursor_col {
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme::muted())
+                .bg(theme::surface_2())
+                .add_modifier(Modifier::BOLD)
+        };
+        header_spans.push(Span::styled(format!(" {t} "), style));
+    }
+    let header: Line = Line::from(header_spans);
 
     let filter = db.results_filter.clone();
     let filtered_idx: Vec<usize> = result
@@ -2395,74 +2484,120 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     for &ri in filtered_idx.iter().skip(scroll).take(visible_rows) {
         let row = &result.rows[ri];
         let row_dirty = dirty.contains(&ri);
-        rows.push(Line::from(
-            col_indices
-                .iter()
-                .filter_map(|&ci| row.get(ci).map(|cell| (ci, cell)))
-                .map(|(ci, cell)| {
-                    let is_cursor = ri == result.cursor_row && ci == result.cursor_col;
-                    let is_null = cell == "NULL";
-                    let mut t = if is_cursor && editing {
-                        // Inline editor — show draft + block cursor inside the cell.
-                        let mut draft = ctx.ui.cell_edit_input.clone();
-                        draft.push('▌');
-                        let chars: Vec<char> = draft.chars().collect();
-                        if chars.len() > max_col_width {
-                            chars[chars.len() - max_col_width..].iter().collect()
-                        } else {
-                            draft
-                        }
-                    } else if is_null {
-                        truncate_chars("NULL", max_col_width)
-                    } else {
-                        truncate_chars(cell, max_col_width)
-                    };
-                    if row_dirty && !(is_cursor && editing) {
-                        t.push('*');
-                        if t.chars().count() > max_col_width {
-                            t = truncate_chars(&t, max_col_width);
-                        }
-                    }
-                    let style = if is_cursor && editing {
-                        Style::default()
-                            .fg(theme::bg())
-                            .bg(theme::accent())
-                            .add_modifier(Modifier::BOLD)
-                    } else if is_cursor {
-                        theme::style_selected()
-                    } else if row_dirty {
-                        Style::default().fg(theme::accent())
-                    } else if ci < pinned {
-                        Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
-                    } else if is_null {
-                        theme::style_faint().add_modifier(Modifier::ITALIC)
-                    } else {
-                        theme::style_text()
-                    };
-                    Span::styled(
-                        format!(" {t:<max_col_width$} ", max_col_width = max_col_width),
-                        style,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        ));
+        let mut spans = vec![Span::styled(
+            format!("{:>gutter_w$}│", ri + 1),
+            if ri == result.cursor_row {
+                theme::style_text().add_modifier(Modifier::BOLD)
+            } else {
+                theme::style_faint()
+            },
+        )];
+        for (pos, &ci) in col_indices.iter().enumerate() {
+            let Some(cell) = row.get(ci) else {
+                continue;
+            };
+            if pos > 0 {
+                spans.push(Span::styled("│", theme::style_faint()));
+            }
+            let w = col_widths[pos];
+            let is_cursor = ri == result.cursor_row && ci == result.cursor_col;
+            let is_null = cell == "NULL";
+            let col_name = result.columns.get(ci).map(|s| s.as_str()).unwrap_or("");
+            let mut t = if is_cursor && editing {
+                let mut draft = ctx.ui.cell_edit_input.clone();
+                draft.push('▌');
+                // Keep the end of the draft visible while editing long values.
+                while display_width(&draft) > w && !draft.is_empty() {
+                    draft = draft.chars().skip(1).collect();
+                }
+                draft
+            } else if is_null {
+                truncate_display("NULL", w)
+            } else {
+                truncate_display(cell, w)
+            };
+            if row_dirty && !(is_cursor && editing) {
+                t.push('*');
+                t = truncate_display(&t, w);
+            }
+            let t = pad_display(&t, w);
+            let is_statusish = col_name.eq_ignore_ascii_case("status")
+                || col_name.eq_ignore_ascii_case("kind")
+                || col_name.eq_ignore_ascii_case("state");
+            let style = if is_cursor && editing {
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::accent())
+                    .add_modifier(Modifier::BOLD)
+            } else if is_cursor {
+                theme::style_selected()
+            } else if row_dirty {
+                Style::default().fg(theme::accent())
+            } else if ci < pinned {
+                Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
+            } else if is_null {
+                theme::style_faint().add_modifier(Modifier::ITALIC)
+            } else if is_statusish && !is_null && display_width(t.trim()) <= 12 {
+                Style::default()
+                    .fg(theme::text())
+                    .bg(theme::surface_3())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme::style_text()
+            };
+            spans.push(Span::styled(format!(" {t} "), style));
+        }
+        let line = if ri == result.cursor_row {
+            Line::from(spans).style(Style::default().bg(theme::surface_3()))
+        } else if ri % 2 == 1 {
+            Line::from(spans).style(Style::default().bg(theme::surface_2()))
+        } else {
+            Line::from(spans)
+        };
+        rows.push(line);
+        // Comfort: hairline grid. Compact: zebra only (density).
         if !compact {
-            rows.push(Line::from(Span::styled(
-                " ".repeat(grid_area.width as usize),
+            let mut hair = vec![Span::styled(
+                format!("{:>gutter_w$}┼", ""),
                 theme::style_faint(),
-            )));
+            )];
+            for (pos, _) in col_indices.iter().enumerate() {
+                if pos > 0 {
+                    hair.push(Span::styled("┼", theme::style_faint()));
+                }
+                hair.push(Span::styled(
+                    "─".repeat(col_widths[pos] + 2),
+                    theme::style_faint(),
+                ));
+            }
+            rows.push(Line::from(hair));
         }
     }
-    let h_hint = if ncols > vis_cols {
-        format!(" cols {}-{} / {ncols}", col_start + 1, col_end)
+    let h_hint = if ncols > col_indices.len() || h_scrolled {
+        let left = if col_start > pinned { "◀ " } else { "  " };
+        let right = if col_end < ncols { " ▶" } else { "" };
+        format!("{left}cols {}–{} / {ncols}{right}", col_start + 1, col_end.max(1))
     } else {
         String::new()
     };
-    let rule_w = (grid_area.width as usize).saturating_sub(h_hint.chars().count());
-    let rule = Line::from(Span::styled(
-        format!("{}{}", "─".repeat(rule_w), h_hint),
+    // Rule under header: gutter + ┼ + repeating ─│ per column window.
+    let mut rule_spans = vec![Span::styled(
+        format!("{:>gutter_w$}┼", ""),
         theme::style_faint(),
-    ));
+    )];
+    for (pos, _) in col_indices.iter().enumerate() {
+        if pos > 0 {
+            rule_spans.push(Span::styled("┼", theme::style_faint()));
+        }
+        rule_spans.push(Span::styled(
+            "─".repeat(col_widths[pos] + 2),
+            theme::style_faint(),
+        ));
+    }
+    if !h_hint.is_empty() {
+        rule_spans.push(Span::styled(h_hint, theme::style_faint()));
+    }
+    let rule = Line::from(rule_spans);
     let mut lines = vec![header, rule];
     if nrows == 0 {
         lines.push(Line::from(Span::styled(
@@ -2507,7 +2642,11 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 .unwrap_or("")
         };
         // Only float when the grid cell is truncated or the value is long / NULL.
-        let cell_shown_w = max_col_width;
+        let cell_shown_w = col_indices
+            .iter()
+            .position(|&ci| ci == result.cursor_col)
+            .and_then(|p| col_widths.get(p).copied())
+            .unwrap_or(14);
         let needs_hover = raw == "NULL"
             || raw.chars().count() > cell_shown_w
             || editing;
@@ -2835,23 +2974,32 @@ fn render_hover(frame: &mut Frame, editor_area: Rect, hover: &str) {
     );
 }
 
-/// Results cell full-value card — replaces the old bottom gray preview strip.
+/// Results cell full-value card — peek without leaving the grid.
 fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &str) {
-    if grid_area.width < 16 || grid_area.height < 4 {
+    if grid_area.width < 16 || grid_area.height < 5 {
         return;
     }
-    let width = grid_area.width.saturating_sub(4).min(72).max(28);
+    let width = grid_area.width.saturating_sub(6).min(64).max(32);
     let inner_w = (width as usize).saturating_sub(4).max(12);
-    let body_lines = hover_wrap_lines(raw, inner_w);
+    let ty = guess_cell_type(raw);
+    let pretty = display_cell_value(raw);
+    let mut body_lines = hover_wrap_lines(&pretty, inner_w);
+    // Cap peek height so the grid stays readable.
+    if body_lines.len() > 6 {
+        body_lines.truncate(6);
+        body_lines.push("…".into());
+    }
     let height = (body_lines.len() as u16)
-        .saturating_add(2)
-        .min(10)
+        .saturating_add(3)
+        .min(12)
         .min(grid_area.height.saturating_sub(1));
-    // Prefer upper-right of the Results pane so the cursor row stays visible.
+    // Bottom-right of Results — keeps header + cursor row visible.
     let x = grid_area
         .x
         .saturating_add(grid_area.width.saturating_sub(width).saturating_sub(1));
-    let y = grid_area.y.saturating_add(1);
+    let y = grid_area
+        .y
+        .saturating_add(grid_area.height.saturating_sub(height).saturating_sub(1));
     let area = Rect {
         x,
         y,
@@ -2859,7 +3007,47 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
         height,
     };
     frame.render_widget(Clear, area);
-    let title = format!(" {} ", truncate_chars(col_name, 24));
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::text()))
+            .style(Style::default().bg(theme::surface_2())),
+        area,
+    );
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let meta = format!(
+        " {}  ·  {}  ·  {}c ",
+        truncate_chars(col_name, 20),
+        ty,
+        raw.chars().count()
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_chars(&meta, inner.width as usize),
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        ))),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+    let value_area = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
     let body: Vec<Line> = body_lines
         .into_iter()
         .map(|l| {
@@ -2868,25 +3056,10 @@ fn render_cell_hover(frame: &mut Frame, grid_area: Rect, col_name: &str, raw: &s
             } else {
                 theme::style_text()
             };
-            Line::from(Span::styled(l, style))
+            Line::from(Span::styled(format!(" {l}"), style))
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(body).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::border_idle()))
-                .style(Style::default().bg(theme::bg()))
-                .title(Span::styled(
-                    title,
-                    Style::default()
-                        .fg(theme::bg())
-                        .bg(theme::text())
-                        .add_modifier(Modifier::BOLD),
-                )),
-        ),
-        area,
-    );
+    frame.render_widget(Paragraph::new(body), value_area);
 }
 
 fn hover_wrap_lines(s: &str, width: usize) -> Vec<String> {
@@ -3432,7 +3605,7 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
 }
 
 fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
-    // Footer: status wins over keymap. Green OK only for Success (not pane tips).
+    // Toast status wins briefly; otherwise DataRig segmented status.
     if let Some(msg) = &ctx.ui.status {
         let text = if msg.text.chars().count() > 90 {
             format!("{}…", msg.text.chars().take(89).collect::<String>())
@@ -3459,61 +3632,143 @@ fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         return;
     }
 
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mode_label = match ctx.ui.mode {
+        Mode::Insert => "INSERT",
+        Mode::EditCell => "EDIT",
+        Mode::Command | Mode::Palette | Mode::Search | Mode::Find | Mode::Replace | Mode::Rename => {
+            "COMMAND"
+        }
+        _ => "NORMAL",
+    };
+    spans.push(Span::styled(
+        format!(" {mode_label} "),
+        Style::default()
+            .fg(theme::bg())
+            .bg(theme::accent())
+            .add_modifier(Modifier::BOLD),
+    ));
     let pane = match ctx.ui.focus {
-        Focus::Database => "Explorer",
-        Focus::Structure => "Structure",
-        Focus::Editor => match ctx.ui.mode {
-            Mode::Insert => "Console · INSERT",
-            Mode::Normal => "Console · NORMAL",
-            _ => "Console",
-        },
-        Focus::Results => "Results",
-        Focus::Git => "Git",
-        Focus::Search => "Search",
-        Focus::Outline => "Hierarchy",
-        Focus::Debug => "Debug",
-        Focus::Terminal => "Terminal",
-        _ => "Studio",
+        Focus::Database => "explorer",
+        Focus::Structure => "structure",
+        Focus::Editor => "console",
+        Focus::Results => "results",
+        _ => "studio",
     };
-    let hint = match ctx.ui.focus {
-        Focus::Database => "Enter open · p props · e edit · n New · d DDL",
-        Focus::Structure => "Ctrl+←→ split  ·  Esc explorer",
-        Focus::Editor if matches!(ctx.ui.mode, Mode::Insert) => {
-            "typing · Alt-b DB · Alt-s schema · Alt-L limit · Esc"
-        }
-        Focus::Editor => {
-            "i insert · b/s DB·schema · Alt-L limit · Ctrl-A all"
-        }
-        Focus::Results if ctx.ui.mode == Mode::EditCell => "Enter save  ·  Esc cancel",
-        Focus::Results if ctx.ui.mode == Mode::EditTableFilter => "Enter apply · Tab field · Esc",
-        Focus::Results if ctx.db.is_some_and(|d| d.active_is_table_tab()) => {
-            "w WHERE · o ORDER BY · x close tab · r refresh"
-        }
-        Focus::Results => "D density · cell hover · ]/[ page · Alt-L limit",
-        Focus::Git => "Esc/q back · s stage · c commit",
-        Focus::Terminal => "q exits pager · Ctrl-` / Esc back",
-        Focus::Search | Focus::Outline | Focus::Debug => "Esc/q back to Studio",
-        _ => "Tab panes  ·  Esc home",
-    };
-    let zoom = if ctx.ui.db_fullscreen.is_some() {
-        " · full"
-    } else {
-        ""
-    };
-
-    let spans = vec![
-        Span::styled(
-            format!(" {pane} "),
+    spans.push(Span::styled(
+        format!(" {pane} "),
+        Style::default()
+            .fg(theme::text())
+            .bg(theme::surface_2())
+            .add_modifier(Modifier::BOLD),
+    ));
+    if ctx.ui.db_fullscreen.is_some() {
+        spans.push(Span::styled(
+            " FULL ",
             Style::default()
                 .fg(theme::bg())
                 .bg(theme::text())
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {hint}{zoom} "), theme::style_faint()),
-    ];
+        ));
+    }
 
+    let (conn_name, conn_color, ro_badge, role_badge, txn_badge) = if let Some(db) = ctx.db {
+        let src = db
+            .active_source
+            .as_ref()
+            .and_then(|id| db.sources.iter().find(|s| &s.id == id));
+        let name = src.map(|s| s.name.clone()).unwrap_or_else(|| "—".into());
+        let color = src
+            .map(|s| parse_accent_color(&s.accent))
+            .unwrap_or(theme::accent());
+        let ro = src
+            .map(|s| s.read_only || matches!(s.role, ide_db::SourceRole::Viewer))
+            .unwrap_or(false);
+        let role = src.map(|s| s.role.label()).unwrap_or("—");
+        let txn = if db.in_txn { "TXN" } else { "AUTO" };
+        (name, color, ro, role.to_string(), txn.to_string())
+    } else {
+        ("—".into(), theme::muted(), false, "—".into(), "AUTO".into())
+    };
+
+    spans.push(Span::styled(
+        format!(" {role_badge} "),
+        Style::default().fg(theme::bg()).bg(conn_color),
+    ));
+    if ro_badge {
+        spans.push(Span::styled(
+            " RO ",
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" {txn_badge} "),
+        if txn_badge == "TXN" {
+            Style::default()
+                .fg(theme::bg())
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme::style_faint()
+        },
+    ));
+
+    if let Some(db) = ctx.db {
+        let spark = ide_db::latency_sparkline(&db.latency_history, 16);
+        spans.push(Span::styled(format!(" {spark} "), theme::style_accent()));
+        if db.query_running {
+            spans.push(Span::styled(" RUN… ", theme::style_warn()));
+        } else if let Some(r) = &db.last_result {
+            spans.push(Span::styled(
+                format!(" {}×{} {}ms ", r.rows.len(), r.columns.len(), r.elapsed_ms),
+                theme::style_faint(),
+            ));
+            let stats = ide_db::selection_stats(r, Some(r.cursor_col));
+            spans.push(Span::styled(format!(" {stats} "), theme::style_muted()));
+            if let Some(cell) = r
+                .rows
+                .get(r.cursor_row)
+                .and_then(|row| row.get(r.cursor_col))
+            {
+                let preview = truncate_chars(cell, 18);
+                spans.push(Span::styled(
+                    format!(" ▏{preview} "),
+                    theme::style_text(),
+                ));
+            }
+        }
+    }
+
+    spans.push(Span::styled(" │ ", theme::style_faint()));
+    spans.push(Span::styled(
+        format!(" {conn_name} "),
+        Style::default().fg(conn_color).add_modifier(Modifier::BOLD),
+    ));
+    if ctx.ui.admin_modal {
+        spans.push(Span::styled(" admin ", theme::style_accent()));
+    } else if ctx.ui.cell_modal {
+        spans.push(Span::styled(" modal ", theme::style_accent()));
+    }
+    if ctx.ui.db_monitor {
+        spans.push(Span::styled(" mon ", theme::style_accent()));
+    }
+
+    let width = area.width as usize;
+    let mut used = 0usize;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for sp in spans {
+        let w = sp.content.chars().count();
+        if used + w > width {
+            break;
+        }
+        used += w;
+        out.push(sp);
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
+        Paragraph::new(Line::from(out)).style(Style::default().bg(theme::bg())),
         area,
     );
 }
@@ -3676,18 +3931,1328 @@ fn studio_explorer_width(left_w: u16, configured: u16) -> u16 {
     configured.clamp(14, max_explor)
 }
 
+fn parse_accent_color(raw: &str) -> Color {
+    let s = raw.trim();
+    if s.is_empty() {
+        return theme::accent();
+    }
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) {
+                return Color::Rgb(r, g, b);
+            }
+        }
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "cyan" => Color::Cyan,
+        "green" => Color::Green,
+        "magenta" | "pink" => Color::Magenta,
+        "yellow" => Color::Yellow,
+        "red" => Color::Red,
+        "blue" => Color::Blue,
+        "white" => Color::White,
+        _ => theme::accent(),
+    }
+}
+
+/// Readable row inspector opened with Enter on a Results cell.
+/// Tabs: 0 Row · 1 JSON · 2 Meta. Cell is Enter drill-in (`cell_modal_drill`).
+fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
+    let Some(db) = ctx.db else {
+        return;
+    };
+    let Some(result) = db.last_result.as_ref() else {
+        return;
+    };
+    let row_i = result.cursor_row;
+    let col_i = result.cursor_col;
+    let Some(cells) = result.rows.get(row_i) else {
+        return;
+    };
+    let editing = ctx.ui.mode == Mode::EditCell;
+    let drill = ctx.ui.cell_modal_drill || editing;
+    let tab = ctx.ui.cell_modal_tab.min(2);
+
+    // Soft backdrop — clears the stage so the plate reads as a focused object.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::bg())),
+        screen,
+    );
+
+    let width = screen.width.saturating_sub(8).clamp(52, 100);
+    let height = screen.height.saturating_sub(4).clamp(16, 28);
+    let area = Rect {
+        x: screen.x + (screen.width.saturating_sub(width)) / 2,
+        y: screen.y + (screen.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let table = match (&result.source_schema, &result.source_table) {
+        (Some(s), Some(t)) => format!("{s}.{t}"),
+        (None, Some(t)) => t.clone(),
+        _ => String::new(),
+    };
+    let col_name = result
+        .columns
+        .get(col_i)
+        .map(|s| s.as_str())
+        .unwrap_or("?");
+    let border = if editing {
+        theme::text()
+    } else {
+        theme::border_focus()
+    };
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border))
+            .style(Style::default().bg(theme::surface())),
+        area,
+    );
+
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+
+    // Title plate
+    let crumb = if drill {
+        if table.is_empty() {
+            format!(" cell  ·  row {}  ·  {col_name} ", row_i + 1)
+        } else {
+            format!(" {table}  ·  cell  ·  row {}  ·  {col_name} ", row_i + 1)
+        }
+    } else if table.is_empty() {
+        format!(" row {}  ·  {col_name} ", row_i + 1)
+    } else {
+        format!(" {table}  ·  row {}  ·  {col_name} ", row_i + 1)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " INSPECT ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_chars(&crumb, inner.width.saturating_sub(10) as usize),
+                Style::default().fg(theme::text()).bg(theme::surface_2()),
+            ),
+        ])),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    // Tab pills — Row | JSON | Meta (Cell is drill-in only).
+    let mut tab_spans: Vec<Span> = Vec::new();
+    if drill {
+        tab_spans.push(Span::styled(
+            " Cell ",
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        ));
+        tab_spans.push(Span::styled("  Esc → Row ", theme::style_faint()));
+    } else {
+        let tabs = ["Row", "JSON", "Meta"];
+        for (i, name) in tabs.iter().enumerate() {
+            if i > 0 {
+                tab_spans.push(Span::styled(" ", theme::style_faint()));
+            }
+            let label = format!(" {name} ");
+            if i == tab {
+                tab_spans.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(theme::bg())
+                        .bg(theme::text())
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                tab_spans.push(Span::styled(
+                    label,
+                    Style::default().fg(theme::muted()).bg(theme::surface_2()),
+                ));
+            }
+        }
+    }
+    tab_spans.push(Span::styled(
+        format!("  col {}/{} ", col_i + 1, result.columns.len()),
+        theme::style_faint(),
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_spans)),
+        Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    // Hairline under chrome
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(inner.width as usize),
+            theme::style_faint(),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y + 2,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    let body = Rect {
+        x: inner.x,
+        y: inner.y + 3,
+        width: inner.width,
+        height: inner.height.saturating_sub(5).max(1),
+    };
+    let body_h = body.height as usize;
+
+    let lines: Vec<Line> = if drill {
+        modal_cell_lines(
+            result,
+            cells,
+            col_i,
+            editing,
+            &ctx.ui.cell_edit_input,
+            body.width as usize,
+        )
+    } else {
+        match tab {
+            1 => modal_json_lines(result, cells, body.width as usize),
+            2 => modal_meta_lines(result, cells, col_i, body.width as usize),
+            _ => modal_row_lines(
+                result,
+                cells,
+                col_i,
+                editing,
+                &ctx.ui.cell_edit_input,
+                body.width as usize,
+            ),
+        }
+    };
+
+    // Row / Meta: one line per column — scroll to keep selection visible.
+    let scroll = if !drill && (tab == 0 || tab == 2) {
+        col_i
+            .saturating_sub(body_h.saturating_sub(1) / 2)
+            .min(lines.len().saturating_sub(body_h))
+    } else {
+        0
+    };
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+
+    // Footer plate
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(inner.width as usize),
+            theme::style_faint(),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(2),
+            width: inner.width,
+            height: 1,
+        },
+    );
+    let hint = if editing {
+        " Enter apply   Esc cancel ".to_string()
+    } else if drill {
+        " Enter/i edit   ←→ col   Esc back to Row ".into()
+    } else if tab == 0 {
+        " ↑↓ field   Enter full cell   i edit   Tab JSON|Meta   Esc ".into()
+    } else if tab == 1 {
+        " Tab Meta|Row   y yank JSON   Esc ".into()
+    } else {
+        " ↑↓ field   Enter cell   Tab Row   Esc ".into()
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_chars(&hint, inner.width as usize),
+            Style::default().fg(theme::faint()).bg(theme::surface_2()),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        },
+    );
+}
+
+fn guess_cell_type(v: &str) -> &'static str {
+    let t = v.trim();
+    if t == "NULL" || t.is_empty() {
+        "null"
+    } else if t == "true" || t == "false" {
+        "bool"
+    } else if t.parse::<i64>().is_ok() {
+        "integer"
+    } else if t.parse::<f64>().is_ok() {
+        "number"
+    } else if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
+        "json"
+    } else if looks_like_timestamp(t) {
+        "timestamp"
+    } else if t.len() <= 24 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        "slug"
+    } else {
+        "text"
+    }
+}
+
+fn looks_like_timestamp(t: &str) -> bool {
+    t.len() >= 10
+        && t.as_bytes().get(4) == Some(&b'-')
+        && t.as_bytes().get(7) == Some(&b'-')
+        && (t.contains('T') || t.contains(' '))
+}
+
+/// Pretty JSON + friendlier timestamps for display (not edit draft).
+fn display_cell_value(v: &str) -> String {
+    let t = v.trim();
+    if t == "NULL" {
+        return "NULL".into();
+    }
+    if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(t) {
+            return serde_json::to_string_pretty(&val).unwrap_or_else(|_| v.to_string());
+        }
+    }
+    if looks_like_timestamp(t) {
+        // 2026-10-08T20:29:19.504962+00:00 → 2026-10-08 20:29:19 UTC
+        let s = t.replace('T', " ");
+        if let Some(i) = s.find('.') {
+            // drop fractional + keep offset or Z
+            let rest = &s[i..];
+            if let Some(plus) = rest.find('+').or_else(|| rest.find('Z')).or_else(|| {
+                rest.char_indices()
+                    .find(|&(j, c)| j > 0 && c == '-')
+                    .map(|(j, _)| j)
+            }) {
+                let head = &s[..i];
+                let tail = &rest[plus..];
+                let tz = if tail.starts_with('Z') || tail == "+00:00" || tail == "-00:00" {
+                    " UTC"
+                } else {
+                    ""
+                };
+                if tz.is_empty() {
+                    return format!("{head} {tail}");
+                }
+                return format!("{head}{tz}");
+            }
+            return s[..i].to_string();
+        }
+        return s;
+    }
+    v.to_string()
+}
+
+fn pretty_cell_value(v: &str) -> String {
+    display_cell_value(v)
+}
+
+fn chip(label: impl Into<String>, on: bool) -> Span<'static> {
+    let style = if on {
+        Style::default()
+            .fg(theme::bg())
+            .bg(theme::text())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::muted()).bg(theme::surface_2())
+    };
+    Span::styled(format!(" {} ", label.into()), style)
+}
+
+fn modal_cell_lines(
+    result: &ide_db::QueryResult,
+    cells: &[String],
+    col_i: usize,
+    editing: bool,
+    draft: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let name = result
+        .columns
+        .get(col_i)
+        .cloned()
+        .unwrap_or_else(|| "?".into());
+    let source = cells.get(col_i).map(|s| s.as_str()).unwrap_or("");
+    let raw = if editing {
+        format!("{draft}▌")
+    } else {
+        source.to_string()
+    };
+    let is_pk = result.primary_keys.iter().any(|pk| pk == &name);
+    let ty = guess_cell_type(source);
+    let bytes = source.len();
+    let chars = source.chars().count();
+
+    let mut chip_row = vec![
+        chip(name.clone(), true),
+        Span::raw(" "),
+        chip(ty, false),
+        Span::raw(" "),
+        chip(format!("{chars} chars"), false),
+        Span::raw(" "),
+        chip(format!("{bytes} B"), false),
+    ];
+    if is_pk {
+        chip_row.push(Span::raw(" "));
+        chip_row.push(chip(format!("{} PK", icons::key()), true));
+    }
+    let mut lines = vec![
+        Line::from(chip_row),
+        Line::from(""),
+    ];
+
+    // Nested value plate (ASCII frame) — reads as a card, not empty void.
+    let plate_w = width.saturating_sub(2).max(12);
+    let display = if editing {
+        raw.clone()
+    } else {
+        display_cell_value(source)
+    };
+    let inner_w = plate_w.saturating_sub(2).max(8);
+    let chunks = wrap_value(&display, inner_w);
+    let top = format!("┌{}┐", "─".repeat(inner_w));
+    let bot = format!("└{}┘", "─".repeat(inner_w));
+    lines.push(Line::from(Span::styled(top, theme::style_faint())));
+    if chunks.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("│", theme::style_faint()),
+            Span::styled(" ".repeat(inner_w), theme::style_faint()),
+            Span::styled("│", theme::style_faint()),
+        ]));
+    } else {
+        for chunk in chunks {
+            let inner = truncate_chars(&chunk, inner_w);
+            let fill = inner_w.saturating_sub(inner.chars().count());
+            let styled = if source == "NULL" {
+                theme::style_faint().add_modifier(Modifier::ITALIC)
+            } else {
+                theme::style_text().add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("│", theme::style_faint()),
+                Span::styled(inner, styled),
+                Span::styled(format!("{}│", " ".repeat(fill)), theme::style_faint()),
+            ]));
+        }
+    }
+    lines.push(Line::from(Span::styled(bot, theme::style_faint())));
+    if !editing && ty == "timestamp" && source != display {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" raw  {source}"),
+            theme::style_faint(),
+        )));
+    }
+    lines
+}
+
+/// Prefer sensible widths: ids narrow, slug/status medium, title/body take the rest.
+fn results_col_widths(
+    result: &ide_db::QueryResult,
+    col_indices: &[usize],
+    budget: usize,
+    compact: bool,
+) -> Vec<usize> {
+    let n = col_indices.len().max(1);
+    let sep = n.saturating_sub(1); // │ between cols
+    let avail = budget.saturating_sub(sep).max(n * 4);
+    let mut preferred: Vec<usize> = col_indices
+        .iter()
+        .map(|&ci| {
+            let name = result.columns.get(ci).map(|s| s.as_str()).unwrap_or("?");
+            let lower = name.to_ascii_lowercase();
+            let (min_w, max_w) = if lower.ends_with("_id") || lower == "id" {
+                (6, if compact { 10 } else { 14 })
+            } else if lower == "status" || lower == "kind" || lower == "state" || lower == "role" {
+                (8, if compact { 12 } else { 14 })
+            } else if lower == "slug" || lower.contains("slug") {
+                (12, if compact { 22 } else { 28 })
+            } else if lower.ends_with("_at")
+                || lower.contains("time")
+                || lower.contains("date")
+                || lower == "at"
+            {
+                (16, if compact { 20 } else { 22 })
+            } else if lower == "title"
+                || lower == "name"
+                || lower == "body"
+                || lower.contains("payload")
+                || lower.contains("desc")
+            {
+                (14, if compact { 28 } else { 40 })
+            } else {
+                (8, if compact { 16 } else { 24 })
+            };
+            let is_pk = result.primary_keys.iter().any(|pk| pk == name);
+            let header_label = if is_pk {
+                format!("{} {name}", icons::key())
+            } else {
+                name.to_string()
+            };
+            let mut sample = display_width(&header_label);
+            for row in result.rows.iter().take(40) {
+                if let Some(cell) = row.get(ci) {
+                    sample = sample.max(display_width(cell).min(max_w));
+                }
+            }
+            sample.clamp(min_w, max_w)
+        })
+        .collect();
+    let sum: usize = preferred.iter().sum();
+    if sum == 0 {
+        return vec![avail / n; n];
+    }
+    if sum > avail {
+        // Scale down proportionally, keep mins of 4.
+        for w in &mut preferred {
+            *w = ((*w as f64) * (avail as f64 / sum as f64)).round() as usize;
+            *w = (*w).max(4);
+        }
+        let mut excess = preferred.iter().sum::<usize>().saturating_sub(avail);
+        while excess > 0 {
+            let mut progressed = false;
+            for w in preferred.iter_mut().rev() {
+                if *w > 4 && excess > 0 {
+                    *w -= 1;
+                    excess -= 1;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    } else {
+        // Give leftover to the widest-preferring columns (title/body first).
+        let mut leftover = avail.saturating_sub(sum);
+        let order: Vec<usize> = {
+            let mut idx: Vec<usize> = (0..n).collect();
+            idx.sort_by_key(|&i| {
+                let name = result
+                    .columns
+                    .get(col_indices[i])
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let score = if name == "title" || name == "body" || name.contains("payload") {
+                    0
+                } else if name == "slug" || name.contains("slug") {
+                    1
+                } else {
+                    2
+                };
+                (score, usize::MAX - preferred[i])
+            });
+            idx
+        };
+        for i in order {
+            if leftover == 0 {
+                break;
+            }
+            preferred[i] += 1;
+            leftover -= 1;
+        }
+        // Any remaining: dump on last col.
+        if leftover > 0 {
+            if let Some(last) = preferred.last_mut() {
+                *last += leftover;
+            }
+        }
+    }
+    preferred
+}
+
+fn modal_json_lines(
+    result: &ide_db::QueryResult,
+    cells: &[String],
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut map = serde_json::Map::new();
+    for (name, cell) in result.columns.iter().zip(cells.iter()) {
+        let v = if cell == "NULL" {
+            serde_json::Value::Null
+        } else if let Ok(n) = cell.parse::<i64>() {
+            serde_json::Value::Number(n.into())
+        } else if let Ok(f) = cell.parse::<f64>() {
+            serde_json::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::String(cell.clone()))
+        } else if cell == "true" || cell == "false" {
+            serde_json::Value::Bool(cell == "true")
+        } else if let Ok(j) = serde_json::from_str::<serde_json::Value>(cell) {
+            j
+        } else {
+            serde_json::Value::String(cell.clone())
+        };
+        map.insert(name.clone(), v);
+    }
+    let pretty = serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .unwrap_or_else(|_| "{}".into());
+    let inner_w = width.saturating_sub(2).max(8);
+    pretty
+        .lines()
+        .map(|l| {
+            Line::from(Span::styled(
+                format!(" {}", truncate_chars(l, inner_w)),
+                theme::style_text(),
+            ))
+        })
+        .collect()
+}
+
+fn modal_meta_lines(
+    result: &ide_db::QueryResult,
+    cells: &[String],
+    col_i: usize,
+    _width: usize,
+) -> Vec<Line<'static>> {
+    let name_w = result
+        .columns
+        .iter()
+        .map(|c| display_width(c))
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 22);
+    let mut lines: Vec<Line> = Vec::new();
+    if let (Some(s), Some(t)) = (&result.source_schema, &result.source_table) {
+        lines.push(Line::from(Span::styled(
+            format!(" {s}.{t}"),
+            theme::style_faint(),
+        )));
+    } else if let Some(t) = &result.source_table {
+        lines.push(Line::from(Span::styled(
+            format!(" {t}"),
+            theme::style_faint(),
+        )));
+    }
+    if !result.primary_keys.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" pk  {}", result.primary_keys.join(", ")),
+            theme::style_faint(),
+        )));
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    for (ci, name) in result.columns.iter().enumerate() {
+        let cell = cells.get(ci).map(|s| s.as_str()).unwrap_or("");
+        let ty = guess_cell_type(cell);
+        let is_pk = result.primary_keys.iter().any(|pk| pk == name);
+        let is_null = cell == "NULL";
+        let label = pad_display(name, name_w);
+        let selected = ci == col_i;
+        let name_style = if selected {
+            theme::style_selected()
+        } else {
+            theme::style_text()
+        };
+        let type_style = if selected {
+            theme::style_selected()
+        } else {
+            theme::style_faint()
+        };
+        let mut spans = vec![
+            Span::styled(format!(" {label}  "), name_style),
+            Span::styled(ty.to_string(), type_style),
+        ];
+        if is_pk {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("{} pk", icons::key()),
+                if selected {
+                    theme::style_selected()
+                } else {
+                    Style::default().fg(theme::muted()).add_modifier(Modifier::BOLD)
+                },
+            ));
+        }
+        if is_null {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                "null",
+                theme::style_faint().add_modifier(Modifier::ITALIC),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn modal_row_lines(
+    result: &ide_db::QueryResult,
+    cells: &[String],
+    col_i: usize,
+    editing: bool,
+    draft: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    // Fixed label column by display width so │ stays aligned even with PK glyphs.
+    let name_w = result
+        .columns
+        .iter()
+        .map(|c| {
+            let is_pk = result.primary_keys.iter().any(|pk| pk == c);
+            let label = if is_pk {
+                format!("{} {c}", icons::key())
+            } else {
+                c.clone()
+            };
+            display_width(&label)
+        })
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 22);
+    let value_w = width.saturating_sub(name_w + 5).max(8);
+    let mut lines: Vec<Line> = Vec::new();
+    for (ci, name) in result.columns.iter().enumerate() {
+        let is_sel = ci == col_i;
+        let cell = cells.get(ci).map(|s| s.as_str()).unwrap_or("");
+        // One-line preview — Enter opens Cell for the full body.
+        let value = if is_sel && editing {
+            format!("{draft}▌")
+        } else {
+            let one = cell.lines().next().unwrap_or(cell);
+            let preview = truncate_display(one, value_w.saturating_sub(1).max(4));
+            if cell.chars().count() > preview.chars().count()
+                || cell.contains('\n')
+                || display_width(cell) > value_w
+            {
+                if preview.ends_with('…') {
+                    preview
+                } else {
+                    format!(
+                        "{}…",
+                        truncate_display(one, value_w.saturating_sub(1).max(4))
+                    )
+                }
+            } else {
+                preview
+            }
+        };
+        let is_pk = result.primary_keys.iter().any(|pk| pk == name);
+        let label = if is_pk {
+            format!("{} {name}", icons::key())
+        } else {
+            name.clone()
+        };
+        let label = pad_display(&label, name_w);
+        let base_style = if is_sel && editing {
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else if is_sel {
+            theme::style_selected()
+        } else if cell == "NULL" {
+            theme::style_faint()
+        } else {
+            theme::style_text()
+        };
+        let prefix_style = if is_sel {
+            base_style
+        } else {
+            theme::style_faint()
+        };
+        let val = pad_display(&value, value_w);
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {label} │ "), prefix_style),
+            Span::styled(val, base_style),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no columns)",
+            theme::style_faint(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Enter on a field → full Cell view ",
+            theme::style_faint(),
+        )));
+    }
+    lines
+}
+
+#[allow(dead_code)]
+fn modal_plan_lines(db: &DbWorkspace, width: usize) -> Vec<Line<'static>> {
+    let text = db
+        .last_explain
+        .as_deref()
+        .or_else(|| db.last_result.as_ref().and_then(|r| r.explain.as_deref()))
+        .unwrap_or("(no EXPLAIN yet — Ctrl-E from Console)");
+    let visual = ide_db::explain_visual_ascii(text);
+    visual
+        .lines()
+        .map(|l| {
+            Line::from(Span::styled(
+                format!(" {}", truncate_chars(l, width.saturating_sub(2))),
+                theme::style_text(),
+            ))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn modal_chart_lines(
+    result: &ide_db::QueryResult,
+    col_i: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let text = ide_db::chart_kind(result, "bar", Some(col_i))
+        .or_else(|| ide_db::chart_kind(result, "line", None))
+        .unwrap_or_else(|| "No numeric column to chart".into());
+    let mut lines: Vec<Line> = text
+        .lines()
+        .map(|l| {
+            Line::from(Span::styled(
+                format!(" {}", truncate_chars(l, width.saturating_sub(2))),
+                theme::style_text(),
+            ))
+        })
+        .collect();
+    if let Some(pie) = ide_db::chart_kind(result, "pie", Some(col_i)) {
+        lines.push(Line::from(""));
+        for l in pie.lines() {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", truncate_chars(l, width.saturating_sub(2))),
+                theme::style_muted(),
+            )));
+        }
+    }
+    lines
+}
+
+/// Admin · Health ops surface — KPI / ops table instead of dumping into Results.
+fn render_admin_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
+    let Some(db) = ctx.db else {
+        return;
+    };
+    let title = if ctx.ui.admin_modal_title.is_empty() {
+        "Admin"
+    } else {
+        ctx.ui.admin_modal_title.as_str()
+    };
+    let view = ctx.ui.admin_modal_view.to_ascii_lowercase();
+    let is_overview = view.contains("overview");
+    let is_blocking = view.contains("blocking") || view.contains("lock");
+
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::bg())),
+        screen,
+    );
+
+    let width = screen.width.saturating_sub(4).clamp(56, 120);
+    let height = screen.height.saturating_sub(2).clamp(14, 36);
+    let area = Rect {
+        x: screen.x + (screen.width.saturating_sub(width)) / 2,
+        y: screen.y + (screen.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::border_focus()))
+            .style(Style::default().bg(theme::surface())),
+        area,
+    );
+
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+
+    // Title plate
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " ADMIN ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {title} "),
+                Style::default().fg(theme::text()).bg(theme::surface_2()),
+            ),
+        ])),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    let (nrows, ncols, ms) = db
+        .last_result
+        .as_ref()
+        .map(|r| (r.rows.len(), r.columns.len(), r.elapsed_ms))
+        .unwrap_or((0, 0, 0));
+    let mut chips: Vec<Span> = vec![
+        Span::styled(
+            format!(" {nrows} rows "),
+            Style::default().fg(theme::muted()).bg(theme::surface_2()),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" {ncols} cols "),
+            Style::default().fg(theme::muted()).bg(theme::surface_2()),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" {ms} ms "),
+            Style::default().fg(theme::muted()).bg(theme::surface_2()),
+        ),
+    ];
+    if is_blocking && nrows > 0 {
+        chips.push(Span::raw(" "));
+        chips.push(Span::styled(
+            " blocked ",
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if is_blocking && nrows == 0 {
+        chips.push(Span::raw(" "));
+        chips.push(Span::styled(
+            " clear ",
+            Style::default()
+                .fg(theme::bg())
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(chips)),
+        Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: 1,
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(inner.width as usize),
+            theme::style_faint(),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y + 2,
+            width: inner.width,
+            height: 1,
+        },
+    );
+
+    let body = Rect {
+        x: inner.x,
+        y: inner.y + 3,
+        width: inner.width,
+        height: inner.height.saturating_sub(5).max(1),
+    };
+    let body_w = body.width as usize;
+    let body_h = body.height as usize;
+
+    let lines: Vec<Line> = match db.last_result.as_ref() {
+        None => vec![Line::from(Span::styled(
+            " running… ",
+            theme::style_faint(),
+        ))],
+        Some(result) if is_overview && admin_is_metric_value(result) => {
+            admin_overview_kpi_lines(result, body_w)
+        }
+        Some(result) if is_blocking => admin_blocking_lines(result, ctx.ui.admin_modal_row, body_w),
+        Some(result) => admin_ops_table_lines(result, ctx.ui.admin_modal_row, body_w),
+    };
+
+    let scroll = {
+        let sel = ctx.ui.admin_modal_row;
+        sel.saturating_sub(body_h.saturating_sub(1) / 2)
+            .min(lines.len().saturating_sub(body_h))
+    };
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(inner.width as usize),
+            theme::style_faint(),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(2),
+            width: inner.width,
+            height: 1,
+        },
+    );
+    let hint = if is_overview {
+        " r refresh   Esc close "
+    } else {
+        " ↑↓ row   r refresh   Esc close "
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            truncate_chars(hint, inner.width as usize),
+            Style::default().fg(theme::faint()).bg(theme::surface_2()),
+        )),
+        Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        },
+    );
+}
+
+fn admin_is_metric_value(result: &ide_db::QueryResult) -> bool {
+    if result.columns.len() < 2 {
+        return false;
+    }
+    let a = result.columns[0].to_ascii_lowercase();
+    let b = result.columns[1].to_ascii_lowercase();
+    (a.contains("metric") || a == "name" || a == "key" || a == "stat")
+        && (b.contains("value") || b == "val" || b == "count")
+}
+
+fn admin_overview_kpi_lines(result: &ide_db::QueryResult, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " overview ",
+        theme::style_faint(),
+    )));
+    lines.push(Line::from(""));
+    // Two KPIs per row when wide enough.
+    let card_w = ((width.saturating_sub(2)) / 2).max(18).min(36);
+    let mut i = 0usize;
+    while i < result.rows.len() {
+        let mut spans: Vec<Span> = Vec::new();
+        for j in 0..2 {
+            if let Some(row) = result.rows.get(i + j) {
+                let metric = row.first().map(|s| s.as_str()).unwrap_or("?");
+                let value = row.get(1).map(|s| s.as_str()).unwrap_or("—");
+                let label = truncate_chars(metric, card_w.saturating_sub(value.chars().count() + 3));
+                let pad = card_w
+                    .saturating_sub(display_width(&label) + display_width(value) + 1)
+                    .min(8);
+                if j > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(
+                    format!(" {label}"),
+                    theme::style_faint(),
+                ));
+                spans.push(Span::raw(" ".repeat(pad.max(1))));
+                spans.push(Span::styled(
+                    format!("{value} "),
+                    theme::style_text().add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        lines.push(Line::from(spans));
+        i += 2;
+    }
+    if result.rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no metrics)",
+            theme::style_faint(),
+        )));
+    }
+    lines
+}
+
+fn admin_blocking_lines(
+    result: &ide_db::QueryResult,
+    sel: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if result.rows.is_empty() {
+        return vec![
+            Line::from(Span::styled(
+                " no blockers ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Nothing waiting on locks right now.",
+                theme::style_faint(),
+            )),
+        ];
+    }
+    let mut lines = Vec::new();
+    for (ri, row) in result.rows.iter().enumerate() {
+        let selected = ri == sel;
+        let style = if selected {
+            theme::style_selected()
+        } else {
+            theme::style_text()
+        };
+        let blocked = row.first().map(|s| s.as_str()).unwrap_or("?");
+        let blocker = row.get(2).map(|s| s.as_str()).unwrap_or("?");
+        let wait = row
+            .get(4)
+            .or_else(|| row.get(5))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let q = row
+            .iter()
+            .rev()
+            .find(|c| c.len() > 12)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let head = format!(" {blocked}  ←blocked by←  {blocker}  {wait}");
+        lines.push(Line::from(Span::styled(
+            truncate_chars(&head, width.saturating_sub(1)),
+            style.add_modifier(Modifier::BOLD),
+        )));
+        if !q.is_empty() {
+            lines.push(Line::from(Span::styled(
+                truncate_chars(&format!("   {q}"), width.saturating_sub(1)),
+                if selected {
+                    theme::style_selected()
+                } else {
+                    theme::style_faint()
+                },
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn admin_ops_table_lines(
+    result: &ide_db::QueryResult,
+    sel: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let ncols = result.columns.len().min(6);
+    if ncols == 0 {
+        return vec![Line::from(Span::styled(
+            " (empty)",
+            theme::style_faint(),
+        ))];
+    }
+    let col_w = ((width.saturating_sub(ncols.saturating_sub(1))) / ncols).max(6);
+    let mut lines = Vec::new();
+    let mut header: Vec<Span> = Vec::new();
+    for (i, c) in result.columns.iter().take(ncols).enumerate() {
+        if i > 0 {
+            header.push(Span::styled(" ", theme::style_faint()));
+        }
+        header.push(Span::styled(
+            pad_display(c, col_w),
+            Style::default()
+                .fg(theme::muted())
+                .bg(theme::surface_2())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(header));
+    for (ri, row) in result.rows.iter().enumerate() {
+        let selected = ri == sel;
+        let style = if selected {
+            theme::style_selected()
+        } else if ri % 2 == 1 {
+            Style::default().fg(theme::text()).bg(theme::surface_2())
+        } else {
+            theme::style_text()
+        };
+        let mut spans = Vec::new();
+        for (i, cell) in row.iter().take(ncols).enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" ", theme::style_faint()));
+            }
+            let t = pad_display(&truncate_display(cell, col_w), col_w);
+            spans.push(Span::styled(t, style));
+        }
+        lines.push(Line::from(spans));
+    }
+    if result.rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no rows)",
+            theme::style_faint(),
+        )));
+    }
+    if result.columns.len() > ncols {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                " +{} more cols in Results after Esc ",
+                result.columns.len() - ncols
+            ),
+            theme::style_faint(),
+        )));
+    }
+    lines
+}
+
+/// Latency / activity monitor overlay (`m` toggle).
+fn render_db_monitor(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
+    let Some(db) = ctx.db else {
+        return;
+    };
+    let width = screen.width.saturating_sub(16).clamp(40, 72);
+    let height = 12u16;
+    let area = Rect {
+        x: screen.x + (screen.width.saturating_sub(width)) / 2,
+        y: screen.y + 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(Line::from(Span::styled(
+                " monitor · latency ",
+                theme::style_title(true),
+            )))
+            .border_style(Style::default().fg(theme::border_idle()))
+            .style(Style::default().bg(theme::surface())),
+        area,
+    );
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let spark =
+        ide_db::latency_sparkline(&db.latency_history, (inner.width as usize).saturating_sub(4));
+    let last = db.latency_history.last().copied().unwrap_or(0);
+    let avg = if db.latency_history.is_empty() {
+        0
+    } else {
+        (db.latency_history.iter().sum::<u128>() / db.latency_history.len() as u128) as u128
+    };
+    let txn = if db.in_txn { "OPEN" } else { "autocommit" };
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" spark  {spark}"),
+            theme::style_accent(),
+        )),
+        Line::from(Span::styled(
+            format!(
+                " last={last}ms  avg={avg}ms  n={}",
+                db.latency_history.len()
+            ),
+            theme::style_text(),
+        )),
+        Line::from(Span::styled(
+            format!(
+                " txn={txn}  tabs={}  history={}",
+                db.tabs.len(),
+                db.history.len()
+            ),
+            theme::style_muted(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " m close · latency from last 64 queries",
+            theme::style_faint(),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn wrap_value(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for raw in text.split('\n') {
+        if raw.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for ch in raw.chars() {
+            if line.chars().count() >= width {
+                out.push(std::mem::take(&mut line));
+            }
+            line.push(ch);
+        }
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+    truncate_display(s, max_chars)
+}
+
+fn display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Truncate by terminal columns (Nerd Font glyphs may be double-width).
+fn truncate_display(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
         return String::new();
     }
-    let count = s.chars().count();
-    if count <= max_chars {
+    if display_width(s) <= max_cols {
         return s.to_string();
     }
-    let keep = max_chars.saturating_sub(1);
-    let mut out: String = s.chars().take(keep).collect();
+    let keep = max_cols.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > keep {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
     out.push('…');
     out
+}
+
+/// Pad/truncate so `display_width == width` (keeps │ columns aligned).
+fn pad_display(s: &str, width: usize) -> String {
+    let t = truncate_display(s, width);
+    let w = display_width(&t);
+    if w >= width {
+        t
+    } else {
+        format!("{t}{}", " ".repeat(width - w))
+    }
 }
 
 /// Build Console toolbar spans; drop schema then database as whole chips when narrow.
