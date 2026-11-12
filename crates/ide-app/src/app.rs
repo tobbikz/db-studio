@@ -96,11 +96,14 @@ pub struct App {
     health_tick_counter: u32,
     /// Ticks since last Health · Activity auto-refresh (~33ms each).
     health_activity_tick: u32,
+    /// Theme id before palette live-preview (Esc restores).
+    theme_before_preview: Option<String>,
 }
 
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         let config = IdeConfig::load();
+        ide_ui::theme::reload_customs();
         ide_ui::theme::set_mode_name(&config.theme.name);
         let workspace = Workspace::open(&root).context("open workspace")?;
         let lsp = LspManager::new(workspace.root.clone(), config.clone());
@@ -138,6 +141,7 @@ impl App {
             pending_db_query: false,
             health_tick_counter: 0,
             health_activity_tick: 0,
+            theme_before_preview: None,
         };
         app.config.remember_project(&app.workspace.root);
         app.db.query_timeout_secs = app.config.database.query_timeout_secs;
@@ -607,6 +611,16 @@ impl App {
             .map(|(plugin, id, title)| (format!("[{plugin}] {title}"), format!("plugin:{id}")))
             .collect();
         self.ui.palette.append_items(plugin_items);
+        // Custom themes from ~/.config/tui-ide/themes/*.toml
+        ide_ui::theme::reload_customs();
+        let custom_items: Vec<(String, String)> = ide_ui::theme::customs()
+            .into_iter()
+            .map(|t| (format!("Theme: {} (custom)", t.label), format!("theme_{}", t.id)))
+            .collect();
+        self.ui.palette.append_items(custom_items);
+        // Snapshot committed theme so Esc can undo live previews.
+        self.theme_before_preview = None;
+        self.preview_palette_theme();
     }
 
     fn open_db_object_palette(&mut self) {
@@ -755,11 +769,9 @@ impl App {
         };
         self.ui.focus = Focus::Results;
         self.ui.mode = Mode::EditTableFilter;
-        let label = match field {
-            TableFilterField::Where => "WHERE",
-            TableFilterField::OrderBy => "ORDER BY",
-        };
-        self.set_status(format!("{label} · Enter apply · Tab switch · Esc cancel"), false);
+        // Keep footer bindings visible (no toast that hides `o order`).
+        self.ui.status = None;
+        self.refresh_table_filter_completions();
     }
 
     async fn confirm_table_filter(&mut self) -> Result<()> {
@@ -770,6 +782,8 @@ impl App {
         }
         self.ui.mode = Mode::Normal;
         self.ui.table_filter_draft.clear();
+        self.ui.show_completions = false;
+        self.ui.completions.clear();
         self.ui.focus = Focus::Results;
         match self.db.apply_table_filters().await {
             Ok(()) => {
@@ -806,6 +820,123 @@ impl App {
             TableFilterField::Where => self.db.active_table_where().to_string(),
             TableFilterField::OrderBy => self.db.active_table_order_by().to_string(),
         };
+        self.refresh_table_filter_completions();
+    }
+
+    /// Current identifier token at end of WHERE/ORDER draft → (byte-free char start, token).
+    fn table_filter_token(draft: &str) -> (usize, String) {
+        let chars: Vec<char> = draft.chars().collect();
+        let mut i = chars.len();
+        while i > 0 {
+            let c = chars[i - 1];
+            if c.is_ascii_alphanumeric() || c == '_' {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        (i, chars[i..].iter().collect())
+    }
+
+    fn refresh_table_filter_completions(&mut self) {
+        if self.ui.mode != Mode::EditTableFilter {
+            return;
+        }
+        let draft = self.ui.table_filter_draft.clone();
+        let cols: Vec<String> = self
+            .db
+            .last_result
+            .as_ref()
+            .map(|r| r.columns.clone())
+            .unwrap_or_default();
+        let (start, token) = Self::table_filter_token(&draft);
+        let token_l = token.to_ascii_lowercase();
+        let mut items: Vec<ide_lsp::CompletionItemView> = Vec::new();
+
+        // After a finished column + space in ORDER BY → ASC / DESC.
+        let trimmed = draft.trim_end();
+        let ends_space = draft.ends_with(' ') && !trimmed.is_empty();
+        if matches!(self.ui.table_filter_field, TableFilterField::OrderBy) && ends_space {
+            for dir in ["ASC", "DESC"] {
+                items.push(ide_lsp::CompletionItemView {
+                    label: dir.to_string(),
+                    detail: Some("direction".into()),
+                    insert_text: dir.to_string(),
+                    kind: None,
+                    replace_start_col: Some(draft.chars().count() as u32),
+                    replace_end_col: Some(draft.chars().count() as u32),
+                    filter_text: None,
+                });
+            }
+        } else {
+            for c in &cols {
+                let cl = c.to_ascii_lowercase();
+                if token_l.is_empty() || cl.starts_with(&token_l) || cl.contains(&token_l) {
+                    items.push(ide_lsp::CompletionItemView {
+                        label: c.clone(),
+                        detail: Some("column".into()),
+                        insert_text: c.clone(),
+                        kind: None,
+                        replace_start_col: Some(start as u32),
+                        replace_end_col: Some(draft.chars().count() as u32),
+                        filter_text: Some(token.clone()),
+                    });
+                }
+            }
+            items.sort_by(|a, b| {
+                let a_pref = a
+                    .label
+                    .to_ascii_lowercase()
+                    .starts_with(&token_l);
+                let b_pref = b
+                    .label
+                    .to_ascii_lowercase()
+                    .starts_with(&token_l);
+                b_pref.cmp(&a_pref).then_with(|| a.label.cmp(&b.label))
+            });
+            items.truncate(24);
+        }
+
+        let n = items.len();
+        self.ui.completions = items;
+        self.ui.completion_idx = 0;
+        self.ui.show_completions = n > 0;
+    }
+
+    fn accept_table_filter_completion(&mut self) {
+        if !self.ui.show_completions || self.ui.completions.is_empty() {
+            // No suggestions → Tab switches WHERE ↔ ORDER BY.
+            self.cycle_table_filter_field(true);
+            return;
+        }
+        let item = self.ui.completions[self.ui.completion_idx.min(self.ui.completions.len() - 1)]
+            .clone();
+        let draft = self.ui.table_filter_draft.clone();
+        let chars: Vec<char> = draft.chars().collect();
+        let start = item
+            .replace_start_col
+            .map(|c| c as usize)
+            .unwrap_or(0)
+            .min(chars.len());
+        let end = item
+            .replace_end_col
+            .map(|c| c as usize)
+            .unwrap_or(chars.len())
+            .min(chars.len());
+        let prefix: String = chars[..start].iter().collect();
+        let suffix: String = chars[end..].iter().collect();
+        let insert = if matches!(self.ui.table_filter_field, TableFilterField::OrderBy)
+            && item.detail.as_deref() == Some("direction")
+        {
+            item.insert_text
+        } else if matches!(self.ui.table_filter_field, TableFilterField::OrderBy) {
+            // Leave a space so ASC/DESC suggestions appear next.
+            format!("{} ", item.insert_text)
+        } else {
+            item.insert_text
+        };
+        self.ui.table_filter_draft = format!("{prefix}{insert}{suffix}");
+        self.refresh_table_filter_completions();
     }
 
     async fn go_to_ddl(&mut self) -> Result<()> {
@@ -1396,6 +1527,58 @@ impl App {
             }
             Err(e) => self.set_status(format!("clipboard: {e}"), true),
         }
+    }
+
+    fn yank_result_row(&mut self) {
+        let Some(result) = self.db.last_result.as_ref() else {
+            self.set_status("copy row: no results", true);
+            return;
+        };
+        let Some(row) = result.rows.get(result.cursor_row) else {
+            self.set_status("copy row: no row", true);
+            return;
+        };
+        let text = row
+            .iter()
+            .map(|c| if c == "NULL" { "" } else { c.as_str() })
+            .collect::<Vec<_>>()
+            .join("\t");
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+            Ok(()) => self.set_status(
+                format!("copied row · {} cols TSV", row.len()),
+                false,
+            ),
+            Err(e) => self.set_status(format!("clipboard: {e}"), true),
+        }
+    }
+
+    fn yank_result_all(&mut self) {
+        let Some(result) = self.db.last_result.as_ref() else {
+            self.set_status("copy all: no results", true);
+            return;
+        };
+        let mut lines: Vec<String> = Vec::with_capacity(result.rows.len() + 1);
+        lines.push(result.columns.join("\t"));
+        for row in &result.rows {
+            lines.push(
+                row.iter()
+                    .map(|c| if c == "NULL" { "" } else { c.as_str() })
+                    .collect::<Vec<_>>()
+                    .join("\t"),
+            );
+        }
+        let text = lines.join("\n");
+        let n = result.rows.len();
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => self.set_status(format!("copied all · {n} rows TSV"), false),
+            Err(e) => self.set_status(format!("clipboard: {e}"), true),
+        }
+    }
+
+    fn open_results_actions(&mut self) {
+        self.ui.mode = Mode::Palette;
+        self.ui.palette = Palette::open_results_actions();
+        self.set_status("results actions · Enter run · Esc", false);
     }
 
     async fn yank_nvim_to_host_clipboard(&mut self) -> Result<()> {
@@ -2213,7 +2396,7 @@ impl App {
     }
 
     async fn apply_row_updates(&mut self) -> Result<()> {
-        match self.db.pending_updates_preview(8) {
+        match self.db.pending_updates_preview(16) {
             Ok(preview) => {
                 self.ui.confirm_apply_pending = true;
                 self.ui.confirm_delete_source_id = None;
@@ -3009,6 +3192,63 @@ impl App {
         self.lsp = LspManager::new(self.workspace.root.clone(), self.config.clone());
         self.set_status("config saved and reloaded", false);
         Ok(())
+    }
+
+    /// Apply a built-in theme id, persist to config, and toast the label.
+    fn apply_theme_id(&mut self, name: &str) {
+        ide_ui::theme::set_mode_name(name);
+        let id = ide_ui::theme::current_id();
+        self.config.theme.name = id.to_string();
+        self.theme_before_preview = None;
+        if let Err(e) = self.config.save() {
+            self.set_status(format!("theme · {id} (save failed: {e:#})"), true);
+            return;
+        }
+        self.set_status(
+            format!("theme · {} ({id})", ide_ui::theme::current_label()),
+            false,
+        );
+    }
+
+    /// Live-preview theme under the palette cursor (DataRig-style). Does not write config.
+    fn preview_palette_theme(&mut self) {
+        if self.ui.mode != Mode::Palette {
+            return;
+        }
+        let id = self
+            .ui
+            .palette
+            .selected_item()
+            .map(|it| it.id.clone())
+            .unwrap_or_default();
+        if id == "theme_new_custom" || id == "theme_reload" {
+            if let Some(base) = self.theme_before_preview.clone() {
+                ide_ui::theme::set_mode_name(&base);
+            }
+            return;
+        }
+        if let Some(name) = id.strip_prefix("theme_") {
+            if self.theme_before_preview.is_none() {
+                let mut base = self.config.theme.name.clone();
+                if base.trim().is_empty() {
+                    base = ide_ui::theme::current_id().to_string();
+                }
+                self.theme_before_preview = Some(base);
+            }
+            ide_ui::theme::set_mode_name(name);
+            return;
+        }
+        // Left theme rows — snap back to the theme we had when preview started.
+        if let Some(base) = self.theme_before_preview.clone() {
+            ide_ui::theme::set_mode_name(&base);
+        }
+    }
+
+    /// Esc from palette: drop preview and restore committed theme.
+    fn restore_theme_preview(&mut self) {
+        if let Some(id) = self.theme_before_preview.take() {
+            ide_ui::theme::set_mode_name(&id);
+        }
     }
 
     /// Enter on a Results cell: open inspector on Row (Cell is Enter drill-in).
@@ -4460,7 +4700,26 @@ impl App {
             }
             Action::Save => self.save_active().await?,
             Action::CloseTab => {
-                if let Err(e) = self.buffers.close_active() {
+                if self.ui.product == ProductMode::Database {
+                    if self.db.close_active_tab() {
+                        self.ui.db_cursor = Cursor::default();
+                        self.ui.db_scroll_row = 0;
+                        let _ = self.db.refresh_structure_for_active_tab().await;
+                        self.set_status(
+                            format!(
+                                "closed · now {}",
+                                self.db
+                                    .tabs
+                                    .get(self.db.active_tab)
+                                    .map(|t| t.title.as_str())
+                                    .unwrap_or("?")
+                            ),
+                            false,
+                        );
+                    } else {
+                        self.set_status(self.db.status.clone(), true);
+                    }
+                } else if let Err(e) = self.buffers.close_active() {
                     self.set_status(e.to_string(), true);
                 }
             }
@@ -4487,6 +4746,13 @@ impl App {
             }
             Action::OpenDbObjectPalette => self.open_db_object_palette(),
             Action::Cancel => {
+                if self.ui.show_discover {
+                    self.ui.show_discover = false;
+                    return Ok(());
+                }
+                if self.ui.mode == Mode::Palette {
+                    self.restore_theme_preview();
+                }
                 if self.ui.query_error.is_some() {
                     self.ui.query_error = None;
                 }
@@ -4689,7 +4955,10 @@ impl App {
                 _ => {}
             },
             Action::MoveUp => match self.ui.mode {
-                Mode::Palette => self.ui.palette.move_up(),
+                Mode::Palette => {
+                    self.ui.palette.move_up();
+                    self.preview_palette_theme();
+                }
                 Mode::Insert | Mode::Normal if self.ui.show_completions => {
                     self.ui.completion_idx = self.ui.completion_idx.saturating_sub(1);
                 }
@@ -4714,6 +4983,7 @@ impl App {
                     Focus::Git => {
                         if let Some(git) = self.git.as_mut() {
                             git.move_up();
+                            let _ = git.load_diff().await;
                         }
                     }
                     Focus::Debug => {
@@ -4742,7 +5012,10 @@ impl App {
                 },
             },
             Action::MoveDown => match self.ui.mode {
-                Mode::Palette => self.ui.palette.move_down(),
+                Mode::Palette => {
+                    self.ui.palette.move_down();
+                    self.preview_palette_theme();
+                }
                 Mode::Insert | Mode::Normal if self.ui.show_completions => {
                     if self.ui.completion_idx + 1 < self.ui.completions.len().min(10) {
                         self.ui.completion_idx += 1;
@@ -4774,6 +5047,7 @@ impl App {
                     Focus::Git => {
                         if let Some(git) = self.git.as_mut() {
                             git.move_down();
+                            let _ = git.load_diff().await;
                         }
                     }
                     Focus::Debug => {
@@ -4895,6 +5169,7 @@ impl App {
                 }
                 Mode::EditTableFilter => {
                     self.ui.table_filter_draft.pop();
+                    self.refresh_table_filter_completions();
                 }
                 Mode::Replace => {
                     self.ui.replace_query.pop();
@@ -4928,7 +5203,10 @@ impl App {
                 }
                 Mode::SessionForm => self.session_form_pop_char(),
                 Mode::AgentForm => self.agent_form_pop_char(),
-                Mode::Palette => self.ui.palette.backspace(),
+                Mode::Palette => {
+                    self.ui.palette.backspace();
+                    self.preview_palette_theme();
+                }
                 Mode::Insert if self.editing_db_sql() => {
                     self.db_backspace();
                     self.db_ensure_cursor_visible(view_h);
@@ -5078,11 +5356,17 @@ impl App {
             Action::GotoDefinition => self.goto_definition().await,
             Action::Hover => self.hover().await,
             Action::AcceptCompletion => {
-                self.accept_completion();
-                self.sync_lsp_change().await;
+                if self.ui.mode == Mode::EditTableFilter {
+                    self.accept_table_filter_completion();
+                } else {
+                    self.accept_completion();
+                    self.sync_lsp_change().await;
+                }
             }
             Action::NextCompletion => {
-                if self.ui.completion_idx + 1 < self.ui.completions.len().min(10) {
+                if self.ui.completions.is_empty() {
+                    // nothing
+                } else if self.ui.completion_idx + 1 < self.ui.completions.len().min(10) {
                     self.ui.completion_idx += 1;
                 }
             }
@@ -5090,7 +5374,14 @@ impl App {
                 self.ui.completion_idx = self.ui.completion_idx.saturating_sub(1);
             }
             Action::RefreshTree => {
-                if self.ui.focus == Focus::Database {
+                if self.ui.focus == Focus::Git {
+                    if let Some(git) = self.git.as_mut() {
+                        match git.refresh().await {
+                            Ok(()) => self.set_status("git refreshed", false),
+                            Err(e) => self.set_status(format!("git: {e:#}"), true),
+                        }
+                    }
+                } else if self.ui.focus == Focus::Database {
                     self.db.rebuild_flat();
                     self.set_status("database tree refreshed", false);
                 } else if let Err(e) = self.workspace.refresh() {
@@ -5128,30 +5419,11 @@ impl App {
             }
             Action::ProductTab(n) => self.goto_product_tab(n).await?,
             Action::OpenGit => {
-                // Database Studio: always the in-app Git panel (never lazygit / less).
-                if self.ui.product == ProductMode::Database
-                    || !self.nvim_active()
-                {
-                    if self.git.is_none() {
-                        match GitState::discover(&self.workspace.root).await {
-                            Ok(g) => self.git = Some(g),
-                            Err(e) => {
-                                self.set_status(format!("Git: {e:#}"), true);
-                                return Ok(());
-                            }
-                        }
-                    }
-                    if let Some(git) = self.git.as_mut() {
-                        if let Err(e) = git.refresh().await {
-                            self.set_status(format!("Git refresh: {e:#}"), true);
-                        }
-                    }
-                    self.ui.sidebar = Sidebar::Git;
-                    self.ui.focus = Focus::Git;
-                    self.ui.show_sidebar = true;
-                    self.ui.bottom = BottomPanel::Results;
-                    self.set_status("Git · s stage · c commit · Esc/q back", false);
-                } else {
+                // Studio: no in-app Git / lazygit surface (removed by product choice).
+                if self.ui.product == ProductMode::Database {
+                    return Ok(());
+                }
+                if self.nvim_active() {
                     self.astro_cmd(
                         "lua pcall(function() Snacks.lazygit() end)",
                         "Astro lazygit · Ctrl-⇧G · <Space>tl",
@@ -5334,6 +5606,7 @@ impl App {
             Action::GoHome => {
                 if self.ui.product == ProductMode::Database {
                     self.ui.show_help = false;
+                    self.ui.show_discover = false;
                     self.ui.busy_label = None;
                     self.go_db_home();
                 } else {
@@ -5342,6 +5615,19 @@ impl App {
             }
             Action::ToggleHelp => {
                 self.ui.show_help = !self.ui.show_help;
+                self.ui.show_discover = false;
+            }
+            Action::ToggleDiscover => {
+                if self.ui.product == ProductMode::Database {
+                    self.ui.show_discover = !self.ui.show_discover;
+                    self.ui.show_help = false;
+                } else {
+                    // Code mode: Space still opens the command palette.
+                    self.open_command_palette();
+                }
+            }
+            Action::CycleTheme => {
+                self.apply_theme_id(&ide_ui::theme::cycle_theme(true));
             }
             Action::ToggleResultsDensity => {
                 self.ui.results_compact = !self.ui.results_compact;
@@ -5589,8 +5875,16 @@ impl App {
             Action::EditCell => self.start_edit_cell(),
             Action::OpenCellModal => self.open_cell_modal(),
             Action::YankResultCell => self.yank_result_cell(),
+            Action::YankResultRow => self.yank_result_row(),
+            Action::OpenResultsActions => self.open_results_actions(),
             Action::SelectAll => self.select_all_sql_or_editor(),
-            Action::ClipboardCopy => self.clipboard_copy_sql_or_editor(),
+            Action::ClipboardCopy => {
+                if self.ui.focus == Focus::Results {
+                    self.yank_result_cell();
+                } else {
+                    self.clipboard_copy_sql_or_editor();
+                }
+            }
             Action::ClipboardPaste => self.clipboard_paste_sql_or_editor(),
             Action::FocusResults => {
                 self.ui.bottom = BottomPanel::Results;
@@ -5939,8 +6233,19 @@ impl App {
         let item = self.ui.palette.selected_item().cloned();
         self.ui.mode = Mode::Normal;
         let Some(item) = item else {
+            self.restore_theme_preview();
             return Ok(());
         };
+        // Committing a theme (or leaving palette on another command): clear preview session.
+        let committing_theme = item.id.starts_with("theme_")
+            && item.id != "theme_new_custom"
+            && item.id != "theme_reload";
+        if !committing_theme {
+            self.restore_theme_preview();
+        } else {
+            // Enter keeps the previewed theme — persist happens in theme_* handlers.
+            self.theme_before_preview = None;
+        }
         if mode == PaletteMode::CodeActions {
             if item.id.starts_with("cmd:") {
                 self.set_status(format!("command not wired: {}", item.id), true);
@@ -6149,6 +6454,11 @@ impl App {
             "export_sql" => self.export_results_sql()?,
             "export_json" => self.export_results_json()?,
             "export_markdown" => self.export_results_markdown()?,
+            "yank_result_cell" => self.yank_result_cell(),
+            "yank_result_row" => self.yank_result_row(),
+            "yank_result_all" => self.yank_result_all(),
+            "edit_table_where" => self.begin_table_filter_edit(TableFilterField::Where),
+            "edit_table_order" => self.begin_table_filter_edit(TableFilterField::OrderBy),
             "format_sql" => match self.db.format_active_sql() {
                 Ok(()) => self.set_status(self.db.status.clone(), false),
                 Err(e) => self.set_status(format!("format: {e:#}"), true),
@@ -6466,6 +6776,42 @@ impl App {
                 self.db.new_query_tab();
                 self.ui.focus = Focus::Editor;
                 self.set_status(self.db.status.clone(), false);
+            }
+            "theme_reload" => {
+                ide_ui::theme::reload_customs();
+                ide_ui::theme::set_mode_name(&self.config.theme.name);
+                self.set_status(
+                    format!(
+                        "themes reloaded · {} custom",
+                        ide_ui::theme::customs().len()
+                    ),
+                    false,
+                );
+            }
+            "theme_new_custom" => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() % 10_000)
+                    .unwrap_or(0);
+                let name = format!("custom{stamp}");
+                let extends = ide_ui::theme::current_id();
+                match ide_ui::theme::create_custom_theme(&name, &extends) {
+                    Ok(path) => {
+                        self.apply_theme_id(&name);
+                        self.set_status(
+                            format!(
+                                "custom theme · edit {} · Theme: reload after changes",
+                                path.display()
+                            ),
+                            false,
+                        );
+                    }
+                    Err(e) => self.set_status(format!("theme new: {e:#}"), true),
+                }
+            }
+            id if id.starts_with("theme_") => {
+                let name = id.trim_start_matches("theme_");
+                self.apply_theme_id(name);
             }
             "studio_help" => {
                 let text = ide_db::DbWorkspace::studio_help_text();
@@ -7908,6 +8254,7 @@ async fn event_loop(
                             app.ui.cell_edit_input.push_str(&text);
                         } else if app.ui.mode == Mode::EditTableFilter {
                             app.ui.table_filter_draft.push_str(&text);
+                            app.refresh_table_filter_completions();
                         } else if app.editing_db_sql()
                             && matches!(app.ui.mode, Mode::Insert | Mode::Normal)
                         {
@@ -8444,17 +8791,16 @@ async fn event_loop(
                                     KeyCode::Enter => {
                                         if app.ui.cell_modal_drill {
                                             app.start_cell_modal_edit();
-                                        } else if app.ui.cell_modal_tab == 0
-                                            || app.ui.cell_modal_tab == 2
-                                        {
-                                            // Row / Meta → full Cell for the selected field.
+                                        } else if app.ui.cell_modal_tab == 0 {
+                                            // Row → full Cell for the selected field.
                                             app.ui.cell_modal_drill = true;
                                             app.set_status(
                                                 "cell · Enter/i edit · Esc → Row",
                                                 false,
                                             );
                                         } else {
-                                            app.start_cell_modal_edit();
+                                            // Plan / Chart / JSON — stay on tab.
+                                            continue;
                                         }
                                         continue;
                                     }
@@ -8468,7 +8814,7 @@ async fn event_loop(
                                     KeyCode::Tab => {
                                         app.ui.cell_modal_drill = false;
                                         app.ui.cell_modal_tab =
-                                            (app.ui.cell_modal_tab + 1) % 3;
+                                            (app.ui.cell_modal_tab + 1) % 4;
                                         continue;
                                     }
                                     KeyCode::BackTab => {
@@ -8477,7 +8823,7 @@ async fn event_loop(
                                             .ui
                                             .cell_modal_tab
                                             .checked_sub(1)
-                                            .unwrap_or(2);
+                                            .unwrap_or(3);
                                         continue;
                                     }
                                     KeyCode::Char('1') => {
@@ -8493,6 +8839,11 @@ async fn event_loop(
                                     KeyCode::Char('3') => {
                                         app.ui.cell_modal_drill = false;
                                         app.ui.cell_modal_tab = 2;
+                                        continue;
+                                    }
+                                    KeyCode::Char('4') => {
+                                        app.ui.cell_modal_drill = false;
+                                        app.ui.cell_modal_tab = 3;
                                         continue;
                                     }
                                     KeyCode::Up => {
@@ -8774,6 +9125,10 @@ async fn event_loop(
                                         app.ui.show_help = false;
                                         continue;
                                     }
+                                    if app.ui.show_discover {
+                                        app.ui.show_discover = false;
+                                        continue;
+                                    }
                                     if app.ui.db_fullscreen.is_some() {
                                         app.ui.db_fullscreen = None;
                                         app.set_status("fullscreen off", false);
@@ -8974,6 +9329,7 @@ async fn event_loop(
                             Mode::EditTableFilter => {
                                 if let KeyCode::Char(c) = key.code {
                                     app.ui.table_filter_draft.push(c);
+                                    app.refresh_table_filter_completions();
                                 }
                             }
                             Mode::Replace => {
@@ -9092,6 +9448,7 @@ async fn event_loop(
                             Mode::Palette => {
                                 if let KeyCode::Char(c) = key.code {
                                     app.ui.palette.push_char(c);
+                                    app.preview_palette_theme();
                                 }
                             }
                             Mode::Normal => {}

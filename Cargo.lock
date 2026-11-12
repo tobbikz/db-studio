@@ -1977,7 +1977,9 @@ dependencies = [
 name = "ide-ui"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "crossterm",
+ "dirs",
  "ide-agents",
  "ide-buffer",
  "ide-config",
@@ -1994,8 +1996,11 @@ dependencies = [
  "ide-syntax",
  "lsp-types",
  "nucleo-matcher",
+ "parking_lot",
  "ratatui",
+ "serde",
  "serde_json",
+ "toml",
  "unicode-width 0.2.0",
 ]
 

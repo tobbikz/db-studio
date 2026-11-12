@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,6 +29,8 @@ pub enum PaletteMode {
     ConsoleDatabase,
     /// Console toolbar: pick schema (search path).
     ConsoleSchema,
+    /// Results-focused DataGrip-like actions (export / copy / page / …).
+    ResultsActions,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +104,17 @@ impl Palette {
             item("Set console database…", "console_database"),
             item("Set console schema…", "console_schema"),
             item("Studio help", "studio_help"),
+            item("Theme: AMOLED mono", "theme_black"),
+            item("Theme: AMOLED light mono", "theme_white"),
+            item("Theme: Dark", "theme_dark"),
+            item("Theme: Nord", "theme_nord"),
+            item("Theme: Catppuccin Mocha", "theme_catppuccin-mocha"),
+            item("Theme: Tokyo Night", "theme_tokyo-night"),
+            item("Theme: Dracula", "theme_dracula"),
+            item("Theme: Light", "theme_light"),
+            item("Theme: High contrast", "theme_high-contrast"),
+            item("Theme: new custom…", "theme_new_custom"),
+            item("Theme: reload customs", "theme_reload"),
             item("Onboarding tips", "onboarding_tips"),
             item("Recipe gallery", "recipe_gallery"),
             item("Recipe: top customers", "recipe_top_customers"),
@@ -335,6 +348,49 @@ impl Palette {
             .collect();
         let mut p = Self {
             mode: PaletteMode::CodeActions,
+            query: String::new(),
+            items,
+            filtered: Vec::new(),
+            selected: 0,
+        };
+        p.refilter();
+        p
+    }
+
+    /// Curated Results data actions (export, copy, edit, page, materialize).
+    pub fn open_results_actions() -> Self {
+        let items = vec![
+            item("Export CSV", "export_csv"),
+            item("Export JSON", "export_json"),
+            item("Export SQL INSERTs", "export_sql"),
+            item("Export Markdown", "export_markdown"),
+            item("Export result pack (SQL+CSV)", "export_result_pack"),
+            item("Copy cell (y)", "yank_result_cell"),
+            item("Copy row (TSV)", "yank_result_row"),
+            item("Copy all as TSV", "yank_result_all"),
+            item("Filter results (/)", "filter_results"),
+            item("Edit WHERE (w)", "edit_table_where"),
+            item("Edit ORDER BY (o)", "edit_table_order"),
+            item("Next page (])", "result_page_next"),
+            item("Prev page ([)", "result_page_prev"),
+            item("Toggle density (D)", "toggle_results_density"),
+            item("Pin / unpin columns", "toggle_pin_columns"),
+            item("Apply row updates (a)", "apply_updates"),
+            item("Insert result row", "insert_row"),
+            item("Delete result row…", "delete_row"),
+            item("Toggle cell NULL", "toggle_cell_null"),
+            item("Paste TSV into results…", "paste_tsv"),
+            item("Undo last cell edit (u)", "undo_cell_edit"),
+            item("Save as temp table", "save_result_temp"),
+            item("Save as view", "save_result_view"),
+            item("Chart results", "chart_results"),
+            item("Import CSV into table", "import_csv"),
+            item("Import JSON into table", "import_json"),
+            item("Quality strip (null%/stats)", "quality_strip"),
+            item("Toggle mask PII", "toggle_mask_pii"),
+        ];
+        let mut p = Self {
+            mode: PaletteMode::ResultsActions,
             query: String::new(),
             items,
             filtered: Vec::new(),
@@ -590,6 +646,7 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
         PaletteMode::SearchEverywhere => " Search everywhere ",
         PaletteMode::ConsoleDatabase => " Database ",
         PaletteMode::ConsoleSchema => " Schema ",
+        PaletteMode::ResultsActions => " Results · actions ",
     };
 
     frame.render_widget(
@@ -648,9 +705,7 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
         let it = &palette.items[idx];
         let selected = vis_off == palette.selected;
         let name_style = if selected {
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            theme::style_selected()
         } else {
             theme::style_text()
         };
@@ -669,8 +724,32 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
     }
     frame.render_widget(Paragraph::new(lines), inner[2]);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+    let theme_row = palette
+        .selected_item()
+        .is_some_and(|it| {
+            it.id.starts_with("theme_") && it.id != "theme_new_custom" && it.id != "theme_reload"
+        });
+    let hint = if theme_row {
+        Line::from(vec![
+            Span::styled(
+                " ↑↓ ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" preview  ·  ", theme::style_faint()),
+            Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" keep  ·  Esc restore ", theme::style_faint()),
+        ])
+    } else {
+        Line::from(vec![
             Span::styled(
                 " Enter ",
                 Style::default()
@@ -679,9 +758,9 @@ pub fn render_palette(frame: &mut Frame, screen: Rect, palette: &Palette) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" open  ·  Esc close ", theme::style_faint()),
-        ])),
-        inner[4],
-    );
+        ])
+    };
+    frame.render_widget(Paragraph::new(hint), inner[4]);
 }
 
 /// Centered dump restore path prompt.
@@ -1218,6 +1297,112 @@ fn textwrap_lines(s: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Changes panel: pending UPDATE/INSERT/DELETE SQL before Apply (DataRig-style).
+pub fn render_changes_preview(frame: &mut Frame, screen: Rect, preview: &str) {
+    frame.render_widget(Clear, screen);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::bg())),
+        screen,
+    );
+
+    let width = screen.width.min(88).max(52);
+    let sql_lines: Vec<&str> = preview.lines().collect();
+    let body_h = (sql_lines.len() as u16).clamp(4, 16);
+    let height = body_h.saturating_add(8).min(screen.height.saturating_sub(2));
+    let x = screen.x + (screen.width.saturating_sub(width)) / 2;
+    let y = screen.y + (screen.height.saturating_sub(height)) / 3;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, area);
+    let title_style = Style::default()
+        .fg(theme::bg())
+        .bg(theme::text())
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::text()))
+            .style(Style::default().bg(theme::bg()))
+            .title(Span::styled(" Changes · SQL preview ", title_style)),
+        area,
+    );
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .margin(2)
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Pending mutations — review before Apply ",
+            theme::style_muted(),
+        )),
+        inner[0],
+    );
+
+    let max_w = (width as usize).saturating_sub(6).max(20);
+    let body: Vec<Line> = sql_lines
+        .into_iter()
+        .map(|l| {
+            let shown = if l.chars().count() > max_w {
+                format!("{}…", l.chars().take(max_w.saturating_sub(1)).collect::<String>())
+            } else {
+                l.to_string()
+            };
+            let style = if shown.starts_with("UPDATE")
+                || shown.starts_with("INSERT")
+                || shown.starts_with("DELETE")
+            {
+                theme::style_accent()
+            } else if shown.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                theme::style_text()
+            } else {
+                theme::style_muted()
+            };
+            Line::from(Span::styled(format!(" {shown}"), style))
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme::border_idle()))
+                    .style(Style::default().bg(theme::surface())),
+            )
+            .wrap(Wrap { trim: false }),
+        inner[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(theme::bg())
+                    .bg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" apply   ", theme::style_faint()),
+            Span::styled(" Esc ", theme::style_pill_off()),
+            Span::styled(" cancel", theme::style_faint()),
+        ])),
+        inner[3],
+    );
+}
+
 pub fn render_confirm_dialog(
     frame: &mut Frame,
     screen: Rect,
@@ -1251,6 +1436,7 @@ pub fn render_confirm_dialog(
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme::text()))
             .style(Style::default().bg(theme::bg()))
             .title(Span::styled(format!(" {title} "), title_style)),

@@ -35,6 +35,10 @@ pub struct GitState {
     pub branch_selected: usize,
     pub commit_msg: String,
     pub last_log: String,
+    /// `origin` URL (or first remote), for GitLab/GitHub badge in Studio.
+    pub remote_url: String,
+    /// Normalized host label: `gitlab` | `github` | `origin` | empty.
+    pub remote_kind: String,
 }
 
 impl GitState {
@@ -90,6 +94,22 @@ impl GitState {
         self.last_log = git_output(&root, &["log", "-5", "--oneline"])
             .await
             .unwrap_or_default();
+        self.remote_url = git_output(&root, &["remote", "get-url", "origin"])
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if self.remote_url.is_empty() {
+            if let Ok(remotes) = git_output(&root, &["remote", "-v"]).await {
+                self.remote_url = remotes
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        self.remote_kind = classify_remote(&self.remote_url);
         self.load_diff().await?;
         Ok(())
     }
@@ -262,6 +282,19 @@ async fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
         bail!("git {} failed: {err}", args.join(" "));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn classify_remote(url: &str) -> String {
+    let u = url.to_ascii_lowercase();
+    if u.contains("gitlab") {
+        "gitlab".into()
+    } else if u.contains("github.com") || u.contains("github.") {
+        "github".into()
+    } else if u.is_empty() {
+        String::new()
+    } else {
+        "origin".into()
+    }
 }
 
 fn parse_status(porcelain: &str) -> Vec<GitFile> {

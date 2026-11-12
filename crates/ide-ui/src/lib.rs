@@ -173,6 +173,8 @@ pub struct UiState {
     pub show_help: bool,
     /// Transient chrome busy label (`connecting…` / `RUNNING…`).
     pub busy_label: Option<String>,
+    /// Space discoverability overlay (DataRig-style: what can follow).
+    pub show_discover: bool,
     /// Query failure modal body (Enter/Esc dismiss).
     pub query_error: Option<String>,
     /// Console Ctrl-A: entire SQL buffer selected (Backspace/Delete/type clears).
@@ -272,6 +274,7 @@ impl Default for UiState {
             home_favorite_selected: 0,
             show_help: false,
             busy_label: None,
+            show_discover: false,
             query_error: None,
             db_sql_all_selected: false,
             resume_console_insert: false,
@@ -557,12 +560,10 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
         }
         if ctx.ui.mode == Mode::ConfirmDeleteSource {
             if ctx.ui.confirm_apply_pending {
-                palette::render_confirm_dialog(
+                palette::render_changes_preview(
                     frame,
                     size,
-                    " apply updates ",
                     &ctx.ui.confirm_delete_label,
-                    "apply",
                 );
             } else {
                 palette::render_confirm_delete(
@@ -710,12 +711,10 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
         }
         if ctx.ui.mode == Mode::ConfirmDeleteSource {
             if ctx.ui.confirm_apply_pending {
-                palette::render_confirm_dialog(
+                palette::render_changes_preview(
                     frame,
                     size,
-                    " apply updates ",
                     &ctx.ui.confirm_delete_label,
-                    "apply",
                 );
             } else {
                 palette::render_confirm_delete(
@@ -738,10 +737,17 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
         if ctx.ui.show_help {
             render_db_help_overlay(frame, size, ctx.ui.db_surface);
         }
+        if ctx.ui.show_discover {
+            render_discover_overlay(frame, size, ctx.ui);
+        }
         if ctx.ui.show_completions && !ctx.ui.completions.is_empty() {
-            // Anchor popup to the Console (right) pane of Studio.
-            let console = studio_console_area(size, ctx.ui);
-            render_completion_popup(frame, console, ctx.ui, ctx.buffers, ctx.db);
+            if ctx.ui.mode == Mode::EditTableFilter {
+                render_filter_column_popup(frame, size, ctx.ui);
+            } else {
+                // Anchor popup to the Console (right) pane of Studio.
+                let console = studio_console_area(size, ctx.ui);
+                render_completion_popup(frame, console, ctx.ui, ctx.buffers, ctx.db);
+            }
         }
         if let Some(err) = ctx.ui.query_error.as_deref() {
             palette::render_error_dialog(frame, size, " query error ", err);
@@ -907,12 +913,10 @@ pub fn render(frame: &mut Frame, ctx: RenderCtx<'_>) {
     }
     if ctx.ui.mode == Mode::ConfirmDeleteSource {
         if ctx.ui.confirm_apply_pending {
-            palette::render_confirm_dialog(
+            palette::render_changes_preview(
                 frame,
                 size,
-                " apply updates ",
                 &ctx.ui.confirm_delete_label,
-                "apply",
             );
         } else {
             palette::render_confirm_delete(
@@ -1065,33 +1069,48 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                     icons::node(&e.kind)
                 };
                 let selected = i == ws.selected;
-                let row_style = if selected {
-                    theme::style_selected()
+                let src = matches!(e.kind, DbNodeKind::Source)
+                    .then(|| ws.sources.iter().find(|s| s.id == e.source_id))
+                    .flatten();
+                let accent = src
+                    .map(|s| parse_accent_color(&s.accent))
+                    .unwrap_or(color);
+                let row_bg = if selected {
+                    theme::surface_3()
                 } else {
-                    Style::default()
+                    theme::bg()
                 };
                 let glyph_style = if selected {
-                    theme::style_selected()
+                    Style::default()
+                        .fg(accent)
+                        .bg(row_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else if matches!(e.kind, DbNodeKind::Source) {
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(color)
                 };
                 let label_style = if selected {
-                    theme::style_selected()
+                    Style::default()
+                        .fg(theme::text())
+                        .bg(row_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else if matches!(e.kind, DbNodeKind::Source) {
+                    Style::default().fg(theme::text()).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme::text())
                 };
                 let inner_w = area.width.saturating_sub(2) as usize;
-                let glyph_part = format!("{glyph} ");
-                let used = tree.chars().count() + glyph_part.chars().count();
-                let label_max = inner_w.saturating_sub(used).max(4);
-                let role = if matches!(e.kind, DbNodeKind::Source) {
-                    ws.sources
-                        .iter()
-                        .find(|s| s.id == e.source_id)
-                        .map(|s| s.role.label())
+                // Selection cue: accent bar ▎ (DataRig-like) instead of reverse-video wash.
+                let mark = if selected { "▎" } else { " " };
+                let glyph_part = if matches!(e.kind, DbNodeKind::Source) {
+                    format!("● {glyph} ")
                 } else {
-                    None
+                    format!("{glyph} ")
                 };
+                let used = 1 + tree.chars().count() + glyph_part.chars().count();
+                let label_max = inner_w.saturating_sub(used).max(4);
+                let role = src.map(|s| s.role.label());
                 // Drop whole tokens (driver, then role) before ellipsizing — never "[ad…]".
                 let mut label = if matches!(e.kind, DbNodeKind::Source) {
                     fit_explorer_source_label(&e.label, role, label_max)
@@ -1104,9 +1123,13 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
                 }
                 ListItem::new(Line::from(vec![
                     Span::styled(
+                        mark.to_string(),
+                        Style::default().fg(theme::accent()).bg(row_bg),
+                    ),
+                    Span::styled(
                         tree,
                         if selected {
-                            row_style
+                            Style::default().fg(theme::faint()).bg(row_bg)
                         } else {
                             theme::style_faint()
                         },
@@ -1151,7 +1174,8 @@ fn render_db_tree(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, focus
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(title, theme::style_title(focused)))
                 .border_style(Style::default().fg(border))
                 .style(Style::default().bg(theme::bg())),
         ),
@@ -1305,7 +1329,8 @@ fn render_db_structure(frame: &mut Frame, area: Rect, db: Option<&DbWorkspace>, 
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(title, theme::style_title(focused)))
                 .border_style(Style::default().fg(border))
                 .style(Style::default().bg(theme::bg())),
         ),
@@ -1327,7 +1352,8 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let title = if focused { " Console " } else { " console " };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(title, theme::style_title(focused)))
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(theme::bg()));
     let inner = block.inner(area);
@@ -1336,35 +1362,46 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let mut y = inner.y;
     let mut h = inner.height;
 
-    // SQL tabs (Query / table data tabs) — powerline-ish · Alt-1..9 / Ctrl-Tab
+    let conn_accent = ctx
+        .db
+        .and_then(|d| {
+            d.active_source
+                .as_ref()
+                .and_then(|id| d.sources.iter().find(|s| &s.id == id))
+        })
+        .map(|s| parse_accent_color(&s.accent))
+        .unwrap_or(theme::accent());
+
+    // Tab strip on surface — underline active (cleaner than powerline wedge).
     if let Some(db) = ctx.db {
         if !db.tabs.is_empty() && h >= 1 {
             let mut spans = Vec::new();
             for (i, tab) in db.tabs.iter().enumerate() {
                 let active = i == db.active_tab;
-                let style = if active {
-                    Style::default()
-                        .fg(theme::bg())
-                        .bg(theme::text())
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    theme::style_muted()
-                };
                 let title = tab.display_title();
                 let label = if i < 9 {
                     format!(" {}:{} ", i + 1, title)
                 } else {
-                    format!(" {} ", title)
+                    format!(" {title} ")
                 };
-                spans.push(Span::styled(label, style));
                 if active {
-                    spans.push(Span::styled("", Style::default().fg(theme::text()).bg(theme::bg())));
-                } else if i + 1 != db.tabs.len() {
-                    spans.push(Span::styled("│", theme::style_faint()));
+                    spans.push(Span::styled(
+                        label,
+                        Style::default()
+                            .fg(theme::text())
+                            .bg(theme::surface_2())
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        "▌",
+                        Style::default().fg(conn_accent).bg(theme::surface_2()),
+                    ));
+                } else {
+                    spans.push(Span::styled(label, theme::style_muted()));
                 }
             }
             frame.render_widget(
-                Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::surface())),
                 Rect {
                     x: inner.x,
                     y,
@@ -1377,8 +1414,27 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         }
     }
 
-    // Quiet toolbar — drop whole tokens when narrow (never mid-word like "publi").
-    if h >= 2 {
+    // Hairline under tabs
+    if h >= 1 && ctx.db.map(|d| !d.tabs.is_empty()).unwrap_or(false) {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(theme::border_idle()),
+            ))
+            .style(Style::default().bg(theme::bg())),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        y = y.saturating_add(1);
+        h = h.saturating_sub(1);
+    }
+
+    // Quiet chip toolbar on surface_2
+    if h >= 1 {
         let running = ctx.db.map(|d| d.query_running).unwrap_or(false)
             || ctx.ui.busy_label.as_deref() == Some("RUNNING…");
         let db_label = ctx
@@ -1390,12 +1446,12 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             .map(|d| d.console_schema_label())
             .unwrap_or_else(|| "schema".into());
         let lim = match ctx.db.map(|d| d.select_limit).unwrap_or(50) {
-            0 => "lim off".into(),
-            n => format!("lim {n}"),
+            0 => "off".into(),
+            n => n.to_string(),
         };
         let spans = console_toolbar_spans(running, &db_label, &schema_label, &lim, inner.width);
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::surface_2())),
             Rect {
                 x: inner.x,
                 y,
@@ -1422,9 +1478,10 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let lines: Vec<&str> = sql.lines().collect();
     let line_count = lines.len().max(1);
     let gutter = line_count.ilog10() as usize + 1;
-    let text_cols = width.saturating_sub(gutter + 2);
+    let text_cols = width.saturating_sub(gutter + 3);
     let start = ctx.ui.db_scroll_row;
     let end = (start + height).min(line_count);
+    let cursor_row = ctx.ui.db_cursor.row;
 
     let highlights = ctx
         .highlighter
@@ -1434,10 +1491,27 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     for row in start..end {
         let rel = row - start;
         let text = lines.get(row).copied().unwrap_or("");
-        let mut spans = vec![Span::styled(
-            format!("{:>width$} ", row + 1, width = gutter),
-            Style::default().fg(Color::DarkGray),
-        )];
+        let on_cursor = focused && row == cursor_row;
+        // DataRig-ish: accent bar ▎ + bold line number on cursor row.
+        let gutter_fg = if on_cursor {
+            theme::accent()
+        } else {
+            theme::faint()
+        };
+        let bar = if on_cursor { "▎" } else { " " };
+        let mut spans = vec![
+            Span::styled(bar.to_string(), Style::default().fg(theme::accent())),
+            Span::styled(
+                format!("{:>width$} ", row + 1, width = gutter),
+                Style::default()
+                    .fg(gutter_fg)
+                    .add_modifier(if on_cursor {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+        ];
         let hl = highlights.get(rel).cloned().unwrap_or_default();
         let chars: Vec<char> = text.chars().collect();
         let visible_end = chars.len().min(text_cols);
@@ -1462,27 +1536,32 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 });
             let slice: String = chars[col..run_end].iter().collect();
             let style = if ctx.ui.db_sql_all_selected {
-                Style::default()
-                    .fg(theme::bg())
-                    .bg(theme::accent())
+                theme::style_selected()
             } else {
-                style_for(kind)
+                let base = style_for(kind);
+                if on_cursor {
+                    base.bg(theme::surface_2())
+                } else {
+                    base
+                }
             };
             spans.push(Span::styled(slice, style));
             col = run_end;
         }
-        // Empty selected lines still need a visible bar.
         if ctx.ui.db_sql_all_selected && visible_end == 0 {
+            spans.push(Span::styled(" ", theme::style_selected()));
+        } else if on_cursor && visible_end == 0 {
             spans.push(Span::styled(
                 " ",
-                Style::default().fg(theme::bg()).bg(theme::accent()),
+                Style::default().bg(theme::surface_2()),
             ));
         }
         out_lines.push(Line::from(spans));
     }
-    // Idle plane stays empty — shortcuts live on the toolbar (and footer on focus).
-    // No faint duplicate strip at the bottom of Console.
-    frame.render_widget(Paragraph::new(out_lines), inner);
+    frame.render_widget(
+        Paragraph::new(out_lines).style(Style::default().bg(theme::bg())),
+        inner,
+    );
 
     if focused
         && !matches!(
@@ -1497,7 +1576,12 @@ fn render_sql_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 .get(ctx.ui.db_cursor.row)
                 .map(|l| l.chars().count())
                 .unwrap_or(0);
-            let x = inner.x + (gutter as u16) + 1 + ctx.ui.db_cursor.col.min(line_len).min(text_cols) as u16;
+            // gutter = accent bar (1) + line number + space
+            let x = inner.x
+                + 1
+                + (gutter as u16)
+                + 1
+                + ctx.ui.db_cursor.col.min(line_len).min(text_cols) as u16;
             let y = inner.y + row as u16;
             if x < inner.x + inner.width && y < inner.y + inner.height {
                 frame.set_cursor_position((x, y));
@@ -1609,65 +1693,100 @@ pub fn product_tab_at_col(_col: u16) -> Option<u8> {
 }
 
 fn render_git(frame: &mut Frame, area: Rect, git: Option<&GitState>, focused: bool) {
-    let border = if focused { Color::Cyan } else { Color::DarkGray };
+    let border = theme::border(focused);
     let (title, items) = match git {
         Some(g) => {
-            let checkout = g
-                .branches
-                .get(g.branch_selected)
-                .map(|b| b.as_str())
-                .unwrap_or("?");
-            let title = format!(" Git ({}) → {checkout} ", g.branch);
-            let mut items: Vec<ListItem> = g
-                .branches
-                .iter()
-                .enumerate()
-                .map(|(i, b)| {
-                    let mark = if i == g.branch_selected { "›" } else { " " };
-                    let style = if i == g.branch_selected {
-                        Style::default().fg(Color::Cyan)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    ListItem::new(Span::styled(format!(" {mark} {b}"), style))
-                })
-                .collect();
+            let host = if g.remote_kind.is_empty() {
+                "git".to_string()
+            } else {
+                g.remote_kind.clone()
+            };
+            let title = format!(" {host} · {} ", g.branch);
+            let mut items: Vec<ListItem> = Vec::new();
+            if !g.remote_url.is_empty() {
+                items.push(ListItem::new(Span::styled(
+                    format!(" {}", truncate_chars(&g.remote_url, 48)),
+                    theme::style_faint(),
+                )));
+            }
             items.push(ListItem::new(Span::styled(
-                " ── files ── ",
-                Style::default().fg(Color::DarkGray),
+                " branches ",
+                theme::style_faint(),
+            )));
+            for (i, b) in g.branches.iter().enumerate().take(12) {
+                let mark = if i == g.branch_selected { "›" } else { " " };
+                let style = if i == g.branch_selected {
+                    theme::style_selected()
+                } else {
+                    theme::style_muted()
+                };
+                items.push(ListItem::new(Span::styled(
+                    format!(" {mark} {b}"),
+                    style,
+                )));
+            }
+            items.push(ListItem::new(Span::styled(
+                " changes ",
+                theme::style_faint(),
             )));
             if g.files.is_empty() {
                 items.push(ListItem::new(Span::styled(
                     " clean working tree ",
-                    Style::default().fg(Color::DarkGray),
+                    theme::style_faint(),
                 )));
             } else {
                 items.extend(g.files.iter().enumerate().map(|(i, f)| {
-                    let mark = if f.staged { "S" } else { " " };
+                    let mark = if f.staged { "S" } else { "·" };
                     let style = if i == g.selected {
                         theme::style_selected()
                     } else {
-                        Style::default()
+                        theme::style_text()
+                    };
+                    let st = match f.status {
+                        ide_git::FileStatus::Modified => "M",
+                        ide_git::FileStatus::Added => "A",
+                        ide_git::FileStatus::Deleted => "D",
+                        ide_git::FileStatus::Renamed => "R",
+                        ide_git::FileStatus::Untracked => "?",
+                        ide_git::FileStatus::Conflict => "U",
+                        ide_git::FileStatus::Staged => "S",
                     };
                     ListItem::new(Span::styled(
-                        format!("[{mark}] {:?} {}", f.status, f.path.display()),
+                        format!(" {mark}{st}  {}", f.path.display()),
                         style,
                     ))
                 }));
             }
+            if !g.last_log.is_empty() {
+                items.push(ListItem::new(Span::styled(
+                    " recent ",
+                    theme::style_faint(),
+                )));
+                for line in g.last_log.lines().take(5) {
+                    items.push(ListItem::new(Span::styled(
+                        format!(" {}", truncate_chars(line, 52)),
+                        theme::style_faint(),
+                    )));
+                }
+            }
             (title, items)
         }
         None => (
-            " Git ".into(),
-            vec![ListItem::new(" not a git repo ".to_string())],
+            " git ".into(),
+            vec![ListItem::new(Span::styled(
+                " not a git repo · open a workspace with .git ",
+                theme::style_faint(),
+            ))],
         ),
     };
     frame.render_widget(
         List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title)
-                .border_style(Style::default().fg(border)),
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(title, theme::style_title(focused)))
+                .border_style(Style::default().fg(border))
+                .style(Style::default().bg(theme::bg())),
         ),
         area,
     );
@@ -2121,27 +2240,24 @@ fn render_editor(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, secondary: 
 }
 
 fn style_for(kind: HighlightKind) -> Style {
-    // Mono terminal: ACCENT≈TEXT, so contrast comes from dimming non-keywords.
     match kind {
         HighlightKind::Keyword => Style::default()
-            .fg(theme::text())
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            .fg(theme::syn_keyword())
+            .add_modifier(Modifier::BOLD),
         HighlightKind::Type | HighlightKind::Property => Style::default()
-            .fg(theme::text())
+            .fg(theme::syn_function())
             .add_modifier(Modifier::BOLD),
-        HighlightKind::Function => Style::default()
-            .fg(theme::text())
-            .add_modifier(Modifier::BOLD),
-        HighlightKind::String => Style::default().fg(theme::faint()),
+        HighlightKind::Function => Style::default().fg(theme::syn_function()),
+        HighlightKind::String => Style::default().fg(theme::syn_string()),
         HighlightKind::Comment => Style::default()
-            .fg(theme::faint())
+            .fg(theme::syn_comment())
             .add_modifier(Modifier::ITALIC),
-        HighlightKind::Number | HighlightKind::Constant => Style::default()
-            .fg(theme::text())
-            .add_modifier(Modifier::BOLD),
-        HighlightKind::Variable => Style::default().fg(theme::muted()),
+        HighlightKind::Number | HighlightKind::Constant => {
+            Style::default().fg(theme::syn_number())
+        }
+        HighlightKind::Variable => Style::default().fg(theme::syn_ident()),
         HighlightKind::Operator | HighlightKind::Punctuation => Style::default().fg(theme::faint()),
-        HighlightKind::Default => Style::default().fg(theme::muted()),
+        HighlightKind::Default => Style::default().fg(theme::syn_ident()),
     }
 }
 
@@ -2207,6 +2323,36 @@ fn render_bottom(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
 }
 
+fn filter_field_span(label: &str, value: &str, focused: bool, field_w: usize) -> Vec<Span<'static>> {
+    let label_w = label.chars().count() + 1;
+    let well_w = field_w.saturating_sub(label_w).max(4);
+    let empty = value.trim().is_empty() || value == "▌";
+    let shown = if empty && !focused {
+        truncate_chars("—", well_w)
+    } else if value.chars().count() > well_w {
+        truncate_chars(value, well_w)
+    } else {
+        format!("{value}{}", " ".repeat(well_w.saturating_sub(value.chars().count())))
+    };
+    let well = if focused {
+        Style::default()
+            .fg(theme::bg())
+            .bg(theme::text())
+            .add_modifier(Modifier::BOLD)
+    } else if empty {
+        Style::default().fg(theme::faint()).bg(theme::surface_2())
+    } else {
+        Style::default().fg(theme::text()).bg(theme::surface_2())
+    };
+    vec![
+        Span::styled(
+            format!("{label} "),
+            theme::style_faint(),
+        ),
+        Span::styled(shown, well),
+    ]
+}
+
 fn render_table_filter_bars(
     frame: &mut Frame,
     area: Rect,
@@ -2226,39 +2372,46 @@ fn render_table_filter_bars(
     };
     let where_focus = editing && ctx.ui.table_filter_field == TableFilterField::Where;
     let order_focus = editing && ctx.ui.table_filter_field == TableFilterField::OrderBy;
-    let where_style = if where_focus {
-        Style::default()
-            .fg(theme::bg())
-            .bg(theme::accent())
-            .add_modifier(Modifier::BOLD)
+
+    // Two quiet input wells with air above/below — not bare uppercase labels.
+    let width = area.width as usize;
+    let gap = 3usize; // " · "
+    let half = width.saturating_sub(gap + 2).max(10) / 2;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::raw(" "));
+    spans.extend(filter_field_span("where", &where_val, where_focus, half));
+    spans.push(Span::styled(" · ", theme::style_faint()));
+    spans.extend(filter_field_span("order", &order_val, order_focus, half));
+
+    let filter_line = Line::from(spans);
+    let empty = Line::from("");
+    let lines = if area.height >= 3 {
+        vec![empty.clone(), filter_line, empty]
+    } else if area.height >= 2 {
+        vec![empty, filter_line]
     } else {
-        theme::style_text()
+        vec![filter_line]
     };
-    let order_style = if order_focus {
-        Style::default()
-            .fg(theme::bg())
-            .bg(theme::accent())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        theme::style_text()
-    };
-    // One compact row: WHERE … │ ORDER BY …
-    let label_w = " WHERE ".chars().count() + " │ ORDER BY ".chars().count();
-    let budget = (area.width as usize).saturating_sub(label_w).max(4);
-    let where_budget = (budget * 3 / 5).max(2);
-    let order_budget = budget.saturating_sub(where_budget).max(2);
-    let where_shown = truncate_chars(&where_val, where_budget);
-    let order_shown = truncate_chars(&order_val, order_budget);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" WHERE ", theme::style_muted().add_modifier(Modifier::BOLD)),
-            Span::styled(where_shown, where_style),
-            Span::styled(" │ ORDER BY ", theme::style_muted().add_modifier(Modifier::BOLD)),
-            Span::styled(order_shown, order_style),
-        ]))
-        .style(Style::default().bg(theme::surface())),
+        Paragraph::new(lines).style(Style::default().bg(theme::bg())),
         area,
     );
+}
+
+/// Split off a WHERE/ORDER strip with vertical air when space allows.
+fn split_table_filter_area(inner: Rect) -> (Rect, Rect) {
+    let h = if inner.height >= 6 {
+        3u16
+    } else if inner.height >= 4 {
+        2
+    } else {
+        1
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(h), Constraint::Min(1)])
+        .split(inner);
+    (chunks[0], chunks[1])
 }
 
 fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
@@ -2269,7 +2422,11 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             Paragraph::new(Span::styled(" — ", theme::style_faint())).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(if focused { " Results " } else { " results " })
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(
+                        if focused { " Results " } else { " results " },
+                        theme::style_title(focused),
+                    ))
                     .border_style(Style::default().fg(border))
                     .style(Style::default().bg(theme::bg())),
             ),
@@ -2281,20 +2438,21 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let Some(result) = &db.last_result else {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(if focused { " Results " } else { " results " })
+            .border_type(BorderType::Rounded)
+            .title(Span::styled(
+                if focused { " Results " } else { " results " },
+                theme::style_title(focused),
+            ))
             .border_style(Style::default().fg(border))
             .style(Style::default().bg(theme::bg()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if table_tab && inner.height >= 2 {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(1)])
-                .split(inner);
-            render_table_filter_bars(frame, chunks[0], ctx, db);
+            let (filter_area, rest) = split_table_filter_area(inner);
+            render_table_filter_bars(frame, filter_area, ctx, db);
             frame.render_widget(
                 Paragraph::new(Span::styled("  F5 / Enter run ", theme::style_faint())),
-                chunks[1],
+                rest,
             );
         } else {
             frame.render_widget(
@@ -2324,67 +2482,64 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let nrows = result.rows.len();
     let ncols = result.columns.len();
     let compact = ctx.ui.results_compact;
-    let density_tag = if compact { "compact" } else { "comfort" };
-    // Border title: short label only. All metrics live on the meta line.
-    let title = if focused {
-        " Results ".to_string()
-    } else {
-        " results ".to_string()
-    };
-    let mut meta_bits: Vec<String> = vec![
-        format!("{nrows}×{ncols}"),
-        density_tag.to_string(),
-        format!("{} ms", result.elapsed_ms),
-    ];
+    // Quiet title: dims + optional table · dirty. Secondary meta is faint (no chip dump).
+    let mut title_core = format!("{nrows}×{ncols}");
     if !table_label.is_empty() {
-        meta_bits.push(table_label);
+        title_core = format!("{title_core} · {table_label}");
+    }
+    if dirty_n > 0 {
+        title_core = format!("{title_core} · *{dirty_n}");
+    }
+    let title = if focused {
+        format!(" Results · {title_core} ")
+    } else {
+        format!(" results · {title_core} ")
+    };
+    let mut secondary: Vec<String> = vec![format!("{} ms", result.elapsed_ms)];
+    if compact {
+        secondary.push("compact".into());
     }
     if !pk_label.trim().is_empty() {
-        meta_bits.push(pk_label.trim().to_string());
+        secondary.push(pk_label.trim().to_string());
     }
     if result.truncated {
-        meta_bits.push("truncated".into());
+        secondary.push("truncated".into());
     }
     if result.has_more {
-        meta_bits.push(format!("page {}+", result.page + 1));
+        secondary.push(format!("page {}+", result.page + 1));
     } else if result.page > 0 {
-        meta_bits.push(format!("page {}", result.page + 1));
+        secondary.push(format!("page {}", result.page + 1));
     }
     if db.select_limit > 0 {
-        meta_bits.push(format!("lim {}", db.select_limit));
-    }
-    if !dirty_label.trim().is_empty() {
-        meta_bits.push(dirty_label.trim().to_string());
+        secondary.push(format!("lim {}", db.select_limit));
     }
     if !db.results_filter.trim().is_empty() {
-        meta_bits.push(format!("/{}", db.results_filter.trim()));
+        secondary.push(format!("/{}", db.results_filter.trim()));
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            title,
+            theme::style_title(focused),
+        ))
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(theme::bg()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Meta chips under the border title.
-    let inner = if inner.height >= 3 {
+    // One faint meta line — typography only, no surface chips.
+    let inner = if inner.height >= 3 && !secondary.is_empty() {
         let parts = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(2)])
             .split(inner);
-        let mut chips: Vec<Span> = Vec::new();
-        for (i, bit) in meta_bits.iter().enumerate() {
-            if i > 0 {
-                chips.push(Span::raw(" "));
-            }
-            chips.push(Span::styled(
-                format!(" {bit} "),
-                Style::default().fg(theme::muted()).bg(theme::surface_2()),
-            ));
-        }
         frame.render_widget(
-            Paragraph::new(Line::from(chips)).style(Style::default().bg(theme::bg())),
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ", secondary.join("  ·  ")),
+                theme::style_faint(),
+            )))
+            .style(Style::default().bg(theme::bg())),
             parts[0],
         );
         parts[1]
@@ -2393,12 +2548,9 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     };
 
     let inner = if table_tab && inner.height >= 3 {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(2)])
-            .split(inner);
-        render_table_filter_bars(frame, chunks[0], ctx, db);
-        chunks[1]
+        let (filter_area, rest) = split_table_filter_area(inner);
+        render_table_filter_bars(frame, filter_area, ctx, db);
+        rest
     } else {
         inner
     };
@@ -2432,13 +2584,14 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     let col_indices: Vec<usize> = (0..pinned).chain(col_start..col_end).collect();
     let col_widths = results_col_widths(result, &col_indices, grid_w, compact);
 
+    // Soft columns: space gutters only — no │ pipe lattice.
     let mut header_spans = vec![Span::styled(
-        format!("{:>gutter_w$}│", ""),
+        format!("{:>gutter_w$}  ", ""),
         theme::style_faint(),
     )];
     for (pos, &ci) in col_indices.iter().enumerate() {
         if pos > 0 {
-            header_spans.push(Span::styled("│", theme::style_faint()));
+            header_spans.push(Span::raw("  "));
         }
         let w = col_widths[pos];
         let c = &result.columns[ci];
@@ -2450,19 +2603,13 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         let t = pad_display(&label, w);
         let style = if ci == result.cursor_col {
-            Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
-                .add_modifier(Modifier::BOLD)
+            theme::style_text().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            Style::default()
-                .fg(theme::muted())
-                .bg(theme::surface_2())
-                .add_modifier(Modifier::BOLD)
+            theme::style_muted().add_modifier(Modifier::BOLD)
         };
-        header_spans.push(Span::styled(format!(" {t} "), style));
+        header_spans.push(Span::styled(format!("{t}"), style));
     }
-    let header: Line = Line::from(header_spans);
+    let header: Line = Line::from(header_spans).style(Style::default().bg(theme::surface()));
 
     let filter = db.results_filter.clone();
     let filtered_idx: Vec<usize> = result
@@ -2485,7 +2632,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         let row = &result.rows[ri];
         let row_dirty = dirty.contains(&ri);
         let mut spans = vec![Span::styled(
-            format!("{:>gutter_w$}│", ri + 1),
+            format!("{:>gutter_w$}  ", ri + 1),
             if ri == result.cursor_row {
                 theme::style_text().add_modifier(Modifier::BOLD)
             } else {
@@ -2497,7 +2644,7 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
                 continue;
             };
             if pos > 0 {
-                spans.push(Span::styled("│", theme::style_faint()));
+                spans.push(Span::raw("  "));
             }
             let w = col_widths[pos];
             let is_cursor = ri == result.cursor_row && ci == result.cursor_col;
@@ -2538,62 +2685,39 @@ fn render_results_grid(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
             } else if is_null {
                 theme::style_faint().add_modifier(Modifier::ITALIC)
             } else if is_statusish && !is_null && display_width(t.trim()) <= 12 {
-                Style::default()
-                    .fg(theme::text())
-                    .bg(theme::surface_3())
-                    .add_modifier(Modifier::BOLD)
+                // Quiet status emphasis — no cell box, just weight.
+                theme::style_text().add_modifier(Modifier::BOLD)
             } else {
                 theme::style_text()
             };
-            spans.push(Span::styled(format!(" {t} "), style));
+            spans.push(Span::styled(t, style));
         }
         let line = if ri == result.cursor_row {
             Line::from(spans).style(Style::default().bg(theme::surface_3()))
         } else if ri % 2 == 1 {
-            Line::from(spans).style(Style::default().bg(theme::surface_2()))
+            Line::from(spans).style(Style::default().bg(theme::surface()))
         } else {
             Line::from(spans)
         };
         rows.push(line);
-        // Comfort: hairline grid. Compact: zebra only (density).
+        // Comfort: blank breathing row (no ┼─ lattice). Compact: zebra only.
         if !compact {
-            let mut hair = vec![Span::styled(
-                format!("{:>gutter_w$}┼", ""),
-                theme::style_faint(),
-            )];
-            for (pos, _) in col_indices.iter().enumerate() {
-                if pos > 0 {
-                    hair.push(Span::styled("┼", theme::style_faint()));
-                }
-                hair.push(Span::styled(
-                    "─".repeat(col_widths[pos] + 2),
-                    theme::style_faint(),
-                ));
-            }
-            rows.push(Line::from(hair));
+            rows.push(Line::from(Span::raw("")));
         }
     }
     let h_hint = if ncols > col_indices.len() || h_scrolled {
-        let left = if col_start > pinned { "◀ " } else { "  " };
+        let left = if col_start > pinned { "◀ " } else { "" };
         let right = if col_end < ncols { " ▶" } else { "" };
-        format!("{left}cols {}–{} / {ncols}{right}", col_start + 1, col_end.max(1))
+        format!("  {left}{}–{}/{ncols}{right}", col_start + 1, col_end.max(1))
     } else {
         String::new()
     };
-    // Rule under header: gutter + ┼ + repeating ─│ per column window.
-    let mut rule_spans = vec![Span::styled(
-        format!("{:>gutter_w$}┼", ""),
-        theme::style_faint(),
-    )];
-    for (pos, _) in col_indices.iter().enumerate() {
-        if pos > 0 {
-            rule_spans.push(Span::styled("┼", theme::style_faint()));
-        }
-        rule_spans.push(Span::styled(
-            "─".repeat(col_widths[pos] + 2),
-            theme::style_faint(),
-        ));
-    }
+    // One quiet rule under the header — continuous, no ┼ junctions.
+    let rule_w = (grid_area.width as usize).saturating_sub(gutter_w + 2);
+    let mut rule_spans = vec![
+        Span::styled(format!("{:>gutter_w$}  ", ""), theme::style_faint()),
+        Span::styled("─".repeat(rule_w.min(120).max(8)), theme::style_faint()),
+    ];
     if !h_hint.is_empty() {
         rule_spans.push(Span::styled(h_hint, theme::style_faint()));
     }
@@ -2812,6 +2936,73 @@ fn render_status(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
+        area,
+    );
+}
+
+/// Column suggestions while editing WHERE / ORDER BY (anchored in Results).
+fn render_filter_column_popup(frame: &mut Frame, screen: Rect, ui: &UiState) {
+    if ui.completions.is_empty() {
+        return;
+    }
+    let height = (ui.completions.len().min(10) as u16)
+        .saturating_add(2)
+        .min(screen.height.saturating_sub(4))
+        .max(3);
+    let width = 40u16.min(screen.width.saturating_sub(4)).max(22);
+    // Sit in the upper Results region (below meta / filter strip).
+    let y = screen
+        .y
+        .saturating_add(screen.height.saturating_mul(45) / 100)
+        .min(screen.y.saturating_add(screen.height.saturating_sub(height).saturating_sub(2)));
+    let x = screen.x.saturating_add(4);
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let items: Vec<ListItem> = ui
+        .completions
+        .iter()
+        .enumerate()
+        .take(10)
+        .map(|(i, c)| {
+            let detail = c.detail.as_deref().unwrap_or("column");
+            let selected = i == ui.completion_idx;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", c.label),
+                    if selected {
+                        theme::style_selected()
+                    } else {
+                        theme::style_text()
+                    },
+                ),
+                Span::styled(
+                    format!("{detail} "),
+                    if selected {
+                        theme::style_selected()
+                    } else {
+                        theme::style_faint()
+                    },
+                ),
+            ]))
+        })
+        .collect();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::border_idle()))
+                .style(Style::default().bg(theme::surface()))
+                .title(Span::styled(
+                    " columns ",
+                    theme::style_muted().add_modifier(Modifier::BOLD),
+                )),
+        ),
         area,
     );
 }
@@ -3085,15 +3276,12 @@ fn hover_wrap_lines(s: &str, width: usize) -> Vec<String> {
 }
 
 fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_active: bool) {
+    // Quiet brand — no inverted pill, no redundant "studio" chip.
     let brand = Span::styled(
-        " DB Studio ",
-        Style::default()
-            .fg(theme::bg())
-            .bg(theme::text())
-            .add_modifier(Modifier::BOLD),
+        " DB Studio",
+        theme::style_text().add_modifier(Modifier::BOLD),
     );
 
-    // Home: brand only — actions live in the body (A / W).
     if ctx.ui.db_surface == DbSurface::Home {
         frame.render_widget(
             Paragraph::new(Line::from(vec![brand])).style(Style::default().bg(theme::bg())),
@@ -3102,44 +3290,210 @@ fn render_host_header(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>, _code_
         return;
     }
 
-    let active_id = ctx.db.and_then(|d| d.active_source.as_deref());
-    let conn = ctx
-        .db
-        .and_then(|d| {
-            active_id
-                .and_then(|id| d.sources.iter().find(|s| s.id == id))
-                .map(|s| s.name.as_str())
-        })
-        .unwrap_or("—");
-    let busy = ctx
-        .ui
-        .busy_label
-        .as_deref()
-        .or_else(|| {
-            if ctx.db.map(|d| d.query_running).unwrap_or(false) {
-                Some("RUNNING…")
-            } else {
-                None
-            }
-        });
-    // Quiet chrome like Home — no health "ok" badge in the header.
-    let mut spans = vec![
-        brand,
-        Span::styled("  studio  ", theme::style_muted()),
-        Span::styled("·  ", theme::style_faint()),
-        Span::styled(conn.to_string(), theme::style_faint()),
-    ];
+    let src = ctx.db.and_then(|d| {
+        d.active_source
+            .as_ref()
+            .and_then(|id| d.sources.iter().find(|s| &s.id == id))
+    });
+    let conn = src.map(|s| s.name.as_str()).unwrap_or("—");
+    let accent = src
+        .map(|s| parse_accent_color(&s.accent))
+        .unwrap_or(theme::accent());
+    let ro = src
+        .map(|s| s.read_only || matches!(s.role, ide_db::SourceRole::Viewer))
+        .unwrap_or(false);
+    let role = src.map(|s| s.role.label()).unwrap_or("");
+    let env_mark = src.and_then(|s| env_mark_from_name(&s.name));
+    let busy = ctx.ui.busy_label.as_deref().or_else(|| {
+        if ctx.db.map(|d| d.query_running).unwrap_or(false) {
+            Some("running…")
+        } else {
+            None
+        }
+    });
+
+    let mut right_spans: Vec<Span> = Vec::new();
+    if let Some(env) = env_mark {
+        let env_bg = match env {
+            "PROD" => theme::danger(),
+            "STG" => theme::warn(),
+            _ => accent,
+        };
+        right_spans.push(Span::styled(
+            format!(" {env} "),
+            Style::default()
+                .fg(theme::bg())
+                .bg(env_bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+        right_spans.push(Span::raw(" "));
+    }
+    if ro {
+        right_spans.push(Span::styled(
+            " RO ",
+            Style::default()
+                .fg(theme::bg())
+                .bg(theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ));
+        right_spans.push(Span::raw(" "));
+    } else if !role.is_empty() && role != "admin" {
+        // Quiet role mark (viewer/editor) — admin stays silent unless env mark above.
+        right_spans.push(Span::styled(
+            format!(" {role} "),
+            Style::default().fg(theme::bg()).bg(accent),
+        ));
+        right_spans.push(Span::raw(" "));
+    }
+    right_spans.push(Span::styled(
+        conn.to_string(),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    ));
     if let Some(b) = busy {
-        spans.push(Span::styled("  ·  ", theme::style_faint()));
-        spans.push(Span::styled(
+        right_spans.push(Span::styled("  ·  ", theme::style_faint()));
+        right_spans.push(Span::styled(
             b.to_string(),
             theme::style_accent().add_modifier(Modifier::BOLD),
         ));
     }
+    right_spans.push(Span::raw(" "));
+
+    let width = area.width as usize;
+    let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+    let left_w = " DB Studio".chars().count();
+    let gap = width.saturating_sub(left_w + right_w).max(2);
+    let mut spans = vec![brand, Span::raw(" ".repeat(gap))];
+    spans.extend(right_spans);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
         area,
     );
+}
+
+fn render_discover_overlay(frame: &mut Frame, screen: Rect, ui: &UiState) {
+    // Soft dim of studio chrome — modal plate floats above.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::scrim()).add_modifier(Modifier::DIM)),
+        screen,
+    );
+
+    let entries: &[(&str, &str)] = match ui.focus {
+        Focus::Results => &[
+            ("Ctrl-P", "command palette"),
+            ("Ctrl-W", "close SQL tab"),
+            ("m", "actions · export · copy · page"),
+            ("Enter", "inspect · Plan · Chart"),
+            ("w  o", "WHERE · ORDER BY"),
+            ("y  Y", "yank cell · row"),
+            ("a", "apply Changes"),
+            ("Shift-T", "cycle theme"),
+        ],
+        Focus::Editor => &[
+            ("Ctrl-P", "command palette"),
+            ("Ctrl-W", "close SQL tab"),
+            ("i", "insert"),
+            ("F5", "run"),
+            ("Ctrl-E", "EXPLAIN"),
+            ("b  s", "database · schema"),
+            ("Shift-T", "cycle theme"),
+        ],
+        Focus::Database | Focus::Structure => &[
+            ("Ctrl-P", "command palette"),
+            ("Ctrl-W", "close SQL tab"),
+            ("Enter", "open / expand"),
+            ("d", "Go to DDL"),
+            ("n", "Create…"),
+            ("e", "edit connection"),
+            ("Shift-T", "cycle theme"),
+        ],
+        _ => &[
+            ("Ctrl-P", "command palette"),
+            ("Ctrl-W", "close SQL tab"),
+            ("1–4", "panes"),
+            ("Tab", "cycle focus"),
+            ("Shift-T", "cycle theme"),
+        ],
+    };
+    let scope = match ui.focus {
+        Focus::Results => "Results",
+        Focus::Editor => "Console",
+        Focus::Database | Focus::Structure => "Explorer",
+        _ => "Studio",
+    };
+
+    let width = screen.width.min(44).max(34);
+    let height = (entries.len() as u16)
+        .saturating_add(5)
+        .min(screen.height.saturating_sub(4))
+        .max(8);
+    let area = Rect {
+        x: screen.x + (screen.width.saturating_sub(width)) / 2,
+        y: screen.y + (screen.height.saturating_sub(height)) / 3,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::accent()))
+        .style(Style::default().bg(theme::modal()))
+        .title(Span::styled(
+            format!(" discover · {scope} "),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(
+            " space / esc ",
+            theme::style_faint(),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Subtle header rule
+    if inner.height >= 2 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(theme::border_idle()),
+            )),
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
+    let body = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(1),
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+    let lines: Vec<Line> = entries
+        .iter()
+        .map(|(k, d)| discover_line(k, d))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
+fn discover_line(key: &str, desc: &str) -> Line<'static> {
+    // Quiet DataRig-ish chord row: accent key, muted action — no reverse-video dump.
+    Line::from(vec![
+        Span::styled("  ", theme::style_faint()),
+        Span::styled(
+            format!("{key:<9}"),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", theme::style_faint()),
+        Span::styled(desc.to_string(), theme::style_muted()),
+    ])
 }
 
 fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
@@ -3188,7 +3542,7 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
-                "Super-⇧A Search Everywhere · Super-⇧G Git · Super-` Terminal",
+                "Super-⇧A Search Everywhere · Super-` Terminal",
                 theme::style_muted(),
             )),
             Line::from(Span::styled(
@@ -3215,7 +3569,8 @@ fn render_db_help_overlay(frame: &mut Frame, screen: Rect, surface: DbSurface) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(title)
+                    .border_type(BorderType::Rounded)
+                    .title(Span::styled(title, theme::style_title(true)))
                     .border_style(Style::default().fg(theme::border_idle()))
                     .style(Style::default().bg(theme::surface())),
             )
@@ -3506,10 +3861,10 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
 
     render_host_header(frame, root[0], ctx, false);
 
-    // DataGrip-like tool windows: Git / Search / Hierarchy / Debug overlay Studio.
+    // DataGrip-like tool windows: Search / Hierarchy / Debug overlay Studio.
     let tool_focus = matches!(
         ctx.ui.focus,
-        Focus::Git | Focus::Search | Focus::Outline | Focus::Debug
+        Focus::Search | Focus::Outline | Focus::Debug
     );
     if tool_focus {
         let body = Layout::default()
@@ -3517,13 +3872,20 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
             .constraints([Constraint::Percentage(42), Constraint::Min(20)])
             .split(root[1]);
         match ctx.ui.focus {
-            Focus::Git => render_git(frame, body[0], ctx.git, true),
-            Focus::Search => render_search(frame, body[0], ctx.search, true),
-            Focus::Outline => render_outline(frame, body[0], ctx.ui),
-            Focus::Debug => render_debug_side(frame, body[0], ctx),
+            Focus::Search => {
+                render_search(frame, body[0], ctx.search, true);
+                render_results_grid(frame, body[1], ctx);
+            }
+            Focus::Outline => {
+                render_outline(frame, body[0], ctx.ui);
+                render_results_grid(frame, body[1], ctx);
+            }
+            Focus::Debug => {
+                render_debug_side(frame, body[0], ctx);
+                render_results_grid(frame, body[1], ctx);
+            }
             _ => {}
         }
-        render_results_grid(frame, body[1], ctx);
         render_studio_footer(frame, root[2], ctx);
         return;
     }
@@ -3604,8 +3966,56 @@ fn render_database_studio(frame: &mut Frame, size: Rect, ctx: &RenderCtx<'_>) {
     render_studio_footer(frame, root[2], ctx);
 }
 
+/// Contextual keybindings for the focused Studio pane (footer-only chrome).
+fn studio_context_bindings(ui: &UiState) -> &'static str {
+    if ui.admin_modal {
+        return "Esc close  ·  r refresh";
+    }
+    if ui.cell_modal {
+        return "Tab Row/Plan/Chart/JSON  ·  Enter drill  ·  Esc close";
+    }
+    if ui.show_discover {
+        return "Space discover  ·  Esc close";
+    }
+    match ui.mode {
+        Mode::Insert if ui.focus == Focus::Editor => {
+            return "Esc normal  ·  F5 run  ·  Ctrl-Space complete";
+        }
+        Mode::EditCell => return "Enter apply  ·  Esc cancel",
+        Mode::EditTableFilter => {
+            return "Tab accept col  ·  ↑↓  ·  Enter apply  ·  Esc";
+        }
+        _ => {}
+    }
+    let mut base = match ui.focus {
+        Focus::Database => "Enter open  ·  Ctrl-P palette  ·  Ctrl-W close tab  ·  Tab",
+        Focus::Structure => "↑↓  ·  Ctrl-P palette  ·  Tab  ·  Esc home",
+        Focus::Editor => "i insert  ·  F5  ·  Ctrl-P palette  ·  Ctrl-W close tab",
+        Focus::Results => {
+            "Space discover  ·  Ctrl-P palette  ·  Ctrl-W close  ·  m actions"
+        }
+        Focus::Search => "↑↓  ·  Enter open  ·  Esc",
+        Focus::Outline => "↑↓  ·  Enter  ·  Esc",
+        Focus::Debug => "F5 continue  ·  F10 step  ·  Esc",
+        Focus::Terminal => "Ctrl-` close  ·  Esc editor",
+        _ => "1–4 panes  ·  Tab  ·  ? help",
+    };
+    if ui.db_fullscreen.is_some() {
+        base = match ui.focus {
+            Focus::Database => "f exit full  ·  Enter open  ·  d DDL",
+            Focus::Structure => "f exit full  ·  ↑↓",
+            Focus::Editor => "f exit full  ·  i insert  ·  F5",
+            Focus::Results => {
+                "f exit full  ·  Space discover  ·  Enter inspect  ·  m actions"
+            }
+            _ => "f exit full  ·  Esc",
+        };
+    }
+    base
+}
+
 fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
-    // Toast status wins briefly; otherwise DataRig segmented status.
+    // Toast briefly; otherwise only contextual bindings for the current focus.
     if let Some(msg) = &ctx.ui.status {
         let text = if msg.text.chars().count() > 90 {
             format!("{}…", msg.text.chars().take(89).collect::<String>())
@@ -3614,161 +4024,31 @@ fn render_studio_footer(frame: &mut Frame, area: Rect, ctx: &RenderCtx<'_>) {
         };
         let mut spans = Vec::new();
         match msg.tone {
-            StatusTone::Success => {
-                spans.push(Span::styled(" OK ", theme::style_ok_badge()));
-            }
-            StatusTone::Error => {
-                spans.push(Span::styled(" ERR ", theme::style_err_badge()));
-            }
-            StatusTone::Info => {
-                spans.push(Span::styled(" · ", theme::style_faint()));
-            }
+            StatusTone::Success => spans.push(Span::styled("ok", theme::style_ok())),
+            StatusTone::Error => spans.push(Span::styled("err", theme::style_err())),
+            StatusTone::Info => spans.push(Span::styled("·", theme::style_faint())),
         }
-        spans.push(Span::styled(format!(" {text} "), theme::style_text()));
+        spans.push(Span::styled(format!("  {text}"), theme::style_muted()));
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::surface())),
             area,
         );
         return;
     }
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mode_label = match ctx.ui.mode {
-        Mode::Insert => "INSERT",
-        Mode::EditCell => "EDIT",
-        Mode::Command | Mode::Palette | Mode::Search | Mode::Find | Mode::Replace | Mode::Rename => {
-            "COMMAND"
-        }
-        _ => "NORMAL",
-    };
-    spans.push(Span::styled(
-        format!(" {mode_label} "),
-        Style::default()
-            .fg(theme::bg())
-            .bg(theme::accent())
-            .add_modifier(Modifier::BOLD),
-    ));
-    let pane = match ctx.ui.focus {
-        Focus::Database => "explorer",
-        Focus::Structure => "structure",
-        Focus::Editor => "console",
-        Focus::Results => "results",
-        _ => "studio",
-    };
-    spans.push(Span::styled(
-        format!(" {pane} "),
-        Style::default()
-            .fg(theme::text())
-            .bg(theme::surface_2())
-            .add_modifier(Modifier::BOLD),
-    ));
-    if ctx.ui.db_fullscreen.is_some() {
-        spans.push(Span::styled(
-            " FULL ",
-            Style::default()
-                .fg(theme::bg())
-                .bg(theme::text())
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    let (conn_name, conn_color, ro_badge, role_badge, txn_badge) = if let Some(db) = ctx.db {
-        let src = db
-            .active_source
-            .as_ref()
-            .and_then(|id| db.sources.iter().find(|s| &s.id == id));
-        let name = src.map(|s| s.name.clone()).unwrap_or_else(|| "—".into());
-        let color = src
-            .map(|s| parse_accent_color(&s.accent))
-            .unwrap_or(theme::accent());
-        let ro = src
-            .map(|s| s.read_only || matches!(s.role, ide_db::SourceRole::Viewer))
-            .unwrap_or(false);
-        let role = src.map(|s| s.role.label()).unwrap_or("—");
-        let txn = if db.in_txn { "TXN" } else { "AUTO" };
-        (name, color, ro, role.to_string(), txn.to_string())
-    } else {
-        ("—".into(), theme::muted(), false, "—".into(), "AUTO".into())
-    };
-
-    spans.push(Span::styled(
-        format!(" {role_badge} "),
-        Style::default().fg(theme::bg()).bg(conn_color),
-    ));
-    if ro_badge {
-        spans.push(Span::styled(
-            " RO ",
-            Style::default()
-                .fg(theme::bg())
-                .bg(theme::warn())
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    spans.push(Span::styled(
-        format!(" {txn_badge} "),
-        if txn_badge == "TXN" {
-            Style::default()
-                .fg(theme::bg())
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            theme::style_faint()
-        },
-    ));
-
-    if let Some(db) = ctx.db {
-        let spark = ide_db::latency_sparkline(&db.latency_history, 16);
-        spans.push(Span::styled(format!(" {spark} "), theme::style_accent()));
-        if db.query_running {
-            spans.push(Span::styled(" RUN… ", theme::style_warn()));
-        } else if let Some(r) = &db.last_result {
-            spans.push(Span::styled(
-                format!(" {}×{} {}ms ", r.rows.len(), r.columns.len(), r.elapsed_ms),
-                theme::style_faint(),
-            ));
-            let stats = ide_db::selection_stats(r, Some(r.cursor_col));
-            spans.push(Span::styled(format!(" {stats} "), theme::style_muted()));
-            if let Some(cell) = r
-                .rows
-                .get(r.cursor_row)
-                .and_then(|row| row.get(r.cursor_col))
-            {
-                let preview = truncate_chars(cell, 18);
-                spans.push(Span::styled(
-                    format!(" ▏{preview} "),
-                    theme::style_text(),
-                ));
-            }
-        }
-    }
-
-    spans.push(Span::styled(" │ ", theme::style_faint()));
-    spans.push(Span::styled(
-        format!(" {conn_name} "),
-        Style::default().fg(conn_color).add_modifier(Modifier::BOLD),
-    ));
-    if ctx.ui.admin_modal {
-        spans.push(Span::styled(" admin ", theme::style_accent()));
-    } else if ctx.ui.cell_modal {
-        spans.push(Span::styled(" modal ", theme::style_accent()));
-    }
-    if ctx.ui.db_monitor {
-        spans.push(Span::styled(" mon ", theme::style_accent()));
-    }
-
+    let bindings = studio_context_bindings(ctx.ui);
     let width = area.width as usize;
-    let mut used = 0usize;
-    let mut out: Vec<Span<'static>> = Vec::new();
-    for sp in spans {
-        let w = sp.content.chars().count();
-        if used + w > width {
-            break;
-        }
-        used += w;
-        out.push(sp);
-    }
+    let shown = if bindings.chars().count() + 2 > width {
+        truncate_chars(bindings, width.saturating_sub(2))
+    } else {
+        bindings.to_string()
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(out)).style(Style::default().bg(theme::bg())),
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(shown, theme::style_faint()),
+        ]))
+        .style(Style::default().bg(theme::surface())),
         area,
     );
 }
@@ -3931,6 +4211,20 @@ fn studio_explorer_width(left_w: u16, configured: u16) -> u16 {
     configured.clamp(14, max_explor)
 }
 
+/// Infer a quiet env badge from connection name (prod/stg/dev).
+fn env_mark_from_name(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if n.contains("prod") || n.contains("production") || n.contains("live") {
+        Some("PROD")
+    } else if n.contains("stg") || n.contains("staging") || n.contains("stage") {
+        Some("STG")
+    } else if n.contains("dev") || n.contains("local") || n.contains("sandbox") {
+        Some("DEV")
+    } else {
+        None
+    }
+}
+
 fn parse_accent_color(raw: &str) -> Color {
     let s = raw.trim();
     if s.is_empty() {
@@ -3960,7 +4254,7 @@ fn parse_accent_color(raw: &str) -> Color {
 }
 
 /// Readable row inspector opened with Enter on a Results cell.
-/// Tabs: 0 Row · 1 JSON · 2 Meta. Cell is Enter drill-in (`cell_modal_drill`).
+/// Tabs: 0 Row · 1 Plan · 2 Chart · 3 JSON. Cell is Enter drill-in (`cell_modal_drill`).
 fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     let Some(db) = ctx.db else {
         return;
@@ -3975,7 +4269,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     };
     let editing = ctx.ui.mode == Mode::EditCell;
     let drill = ctx.ui.cell_modal_drill || editing;
-    let tab = ctx.ui.cell_modal_tab.min(2);
+    let tab = ctx.ui.cell_modal_tab.min(3);
 
     // Soft backdrop — clears the stage so the plate reads as a focused object.
     frame.render_widget(
@@ -4058,7 +4352,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         },
     );
 
-    // Tab pills — Row | JSON | Meta (Cell is drill-in only).
+    // Tab pills — Row | Plan | Chart | JSON (Cell is drill-in only).
     let mut tab_spans: Vec<Span> = Vec::new();
     if drill {
         tab_spans.push(Span::styled(
@@ -4070,7 +4364,7 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         ));
         tab_spans.push(Span::styled("  Esc → Row ", theme::style_faint()));
     } else {
-        let tabs = ["Row", "JSON", "Meta"];
+        let tabs = ["Row", "Plan", "Chart", "JSON"];
         for (i, name) in tabs.iter().enumerate() {
             if i > 0 {
                 tab_spans.push(Span::styled(" ", theme::style_faint()));
@@ -4139,8 +4433,9 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         )
     } else {
         match tab {
-            1 => modal_json_lines(result, cells, body.width as usize),
-            2 => modal_meta_lines(result, cells, col_i, body.width as usize),
+            1 => modal_plan_lines(db, body.width as usize),
+            2 => modal_chart_lines(result, col_i, row_i, body.width as usize),
+            3 => modal_json_lines(result, cells, body.width as usize),
             _ => modal_row_lines(
                 result,
                 cells,
@@ -4152,9 +4447,14 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
         }
     };
 
-    // Row / Meta: one line per column — scroll to keep selection visible.
-    let scroll = if !drill && (tab == 0 || tab == 2) {
+    // Row: one line per column — scroll to keep selection visible.
+    let scroll = if !drill && tab == 0 {
         col_i
+            .saturating_sub(body_h.saturating_sub(1) / 2)
+            .min(lines.len().saturating_sub(body_h))
+    } else if !drill && (tab == 1 || tab == 2) {
+        // Plan/Chart: keep cursor row near mid when long.
+        row_i
             .saturating_sub(body_h.saturating_sub(1) / 2)
             .min(lines.len().saturating_sub(body_h))
     } else {
@@ -4180,11 +4480,13 @@ fn render_cell_modal(frame: &mut Frame, screen: Rect, ctx: &RenderCtx<'_>) {
     } else if drill {
         " Enter/i edit   ←→ col   Esc back to Row ".into()
     } else if tab == 0 {
-        " ↑↓ field   Enter full cell   i edit   Tab JSON|Meta   Esc ".into()
+        " ↑↓ field   Enter cell   Tab Plan|Chart|JSON   Esc ".into()
     } else if tab == 1 {
-        " Tab Meta|Row   y yank JSON   Esc ".into()
+        " Tab Chart|JSON|Row   Ctrl-E for EXPLAIN   Esc ".into()
+    } else if tab == 2 {
+        " ←→ numeric col   cursor row highlighted   Tab JSON   Esc ".into()
     } else {
-        " ↑↓ field   Enter cell   Tab Row   Esc ".into()
+        " Tab Row   y yank JSON   Esc ".into()
     };
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -4380,7 +4682,7 @@ fn results_col_widths(
     compact: bool,
 ) -> Vec<usize> {
     let n = col_indices.len().max(1);
-    let sep = n.saturating_sub(1); // │ between cols
+    let sep = n.saturating_sub(1) * 2; // soft "  " gutters between cols
     let avail = budget.saturating_sub(sep).max(n * 4);
     let mut preferred: Vec<usize> = col_indices
         .iter()
@@ -4525,6 +4827,7 @@ fn modal_json_lines(
         .collect()
 }
 
+#[allow(dead_code)]
 fn modal_meta_lines(
     result: &ide_db::QueryResult,
     cells: &[String],
@@ -4699,7 +5002,6 @@ fn modal_row_lines(
     lines
 }
 
-#[allow(dead_code)]
 fn modal_plan_lines(db: &DbWorkspace, width: usize) -> Vec<Line<'static>> {
     let text = db
         .last_explain
@@ -4707,42 +5009,89 @@ fn modal_plan_lines(db: &DbWorkspace, width: usize) -> Vec<Line<'static>> {
         .or_else(|| db.last_result.as_ref().and_then(|r| r.explain.as_deref()))
         .unwrap_or("(no EXPLAIN yet — Ctrl-E from Console)");
     let visual = ide_db::explain_visual_ascii(text);
-    visual
-        .lines()
-        .map(|l| {
-            Line::from(Span::styled(
-                format!(" {}", truncate_chars(l, width.saturating_sub(2))),
-                theme::style_text(),
-            ))
-        })
-        .collect()
+    let mut lines: Vec<Line> = Vec::new();
+    for l in visual.lines() {
+        let shown = truncate_chars(l, width.saturating_sub(2));
+        let style = if l.contains('█') || l.contains('▓') {
+            theme::style_accent()
+        } else if l.starts_with('═') || l.contains("Timeline") || l.contains("Icicle") || l.contains("Funnel") {
+            theme::style_text().add_modifier(Modifier::BOLD)
+        } else if l.contains('┌') || l.contains('└') || l.contains('│') {
+            theme::style_muted()
+        } else {
+            theme::style_text()
+        };
+        lines.push(Line::from(Span::styled(format!(" {shown}"), style)));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (empty plan)",
+            theme::style_faint(),
+        )));
+    }
+    lines
 }
 
-#[allow(dead_code)]
 fn modal_chart_lines(
     result: &ide_db::QueryResult,
     col_i: usize,
+    cursor_row: usize,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let text = ide_db::chart_kind(result, "bar", Some(col_i))
-        .or_else(|| ide_db::chart_kind(result, "line", None))
-        .unwrap_or_else(|| "No numeric column to chart".into());
-    let mut lines: Vec<Line> = text
-        .lines()
-        .map(|l| {
-            Line::from(Span::styled(
-                format!(" {}", truncate_chars(l, width.saturating_sub(2))),
-                theme::style_text(),
-            ))
-        })
-        .collect();
-    if let Some(pie) = ide_db::chart_kind(result, "pie", Some(col_i)) {
+    let col_name = result
+        .columns
+        .get(col_i)
+        .map(|s| s.as_str())
+        .unwrap_or("?");
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!(" Chart · {col_name} · cursor row {}", cursor_row + 1),
+            theme::style_text().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    // Prefer bar chart with cursor highlight on the focused row index.
+    if let Some(text) = ide_db::chart_kind(result, "bar", Some(col_i)) {
+        let cursor_tag = format!("{:>2} │", cursor_row + 1);
+        for l in text.lines() {
+            let shown = truncate_chars(l, width.saturating_sub(2));
+            let is_cursor = l.contains(&cursor_tag);
+            let style = if is_cursor {
+                theme::style_selected()
+            } else if l.contains('█') || l.contains('▁') || l.contains("Spark") {
+                theme::style_accent()
+            } else {
+                theme::style_text()
+            };
+            lines.push(Line::from(Span::styled(format!(" {shown}"), style)));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            " No numeric column to chart — ←→ pick a number col",
+            theme::style_faint(),
+        )));
+    }
+
+    if let Some(line) = ide_db::chart_kind(result, "line", Some(col_i)) {
         lines.push(Line::from(""));
-        for l in pie.lines() {
+        for l in line.lines() {
             lines.push(Line::from(Span::styled(
                 format!(" {}", truncate_chars(l, width.saturating_sub(2))),
                 theme::style_muted(),
             )));
+        }
+    }
+    if let Some(pie) = ide_db::chart_kind(result, "pie", Some(col_i)) {
+        lines.push(Line::from(""));
+        for l in pie.lines() {
+            let shown = truncate_chars(l, width.saturating_sub(2));
+            let style = if l.contains('●') {
+                theme::style_accent()
+            } else {
+                theme::style_muted()
+            };
+            lines.push(Line::from(Span::styled(format!(" {shown}"), style)));
         }
     }
     lines
@@ -5264,41 +5613,48 @@ fn console_toolbar_spans(
     width: u16,
 ) -> Vec<Span<'static>> {
     let run = if running {
-        Span::styled(" RUNNING… Esc ", theme::style_selected())
+        Span::styled(" ● running  Esc ", theme::style_warn())
     } else {
-        Span::styled(" F5 run ", theme::style_faint())
+        Span::styled(
+            " ▶ F5 ",
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        )
     };
-    let lim_span = Span::styled(format!("Alt-L {lim}"), theme::style_muted());
-    let db_chip = format!("Alt-b {db_label} ▾");
-    let schema_chip = format!("Alt-s {schema_label} ▾");
+    let sep = Span::styled(" · ", theme::style_faint());
+    let db_chip = format!("{db_label} ▾");
+    let schema_chip = format!("{schema_label} ▾");
+    let lim_chip = format!("lim {lim}");
 
-    // Candidates from richest → sparsest; pick first that fits.
+    let chip = |label: String| {
+        Span::styled(
+            format!(" {label} "),
+            Style::default().fg(theme::muted()).bg(theme::surface()),
+        )
+    };
+
     let candidates: Vec<Vec<Span<'static>>> = vec![
         vec![
-            Span::styled(" ", theme::style_faint()),
+            Span::raw(" "),
             run.clone(),
-            Span::styled(" │ ", theme::style_faint()),
-            Span::styled(db_chip.clone(), theme::style_muted()),
-            Span::styled(" │ ", theme::style_faint()),
-            Span::styled(schema_chip.clone(), theme::style_muted()),
-            Span::styled(" │ ", theme::style_faint()),
-            lim_span.clone(),
+            sep.clone(),
+            chip(db_chip.clone()),
+            sep.clone(),
+            chip(schema_chip.clone()),
+            sep.clone(),
+            chip(lim_chip.clone()),
         ],
         vec![
-            Span::styled(" ", theme::style_faint()),
+            Span::raw(" "),
             run.clone(),
-            Span::styled(" │ ", theme::style_faint()),
-            Span::styled(db_chip.clone(), theme::style_muted()),
-            Span::styled(" │ ", theme::style_faint()),
-            lim_span.clone(),
+            sep.clone(),
+            chip(db_chip.clone()),
+            sep.clone(),
+            chip(lim_chip.clone()),
         ],
-        vec![
-            Span::styled(" ", theme::style_faint()),
-            run.clone(),
-            Span::styled(" │ ", theme::style_faint()),
-            lim_span.clone(),
-        ],
-        vec![Span::styled(" ", theme::style_faint()), run, Span::raw(" "), lim_span],
+        vec![Span::raw(" "), run.clone(), sep.clone(), chip(lim_chip.clone())],
+        vec![Span::raw(" "), run],
     ];
 
     let max = width as usize;
@@ -5308,10 +5664,7 @@ fn console_toolbar_spans(
             return c;
         }
     }
-    vec![
-        Span::styled(" F5 ", theme::style_faint()),
-        Span::styled(lim.to_string(), theme::style_muted()),
-    ]
+    vec![Span::styled(" ▶ F5 ", theme::style_accent())]
 }
 
 /// Drop whole ` · `-separated tokens from the right before mid-glyph ellipsis.

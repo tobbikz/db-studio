@@ -1,72 +1,71 @@
-# db-studio
+# DB Studio
 
-Terminal **Database Studio** — Home hub, explorer, structure, SQL console, and results.
+Terminal **Database Studio** — Home hub, explorer, structure, SQL console, and results grid.
 
-AMOLED mono TUI. Database product only (no Code / Sessions chrome).
+Truecolor TUI with DataRig-inspired themes (AMOLED mono, Nord, Catppuccin, Tokyo Night, Dracula, Light, customs).
 
-## Run
+**Version:** 0.5.0
+
+## Install
+
+| OS | Command |
+|----|---------|
+| **Linux** | `./scripts/install.sh` → `~/.local/bin/db-studio` |
+| **Windows** | `.\scripts\install.ps1` → `%LOCALAPPDATA%\db-studio\` |
+| **Update** | `./scripts/update.sh` / `.\scripts\update.ps1` |
+
+Full guide: [docs/INSTALL.md](docs/INSTALL.md). Themes: [docs/THEMES.md](docs/THEMES.md).
 
 ```bash
-cargo run -p ide-app --release
-# binary: target/release/db-studio [workspace]
+# from source
+cargo build -p ide-app --release
+./target/release/db-studio
 ```
 
-Release helper:
-
-```bash
-./scripts/release.sh
-# → target/release/db-studio
-```
-
-## Surfaces
-
-| Surface | How |
-|---------|-----|
-| **Home** | boot · `Ctrl-⇧H` · Esc from Studio Explorer |
-| **Studio** | Enter / `1–9` source · or Recents / Favorites |
-
-## Home keys
+## Quick keys (Studio)
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Sources · Recents · Favorites |
-| `j` / `k` | Move selection |
-| `Enter` / `e` | Connect → Studio (or load recent SQL) |
-| `1`–`9` | Open source slot |
-| `a` | Add connection |
-| `p` | Pin / unpin source |
-| `r` | Refresh health |
-| `?` | Help overlay |
-
-## Studio keys
-
-| Key | Action |
-|-----|--------|
+| `Ctrl-P` | Command palette |
+| `Ctrl-W` | Close SQL tab |
+| `Space` | Discover next keys |
+| `Shift-T` | Cycle theme |
 | `1`–`4` | Explorer · Structure · Console · Results |
 | `Tab` | Cycle panes |
-| `f` | Fullscreen pane |
-| `Esc` | Pane → Explorer → **Home** (cancels running query) |
-| `Ctrl-]` / `Ctrl-[` | Switch connection |
 | `F5` / `Ctrl-↵` | Run SQL |
-| `D` | Results density (compact / comfort) |
-| `y` | Copy focused result cell |
-| `i` | Edit cell |
-| `/` | Filter results |
-| `Ctrl-⇧E` | Export CSV |
-| `Ctrl-⇧L` | Export SQL |
-| `?` | Help overlay |
+| `Esc` | Cancel / back / Home |
+| `?` | Help |
 
-## Drivers & SSH
+Home: `a` add connection · `Enter` open Studio · `?` help.
 
-Postgres · MySQL · SQLite · DuckDB · and more in the connection form (`←`/`→` on Driver).
+## Themes
 
-Optional **SSH jump**: set SSH host / user / port / key on the connection form (empty host = direct).
+Palette (`Ctrl-P`) → filter `theme`:
+
+- **AMOLED mono** / **AMOLED light mono**
+- **Dark** (default) · Nord · Mocha · Tokyo Night · Dracula · **Light** · High contrast
+- **Theme: new custom…** → TOML under `~/.config/tui-ide/themes/`
+
+↑↓ previews · Enter keeps · Esc restores.
+
+## Drivers
+
+Postgres · MySQL · SQLite · DuckDB · and more in the connection form.
 
 Passwords: prefer `env:VAR` or vault — plaintext is not required.
 
 ## Config
 
-Connections live under `~/.config/tui-ide/` (shared toolkit path for now).
+`~/.config/tui-ide/` (Linux) · `%APPDATA%\tui-ide\` (Windows).
+
+## Docs
+
+| Doc | Topic |
+|-----|--------|
+| [docs/INSTALL.md](docs/INSTALL.md) | Linux / Windows install & update |
+| [docs/THEMES.md](docs/THEMES.md) | Built-ins + custom TOML |
+| [docs/AGENTS.md](docs/AGENTS.md) | Agents surface |
+| [docs/SESSIONS.md](docs/SESSIONS.md) | Sessions |
 
 ## License
 

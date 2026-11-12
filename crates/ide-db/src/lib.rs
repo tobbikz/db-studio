@@ -7033,9 +7033,15 @@ impl DbWorkspace {
     /// Human preview of pending INSERT/UPDATE/DELETE (for confirm dialog).
     pub fn pending_updates_preview(&self, max_stmts: usize) -> Result<String> {
         let stmts = self.pending_mutations()?;
-        let mut lines = vec![format!("{} mutation(s):", stmts.len())];
+        let mut lines = vec![format!("{} mutation(s) ready to apply:", stmts.len())];
         for (i, s) in stmts.iter().take(max_stmts).enumerate() {
-            let one: String = s.chars().take(120).collect();
+            // Prefer full statement when short; soft-wrap at 160 for the Changes panel.
+            let one: String = s.chars().take(160).collect();
+            let one = if s.chars().count() > 160 {
+                format!("{one}…")
+            } else {
+                one
+            };
             lines.push(format!("{}. {one}", i + 1));
         }
         if stmts.len() > max_stmts {
