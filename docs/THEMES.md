@@ -1,5 +1,9 @@
 # Themes — DB Studio
 
+<p align="center">
+  <img src="assets/theme-light-preview.png" alt="Live theme preview in palette" width="720" />
+</p>
+
 Built-ins (palette: `Ctrl-P` → type `theme`):
 
 | Id | Label |

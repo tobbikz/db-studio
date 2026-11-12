@@ -5,7 +5,7 @@ Requires a [Rust toolchain](https://rustup.rs/) (1.75+) and a terminal with true
 ## Linux
 
 ```bash
-git clone <this-repo> db-studio && cd db-studio
+git clone https://github.com/tobbikz/db-studio.git && cd db-studio
 ./scripts/install.sh
 # binary → ~/.local/bin/db-studio
 ```
@@ -27,7 +27,7 @@ cd db-studio && ./scripts/update.sh
 In PowerShell (Developer / user):
 
 ```powershell
-git clone <this-repo> db-studio
+git clone https://github.com/tobbikz/db-studio.git
 cd db-studio
 .\scripts\install.ps1
 # binary → %LOCALAPPDATA%\db-studio\db-studio.exe
